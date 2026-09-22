@@ -1,0 +1,49 @@
+{
+  "name": "ml-dash",
+  "version": "0.1.0",
+  "description": "ml-dash \u2014 ML experiment tracking CLI. Authenticate, inspect projects and experiments, and move experiment data to and from an ML-Dash server.",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "ml-dash": "bin/ml-dash.js"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "!dist/**/*.map"
+  ],
+  "engines": {
+    "node": ">=20.19"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fortyfive-labs/ml-dash-cli.git"
+  },
+  "homepage": "https://docs.dash.ml",
+  "keywords": [
+    "machine-learning",
+    "experiment-tracking",
+    "mlops",
+    "cli"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "cli": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "tsc --noEmit && node --import tsx --test test/*.test.ts",
+    "build:release": "bun run scripts/build-release.ts"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@types/qrcode": "^1.5.5",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
