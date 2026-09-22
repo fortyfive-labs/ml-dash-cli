@@ -713,8 +713,12 @@ export class RemoteClient {
     topic: string,
     entries: unknown[],
   ): Promise<any> {
+    // `append_batch`, with an underscore: the track routes spell it that way
+    // (`/experiments/:id/tracks/:topic/append_batch` in the server, and the
+    // same in the Python client), while the *metric* route next door is
+    // `append-batch`. The hyphen here 404'd every track upload.
     return this.requestJson(
-      `experiments/${experimentId}/tracks/${encodeURIComponent(topic)}/append-batch`,
+      `experiments/${experimentId}/tracks/${encodeURIComponent(topic)}/append_batch`,
       { method: "POST", json: { entries }, timeoutMs: 120_000 },
     );
   }

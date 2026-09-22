@@ -31,6 +31,7 @@ import {
 } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import path from "node:path";
+import { resolveWithin, safeSegment } from "./safe-path.js";
 
 export const FILES_METADATA_FILENAME = ".files_metadata.json";
 
@@ -85,9 +86,15 @@ export class LocalStorage {
     mkdirSync(this.rootPath, { recursive: true });
   }
 
-  /** Experiment directory for a prefix of the form owner/project/folders…/name. */
+  /**
+   * Experiment directory for a prefix of the form owner/project/folders…/name.
+   *
+   * The prefix is server metadata, and every other path in this class is built
+   * from the directory it returns, so this is the choke point where a prefix
+   * that would leave the root is rejected rather than written.
+   */
   experimentDir(prefix: string): string {
-    return path.join(this.rootPath, prefix.replace(/^\/+/, ""));
+    return resolveWithin(this.rootPath, prefix, "experiment prefix");
   }
 
   // ── experiment metadata ────────────────────────────────────────────────────
@@ -337,7 +344,8 @@ export class LocalStorage {
   appendBatchToMetric(prefix: string, metricName: string | null, dataPoints: unknown[]): void {
     const metricsDir = path.join(this.experimentDir(prefix), "metrics");
     const dirName = metricName === null ? "None" : String(metricName);
-    const metricDir = path.join(metricsDir, dirName);
+    // A nested name ('train/loss') keeps nesting; '..' in one does not.
+    const metricDir = resolveWithin(metricsDir, dirName, "metric name");
     mkdirSync(metricDir, { recursive: true });
 
     const dataFile = path.join(metricDir, "data.jsonl");
@@ -416,10 +424,14 @@ export class LocalStorage {
 
   /** Absolute on-disk path of a recorded file. */
   filePath(prefix: string, record: Pick<LocalFileRecord, "id" | "path" | "filename">): string {
+    const filesDir = this.filesDir(prefix);
     const sub = (record.path ?? "").replace(/^\/+/, "");
-    return sub
-      ? path.join(this.filesDir(prefix), sub, record.id, record.filename)
-      : path.join(this.filesDir(prefix), record.id, record.filename);
+    const dir = sub ? resolveWithin(filesDir, sub, "file path") : filesDir;
+    return path.join(
+      dir,
+      safeSegment("file id", String(record.id)),
+      safeSegment("filename", record.filename),
+    );
   }
 
   /** Copy a file in and record it, replacing any record with the same path+filename. */
@@ -439,23 +451,24 @@ export class LocalStorage {
   }): Promise<LocalFileRecord> {
     const filesDir = this.filesDir(args.prefix);
     const fileId = generateSnowflakeId();
+    const filename = safeSegment("filename", args.filename);
     const normalized = (args.path ?? "").replace(/^\/+/, "");
-    const storageDir = normalized ? path.join(filesDir, normalized) : filesDir;
+    const storageDir = normalized ? resolveWithin(filesDir, normalized, "file path") : filesDir;
     const fileDir = path.join(storageDir, fileId);
     mkdirSync(fileDir, { recursive: true });
-    await copyFile(args.sourcePath, path.join(fileDir, args.filename));
+    await copyFile(args.sourcePath, path.join(fileDir, filename));
 
     const now = utcNowIso();
     const record: LocalFileRecord = {
       id: fileId,
       experimentId: `${args.project}/${args.prefix}`,
       path: args.path ?? "",
-      filename: args.filename,
+      filename,
       description: args.description ?? null,
       tags: args.tags ?? [],
       bindrs: args.bindrs ?? [],
       contentType: args.contentType ?? "",
-      sizeBytes: args.sizeBytes ?? statSync(path.join(fileDir, args.filename)).size,
+      sizeBytes: args.sizeBytes ?? statSync(path.join(fileDir, filename)).size,
       checksum: args.checksum ?? "",
       metadata: args.metadata ?? null,
       uploadedAt: now,
@@ -470,7 +483,10 @@ export class LocalStorage {
     if (existingIndex >= 0) {
       const old = meta.files[existingIndex];
       const oldSub = (old.path ?? "").replace(/^\/+/, "");
-      rmSync(oldSub ? path.join(filesDir, oldSub, old.id) : path.join(filesDir, old.id), {
+      const oldDir = oldSub ? resolveWithin(filesDir, oldSub, "file path") : filesDir;
+      // Only the directory this manifest created for that record, never a path
+      // the record could point at outside the tree.
+      rmSync(path.join(oldDir, safeSegment("file id", String(old.id))), {
         recursive: true,
         force: true,
       });

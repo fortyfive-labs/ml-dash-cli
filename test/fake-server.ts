@@ -65,6 +65,8 @@ export interface FakeState {
   projects: { id: string; slug: string; description: string; experimentCount: number }[];
   experiments: any[];
   tracks: any[];
+  /** Topic → entries the CLI appended, and what `/data` serves back. */
+  trackEntries: Record<string, any[]>;
   /** Token handed back by /api/auth/exchange. */
   mlDashToken: string;
   /** When set, /api/device/poll answers with this error instead of a token. */
@@ -124,6 +126,7 @@ export function defaultState(): FakeState {
         lastTimestamp: 12.25,
       },
     ],
+    trackEntries: {},
     mlDashToken: makeJwt({ sub: "9876543210987654321", username: "token-user", name: "Token User" }),
     transfer: {
       receivedParameters: {},
@@ -396,6 +399,42 @@ export async function startFakeServer(state: FakeState = defaultState()): Promis
       return sendJson(res, 200, { deleted: 3, experiments: 1 });
     }
 
+    // The topic is one percent-encoded path segment, exactly as the server
+    // routes it: `/tracks/:topic/append_batch` with `decodeURIComponent` on
+    // the far side. Only the underscore spelling exists here, so the hyphen
+    // the client used to send falls through to the 404 below.
+    const trackBatchMatch = url.pathname.match(
+      /^\/api\/experiments\/([^/]+)\/tracks\/([^/]+)\/append_batch$/,
+    );
+    if (trackBatchMatch && req.method === "POST") {
+      const topic = decodeURIComponent(trackBatchMatch[2]);
+      const entries = body?.entries;
+      if (!Array.isArray(entries) || entries.length === 0) {
+        return sendJson(res, 400, { error: "Bad Request", message: "entries must be a non-empty array" });
+      }
+      for (const [i, entry] of entries.entries()) {
+        if (entry?.timestamp === undefined || entry?.timestamp === null) {
+          return sendJson(res, 400, { error: "Bad Request", message: `Entry at index ${i} is missing timestamp` });
+        }
+      }
+      (state.trackEntries[topic] ??= []).push(...entries);
+      return sendJson(res, 201, { count: entries.length, topic });
+    }
+
+    const trackDataMatch = url.pathname.match(
+      /^\/api\/experiments\/([^/]+)\/tracks\/([^/]+)\/data$/,
+    );
+    if (trackDataMatch && req.method === "GET") {
+      const topic = decodeURIComponent(trackDataMatch[2]);
+      const entries = state.trackEntries[topic] ?? [];
+      const format = url.searchParams.get("format") ?? "json";
+      if (format === "jsonl") {
+        res.writeHead(200, { "Content-Type": "application/x-ndjson" });
+        return res.end(entries.map((e) => JSON.stringify(e)).join("\n") + (entries.length ? "\n" : ""));
+      }
+      return sendJson(res, 200, { topic, count: entries.length, entries });
+    }
+
     const tracksMatch = url.pathname.match(/^\/api\/experiments\/([^/]+)\/tracks$/);
     if (tracksMatch && req.method === "GET") {
       const topic = url.searchParams.get("topic");
@@ -448,7 +487,7 @@ function graphqlResponse(state: FakeState, query: string, vars: Record<string, a
   if (query.includes("query Experiment(")) {
     const exp = state.experiments.find((e) => e.name === vars.experimentName);
     if (!exp) return `{"data":{"experiment":null}}`;
-    return `{"data":{"experiment":{"id":${exp.id},"name":"${exp.name}","description":"","tags":[],"status":"${exp.status}","metadata":null,"project":{"slug":"alpha","namespace":{"slug":"${state.username}"}},"logMetadata":{"totalLogs":0},"metrics":[],"files":[],"parameters":null}}}`;
+    return `{"data":{"experiment":{"id":${exp.id},"name":"${exp.name}","description":"","tags":[],"status":"${exp.status}","metadata":${JSON.stringify(exp.metadata ?? null)},"project":{"slug":"alpha","namespace":{"slug":"${state.username}"}},"logMetadata":{"totalLogs":0},"metrics":[],"files":[],"parameters":null}}}`;
   }
   if (query.includes("ListExperimentFilesPaginated")) {
     const { slice, totalCount, hasMore } = page(state.transfer.files, vars.limit ?? 500, vars.offset ?? 0);

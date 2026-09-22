@@ -593,6 +593,141 @@ describe("download", () => {
   });
 });
 
+// ── hostile server paths ─────────────────────────────────────────────────────
+
+/**
+ * `download` writes where the server's metadata tells it to. A file's `pPath`
+ * and filename, and an experiment's `prefix`, therefore decide a path on the
+ * user's disk — and a server that answers with `..` in one of them was walking
+ * the write out of the `.dash` tree entirely. The sentinel here sits outside
+ * the download root; nothing the CLI does may touch it.
+ */
+describe("download refuses server paths that leave the tree", () => {
+  const SENTINEL = "do not overwrite me\n";
+
+  /** A sentinel file one level above the download root, with its own copy. */
+  function sentinel(h: Harness): { root: string; file: string; unchanged: () => void } {
+    const base = path.join(h.configDir, "tree");
+    const root = path.join(base, "dash");
+    mkdirSync(root, { recursive: true });
+    const file = path.join(base, "sentinel.txt");
+    writeFileSync(file, SENTINEL);
+    return {
+      root,
+      file,
+      unchanged: () => assert.equal(readFileSync(file, "utf8"), SENTINEL, "the sentinel was written"),
+    };
+  }
+
+  test("a file whose path and name climb out of the root is refused", async (t) => {
+    const state = stateWithRemoteData();
+    // Five levels up from <root>/test-user/alpha/exp-one/files is the
+    // sentinel's directory. The filename is ordinary: what is hostile here is
+    // where the server says the file belongs.
+    state.transfer.files[0].pPath = "../../../../..";
+    state.transfer.files[0].name = "sentinel.txt";
+    state.transfer.files[0].physicalFile.filename = "sentinel.txt";
+    const h = await harness(t, state);
+    await h.login();
+    const { root, file, unchanged } = sentinel(h);
+
+    const r = await h.cli([
+      "download", root, "--dash-url", h.server.url,
+      "-p", "test-user/alpha", "--experiment", "exp-one",
+    ]);
+
+    // Nothing new beside the download root, and the sentinel is as it was.
+    assert.deepEqual(
+      readdirSync(path.dirname(root)).sort(),
+      ["dash", "sentinel.txt"],
+      "the file was written outside the download root",
+    );
+    unchanged();
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /unsafe/i);
+    // Refused, not quietly rewritten into some other path inside the tree.
+    const metadataFile = path.join(root, "test-user", "alpha", "exp-one", "files", ".files_metadata.json");
+    if (existsSync(metadataFile)) {
+      assert.deepEqual(
+        JSON.parse(readFileSync(metadataFile, "utf8")).files,
+        [],
+        "a file record was stored for a path that was refused",
+      );
+    }
+    assert.ok(existsSync(file));
+  });
+
+  test("an experiment prefix that climbs out of the root is refused", async (t) => {
+    const state = stateWithRemoteData();
+    // Three levels up from <root>/test-user/alpha is the sentinel's own
+    // directory, one above the download root the user named.
+    state.experiments[0].metadata = { prefix: "test-user/alpha/../../../escaped" };
+    const h = await harness(t, state);
+    await h.login();
+    const { root, unchanged } = sentinel(h);
+
+    const r = await h.cli([
+      "download", root, "--dash-url", h.server.url,
+      "-p", "test-user/alpha", "--experiment", "exp-one",
+    ]);
+
+    assert.ok(
+      !existsSync(path.join(h.configDir, "tree", "escaped")),
+      "the prefix created a directory outside the download root",
+    );
+    unchanged();
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /unsafe/i);
+    // Refused, not quietly rewritten into some other path inside the tree.
+    assert.ok(!existsSync(path.join(root, "escaped")), "the prefix was rewritten into the tree");
+  });
+});
+
+// ── tracks ───────────────────────────────────────────────────────────────────
+
+/**
+ * `--tracks` on both commands, driven end to end: the bytes uploaded from a
+ * JSONL file come back out of `download --tracks` unchanged. This is also what
+ * caught the append route being spelled `append-batch` (the metric spelling)
+ * rather than the `append_batch` the track routes use.
+ */
+describe("upload/download --tracks", () => {
+  test("a track round trips through the server", async (t) => {
+    const h = await harness(t);
+    await h.login();
+
+    const entries = [
+      { timestamp: 0.5, q0: 1, q1: 2 },
+      { timestamp: 1.5, q0: 3, q1: 4 },
+    ];
+    const source = path.join(h.configDir, "joints.jsonl");
+    writeFileSync(source, entries.map((e) => JSON.stringify(e)).join("\n") + "\n");
+
+    const up = await h.cli([
+      "upload", "--dash-url", h.server.url,
+      "--tracks", source,
+      "--remote-path", "test-user/alpha/exp-one/robot/joints",
+    ]);
+    assert.equal(up.code, 0, up.out);
+
+    // The topic is one encoded segment, and the entries arrive as sent.
+    const posted = h.server.requests.find((q) => q.path.includes("/append_batch"));
+    assert.ok(posted, `no append_batch request: ${h.server.requests.map((q) => q.path).join(", ")}`);
+    assert.match(posted.path, /\/tracks\/robot%2Fjoints\/append_batch$/);
+    assert.deepEqual(posted.body.entries, entries);
+    assert.deepEqual(h.server.state.trackEntries["robot/joints"], entries);
+
+    const out = path.join(h.configDir, "downloaded.jsonl");
+    const down = await h.cli([
+      "download", "--dash-url", h.server.url,
+      "--tracks", "test-user/alpha/exp-one/robot/joints",
+      "--output", out, "--format", "jsonl",
+    ]);
+    assert.equal(down.code, 0, down.out);
+    assert.equal(readFileSync(out, "utf8"), readFileSync(source, "utf8"));
+  });
+});
+
 // ── round trip ───────────────────────────────────────────────────────────────
 
 describe("upload then download", () => {

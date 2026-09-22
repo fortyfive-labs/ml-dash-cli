@@ -487,7 +487,10 @@ async function downloadSingleFile(
   file: RemoteFile,
 ): Promise<number> {
   const scratch = mkdtempSync(path.join(tmpdir(), "ml-dash-download-"));
-  const temp = path.join(scratch, file.filename || "download");
+  // A fixed local name: the server's filename decides where the file lands in
+  // the .dash tree (checked there), never where the unverified bytes land
+  // here, so a '../' in it cannot write over anything outside the scratch dir.
+  const temp = path.join(scratch, "payload");
   try {
     await client.downloadFileStreaming(file.id, temp);
 
