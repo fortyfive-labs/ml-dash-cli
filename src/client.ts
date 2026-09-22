@@ -525,7 +525,12 @@ export class RemoteClient {
     return this.requestJson(`nodes/${fileId}`, { method: "DELETE" });
   }
 
-  /** Stream a file to disk, then verify its checksum. A mismatch deletes the file. */
+  /**
+   * Stream a file to disk.
+   *
+   * Checksum verification belongs to the caller: `download` hashes into a
+   * scratch directory and only copies a file into the tree once it matches.
+   */
   async downloadFileStreaming(fileId: string, destPath: string): Promise<string> {
     const res = await this.request(`nodes/${fileId}/download`, { timeoutMs: 600_000, raw: true });
     if (!res.ok) throw new HttpError(res.status, `nodes/${fileId}/download`, await res.text());

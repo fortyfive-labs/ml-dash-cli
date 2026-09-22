@@ -18,7 +18,17 @@ export interface RecordedRequest {
   method: string;
   path: string;
   body: any;
+  /** Query string, so a test can assert on bufferOnly / limit / offset. */
+  query: Record<string, string>;
   headers: Record<string, string | string[] | undefined>;
+}
+
+/** One `multipart/form-data` part, with the file bytes kept intact. */
+export interface MultipartPart {
+  name: string;
+  filename?: string;
+  contentType?: string;
+  data: Buffer;
 }
 
 export interface FakeServer {
@@ -30,7 +40,26 @@ export interface FakeServer {
   state: FakeState;
 }
 
+/** Everything the transfer commands read from or write to the server. */
+export interface TransferState {
+  /** What `upload` sent, keyed by experiment id. */
+  receivedParameters: Record<string, any>;
+  receivedLogs: Record<string, any[]>;
+  receivedMetrics: Record<string, Record<string, any[]>>;
+  receivedFiles: { filename: string; checksum: string; fields: Record<string, string>; data: Buffer }[];
+  /** What `download` is offered. */
+  parameters: Record<string, unknown>;
+  logs: any[];
+  metrics: Record<string, { chunks: any[][]; buffer: any[] }>;
+  files: any[];
+  /** File id → bytes served by /api/nodes/{id}/download. */
+  fileBodies: Record<string, Buffer>;
+  /** Substring of a path that should answer 500 instead of succeeding. */
+  failPath?: string;
+}
+
 export interface FakeState {
+  transfer: TransferState;
   username: string;
   userId: string;
   projects: { id: string; slug: string; description: string; experimentCount: number }[];
@@ -96,8 +125,21 @@ export function defaultState(): FakeState {
       },
     ],
     mlDashToken: makeJwt({ sub: "9876543210987654321", username: "token-user", name: "Token User" }),
+    transfer: {
+      receivedParameters: {},
+      receivedLogs: {},
+      receivedMetrics: {},
+      receivedFiles: [],
+      parameters: {},
+      logs: [],
+      metrics: {},
+      files: [],
+      fileBodies: {},
+    },
   };
 }
+
+export const EXPERIMENT_ID = EXP_ID;
 
 /** An unsigned JWT — the CLI only ever decodes the payload for display. */
 export function makeJwt(payload: Record<string, unknown>, expOffsetSeconds = 30 * 86400): string {
@@ -106,13 +148,51 @@ export function makeJwt(payload: Record<string, unknown>, expOffsetSeconds = 30 
   return `${b64({ alg: "none", typ: "JWT" })}.${b64(body)}.signature`;
 }
 
-const readBody = (req: IncomingMessage): Promise<string> =>
+const readBody = (req: IncomingMessage): Promise<Buffer> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
     req.on("data", (c) => chunks.push(c));
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => resolve(Buffer.concat(chunks)));
     req.on("error", reject);
   });
+
+/**
+ * Split a multipart/form-data body on its boundary.
+ *
+ * The file part is kept as raw bytes rather than decoded to a string: the
+ * upload test hashes it and compares against the checksum the CLI sent, and a
+ * utf8 round trip would quietly repair a corrupted binary body.
+ */
+export function parseMultipart(body: Buffer, contentType: string): MultipartPart[] {
+  const match = /boundary=(?:"([^"]+)"|([^;]+))/.exec(contentType);
+  if (!match) return [];
+  const boundary = Buffer.from(`--${(match[1] ?? match[2]).trim()}`);
+
+  const parts: MultipartPart[] = [];
+  let index = body.indexOf(boundary);
+  while (index !== -1) {
+    const start = index + boundary.length;
+    const next = body.indexOf(boundary, start);
+    if (next === -1) break;
+    // Drop the CRLF after the boundary and the CRLF before the next one.
+    const section = body.subarray(start + 2, next - 2);
+    const split = section.indexOf("\r\n\r\n");
+    if (split !== -1) {
+      const headers = section.subarray(0, split).toString("utf8");
+      const name = /name="([^"]*)"/.exec(headers)?.[1];
+      if (name) {
+        parts.push({
+          name,
+          filename: /filename="([^"]*)"/.exec(headers)?.[1],
+          contentType: /content-type:\s*([^\r\n]+)/i.exec(headers)?.[1],
+          data: section.subarray(split + 4),
+        });
+      }
+    }
+    index = next;
+  }
+  return parts;
+}
 
 /** Raw JSON so 19-digit IDs stay literal — JSON.stringify of a number would not. */
 const sendRaw = (res: ServerResponse, status: number, raw: string): void => {
@@ -128,18 +208,26 @@ export async function startFakeServer(state: FakeState = defaultState()): Promis
 
   const server: Server = createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const raw = await readBody(req);
+    const rawBuffer = await readBody(req);
+    const contentType = String(req.headers["content-type"] ?? "");
     let body: any = undefined;
-    if (raw && (req.headers["content-type"] ?? "").includes("json")) {
+    let multipart: MultipartPart[] = [];
+    if (rawBuffer.length > 0 && contentType.includes("json")) {
       try {
-        body = JSON.parse(raw);
+        body = JSON.parse(rawBuffer.toString("utf8"));
       } catch {
-        body = raw;
+        body = rawBuffer.toString("utf8");
       }
-    } else if (raw) {
-      body = raw;
+    } else if (rawBuffer.length > 0 && contentType.includes("multipart/form-data")) {
+      multipart = parseMultipart(rawBuffer, contentType);
+      body = Object.fromEntries(
+        multipart.map((p) => [p.name, p.filename !== undefined ? `<file:${p.filename}>` : p.data.toString("utf8")]),
+      );
+    } else if (rawBuffer.length > 0) {
+      body = rawBuffer.toString("utf8");
     }
-    requests.push({ method: req.method ?? "GET", path: url.pathname, body, headers: req.headers });
+    const query = Object.fromEntries(url.searchParams.entries());
+    requests.push({ method: req.method ?? "GET", path: url.pathname, body, query, headers: req.headers });
 
     // ── vuer-auth device flow ────────────────────────────────────────────────
     if (url.pathname === "/api/device/start") {
@@ -176,8 +264,116 @@ export async function startFakeServer(state: FakeState = defaultState()): Promis
     }
 
     // ── REST ─────────────────────────────────────────────────────────────────
+    // An injected failure, so a test can prove the CLI reports a broken
+    // section as a failure instead of finishing 0 with the data dropped.
+    if (state.transfer.failPath && url.pathname.includes(state.transfer.failPath)) {
+      return sendJson(res, 500, { error: "injected failure" });
+    }
+
+    const t = state.transfer;
+    const expMatch = url.pathname.match(/^\/api\/experiments\/([^/]+)\/(.+)$/);
+    if (expMatch) {
+      const experimentId = expMatch[1];
+      const rest = expMatch[2];
+
+      if (rest === "parameters" && req.method === "POST") {
+        t.receivedParameters[experimentId] = body?.data ?? {};
+        return sendJson(res, 200, { data: body?.data ?? {} });
+      }
+      if (rest === "parameters" && req.method === "GET") {
+        return sendJson(res, 200, { data: t.parameters });
+      }
+      if (rest === "logs" && req.method === "POST") {
+        (t.receivedLogs[experimentId] ??= []).push(...(body?.logs ?? []));
+        return sendJson(res, 201, { created: (body?.logs ?? []).length });
+      }
+      if (rest === "logs" && req.method === "GET") {
+        const limit = Number(url.searchParams.get("limit") ?? 100);
+        const offset = Number(url.searchParams.get("offset") ?? 0);
+        const slice = t.logs.slice(offset, offset + limit);
+        return sendJson(res, 200, { logs: slice, hasMore: offset + limit < t.logs.length });
+      }
+      if (rest === "metrics" && req.method === "GET") {
+        return sendJson(res, 200, {
+          metrics: Object.keys(t.metrics).map((name) => ({ name })),
+        });
+      }
+
+      const metricMatch = rest.match(/^metrics\/([^/]+)\/(.+)$/);
+      if (metricMatch) {
+        const metricName = decodeURIComponent(metricMatch[1]);
+        const action = metricMatch[2];
+
+        if (action === "append-batch" && req.method === "POST") {
+          const perExperiment = (t.receivedMetrics[experimentId] ??= {});
+          (perExperiment[metricName] ??= []).push(...(body?.dataPoints ?? []));
+          return sendJson(res, 200, { count: (body?.dataPoints ?? []).length });
+        }
+        const metric = t.metrics[metricName];
+        if (!metric) return sendJson(res, 404, { error: `no metric ${metricName}` });
+
+        if (action === "stats") {
+          return sendJson(res, 200, {
+            totalChunks: metric.chunks.length,
+            bufferedDataPoints: metric.buffer.length,
+          });
+        }
+        const chunkMatch = action.match(/^chunks\/(\d+)$/);
+        if (chunkMatch) {
+          const chunk = metric.chunks[Number(chunkMatch[1])];
+          if (!chunk) return sendJson(res, 404, { error: "no such chunk" });
+          return sendJson(res, 200, { data: chunk });
+        }
+        if (action === "data") {
+          if (url.searchParams.get("bufferOnly") === "true") {
+            return sendJson(res, 200, { data: metric.buffer, hasMore: false });
+          }
+          const startIndex = Number(url.searchParams.get("startIndex") ?? 0);
+          const limit = Number(url.searchParams.get("limit") ?? 1000);
+          const all = [...metric.chunks.flat(), ...metric.buffer];
+          const slice = all.slice(startIndex, startIndex + limit);
+          return sendJson(res, 200, { data: slice, hasMore: startIndex + limit < all.length });
+        }
+      }
+    }
+
+    const downloadMatch = url.pathname.match(/^\/api\/nodes\/([^/]+)\/download$/);
+    if (downloadMatch && req.method === "GET") {
+      const bytes = t.fileBodies[downloadMatch[1]];
+      if (!bytes) return sendJson(res, 404, { error: "no such file" });
+      res.writeHead(200, { "Content-Type": "application/octet-stream" });
+      return res.end(bytes);
+    }
+
     const nodesMatch = url.pathname.match(/^\/api\/namespaces\/([^/]+)\/nodes$/);
+    if (nodesMatch && req.method === "POST" && multipart.length > 0) {
+      const filePart = multipart.find((p) => p.filename !== undefined);
+      const fields = Object.fromEntries(
+        multipart.filter((p) => p.filename === undefined).map((p) => [p.name, p.data.toString("utf8")]),
+      );
+      t.receivedFiles.push({
+        filename: filePart?.filename ?? "",
+        checksum: fields.checksum ?? "",
+        fields,
+        data: filePart?.data ?? Buffer.alloc(0),
+      });
+      const id = `700000000000000${String(t.receivedFiles.length).padStart(4, "0")}`;
+      return sendRaw(
+        res,
+        201,
+        `{"node":{"id":${id},"experimentId":"${fields.experimentId ?? ""}","createdAt":"2026-01-01T00:00:00Z"},` +
+          `"physicalFile":{"contentType":"${fields.name?.endsWith(".json") ? "application/json" : "application/octet-stream"}",` +
+          `"sizeBytes":${filePart?.data.length ?? 0},"checksum":"${fields.checksum ?? ""}"}}`,
+      );
+    }
     if (nodesMatch && req.method === "POST") {
+      if (body?.type === "EXPERIMENT") {
+        return sendRaw(
+          res,
+          201,
+          `{"experiment":{"id":${EXP_ID}},"node":{"id":6666666666666666666}}`,
+        );
+      }
       if (body?.type === "PROJECT") {
         const slug = body.slug ?? body.name;
         if (state.projects.some((p) => p.slug === slug)) {
@@ -253,6 +449,16 @@ function graphqlResponse(state: FakeState, query: string, vars: Record<string, a
     const exp = state.experiments.find((e) => e.name === vars.experimentName);
     if (!exp) return `{"data":{"experiment":null}}`;
     return `{"data":{"experiment":{"id":${exp.id},"name":"${exp.name}","description":"","tags":[],"status":"${exp.status}","metadata":null,"project":{"slug":"alpha","namespace":{"slug":"${state.username}"}},"logMetadata":{"totalLogs":0},"metrics":[],"files":[],"parameters":null}}}`;
+  }
+  if (query.includes("ListExperimentFilesPaginated")) {
+    const { slice, totalCount, hasMore } = page(state.transfer.files, vars.limit ?? 500, vars.offset ?? 0);
+    return `{"data":{"experimentById":{"filesPaginated":{"files":${JSON.stringify(slice)},"totalCount":${totalCount},"hasMore":${hasMore}}}}}`;
+  }
+  if (query.includes("GetExperimentNode")) {
+    return `{"data":{"experimentNode":{"id":6666666666666666666}}}`;
+  }
+  if (query.includes("GetExperimentProject")) {
+    return `{"data":{"experimentById":{"projectId":${state.projects[0].id}}}}`;
   }
   if (query.includes("GetProject(")) {
     const projects = state.projects.map((p) => `{"id":${p.id},"slug":"${p.slug}"}`);

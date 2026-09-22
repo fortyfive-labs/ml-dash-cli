@@ -4,12 +4,6 @@
  *
  * Commands are dispatched by name and their modules are imported lazily, so
  * `ml-dash version` does not pay for the GraphQL client or the QR encoder.
- *
- * `upload` and `download` are deliberately absent from this build rather than
- * present as no-ops: a command that accepts its flags and silently moves no
- * data is worse than one that is missing, because a backup script would report
- * success. They are named in the unknown-command message so the failure says
- * what is actually going on.
  */
 import { ParseError, parseArgs, renderCommandHelp, renderRootHelp, usageError, type CommandSpec } from "./cli/parser.js";
 import { red, yellow } from "./util/ansi.js";
@@ -28,10 +22,9 @@ const loaders: Record<string, () => Promise<CommandModule>> = {
   create: () => import("./commands/create.js") as Promise<CommandModule>,
   remove: () => import("./commands/remove.js") as Promise<CommandModule>,
   list: () => import("./commands/list.js") as Promise<CommandModule>,
+  upload: () => import("./commands/upload.js") as Promise<CommandModule>,
+  download: () => import("./commands/download.js") as Promise<CommandModule>,
 };
-
-/** Implemented in the Python CLI but not yet in this build. */
-const NOT_YET_PORTED = ["upload", "download"];
 
 export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -47,13 +40,6 @@ export async function main(argv: string[]): Promise<number> {
 
   const loader = loaders[command];
   if (!loader) {
-    if (NOT_YET_PORTED.includes(command)) {
-      console.error(
-        `${red("error:")} '${command}' is not available in this build (${"ml-dash"} ` +
-          `is being ported from Python). Use the Python ml-dash CLI for '${command}' until it lands.`,
-      );
-      return 2;
-    }
     console.error(`${red("error:")} unknown command '${command}'`);
     console.error(`\nAvailable commands: ${Object.keys(loaders).join(", ")}`);
     return 2;

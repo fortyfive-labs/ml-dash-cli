@@ -34,7 +34,7 @@
     "build": "tsc",
     "cli": "tsx src/index.ts",
     "typecheck": "tsc --noEmit",
-    "test": "tsc --noEmit && node --import tsx --test test/*.test.ts",
+    "test": "npm run build && node --import tsx --test test/*.test.ts",
     "build:release": "bun run scripts/build-release.ts"
   },
   "dependencies": {

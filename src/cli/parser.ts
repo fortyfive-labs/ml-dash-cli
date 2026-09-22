@@ -30,11 +30,21 @@ export interface OptionSpec {
   metavar?: string;
 }
 
+export interface PositionalSpec {
+  dest: string;
+  metavar: string;
+  help: string;
+  /** Used when the argument is absent, matching argparse's `default=`. */
+  default?: string;
+}
+
 export interface CommandSpec {
   name: string;
   help: string;
   description?: string;
   options: OptionSpec[];
+  /** Optional trailing arguments, consumed in order. All are `nargs="?"`. */
+  positionals?: PositionalSpec[];
   /** Groups where at most one member may appear; `required` makes it exactly one. */
   mutuallyExclusive?: { dests: string[]; required?: boolean }[];
 }
@@ -51,6 +61,8 @@ export function parseArgs(spec: CommandSpec, argv: string[]): ParsedArgs {
 
   const out: ParsedArgs = {};
   const seen = new Set<string>();
+  const positionals = spec.positionals ?? [];
+  let nextPositional = 0;
 
   for (let i = 0; i < argv.length; i++) {
     const token = argv[i];
@@ -60,7 +72,13 @@ export function parseArgs(spec: CommandSpec, argv: string[]): ParsedArgs {
       return out;
     }
     if (!token.startsWith("-") || token === "-") {
-      throw new ParseError(`unrecognized argument: ${token}`);
+      if (nextPositional >= positionals.length) {
+        throw new ParseError(`unrecognized argument: ${token}`);
+      }
+      const positional = positionals[nextPositional++];
+      out[positional.dest] = token;
+      seen.add(positional.dest);
+      continue;
     }
 
     // `--flag=value` and `--flag value` are the same thing to argparse.
@@ -116,6 +134,12 @@ export function parseArgs(spec: CommandSpec, argv: string[]): ParsedArgs {
     }
   }
 
+  for (const positional of positionals) {
+    if (!seen.has(positional.dest) && positional.default !== undefined) {
+      out[positional.dest] = positional.default;
+    }
+  }
+
   for (const opt of spec.options) {
     if (opt.required && !seen.has(opt.dest)) {
       throw new ParseError(`the following arguments are required: ${opt.flags.join("/")}`);
@@ -130,10 +154,18 @@ const flagFor = (spec: CommandSpec, dest: string): string =>
 
 export function renderCommandHelp(spec: CommandSpec): string {
   const lines: string[] = [];
-  lines.push(bold(`usage: ml-dash ${spec.name} [options]`));
+  const positionals = spec.positionals ?? [];
+  const usageTail = positionals.map((p) => ` [${p.metavar}]`).join("");
+  lines.push(bold(`usage: ml-dash ${spec.name} [options]${usageTail}`));
   lines.push("");
   if (spec.description) {
     lines.push(spec.description.trimEnd());
+    lines.push("");
+  }
+  if (positionals.length > 0) {
+    lines.push(bold("positional arguments:"));
+    const width = Math.max(...positionals.map((p) => p.metavar.length));
+    for (const p of positionals) lines.push(`  ${p.metavar.padEnd(width)}  ${p.help}`);
     lines.push("");
   }
   lines.push(bold("options:"));

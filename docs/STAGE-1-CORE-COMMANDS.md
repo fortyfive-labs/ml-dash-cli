@@ -1,5 +1,9 @@
 # Stage 1 — core commands on the npm channel
 
+> Superseded in part by [STAGE-2-TRANSFER.md](STAGE-2-TRANSFER.md): `upload`
+> and `download` are implemented now, so the "rejected by name" behaviour
+> described below is no longer what the CLI does.
+
 Scope of this stage: the npm (plain JavaScript) entry point builds and runs,
 and eight commands are fully implemented and covered by behaviour tests that
 drive the real CLI as a subprocess against a real HTTP server.
@@ -84,7 +88,7 @@ asserted on only through the CLI's own observable behaviour.
 
 - `upload` / `download` (the two largest Python modules, 1497 + 941 lines).
   `src/local/storage.ts` and the client's file/metric/track methods are already
-  in place for them.
+  in place for them. **Done in stage 2.**
 - `scripts/build-release.ts` (the `bun build --compile` R2 binary) does not
   exist yet, so `npm run build:release` fails. Stage 2.
 - Removing the Python CLI, documentation, and any publishing.

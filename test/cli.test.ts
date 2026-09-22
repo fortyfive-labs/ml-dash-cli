@@ -1,75 +1,9 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
-import { describe, test, type TestContext } from "node:test";
-import { makeJwt, startFakeServer, type FakeServer } from "./fake-server.js";
-
-const REPO = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
-const ENTRY = path.join(REPO, "bin", "ml-dash.js");
-
-interface RunResult {
-  code: number;
-  stdout: string;
-  stderr: string;
-  /** stdout and stderr together, for assertions that do not care which. */
-  out: string;
-}
-
-interface Harness {
-  server: FakeServer;
-  /** Per-test ML_DASH_CONFIG_DIR, so no test can see another's credentials. */
-  configDir: string;
-  cli: (args: string[], opts?: { input?: string }) => Promise<RunResult>;
-  login: () => Promise<RunResult>;
-}
-
-/**
- * Each test gets its own server and its own config directory.
- *
- * The node test runner may interleave suites, and both the fake server's
- * recorded-request log and the on-disk token are mutable state — sharing
- * either across tests makes assertions depend on execution order, which is
- * exactly the kind of test that passes for the wrong reason.
- */
-async function harness(t: TestContext): Promise<Harness> {
-  const server = await startFakeServer();
-  const configDir = mkdtempSync(path.join(tmpdir(), "ml-dash-test-"));
-  t.after(async () => {
-    await server.close();
-    rmSync(configDir, { recursive: true, force: true });
-  });
-
-  const cli = (args: string[], opts: { input?: string } = {}): Promise<RunResult> =>
-    new Promise((resolve, reject) => {
-      const child = spawn(process.execPath, [ENTRY, ...args], {
-        env: {
-          ...process.env,
-          ML_DASH_CONFIG_DIR: configDir,
-          ML_DASH_NO_KEYCHAIN: "1",
-          NO_COLOR: "1",
-        },
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      let stdout = "";
-      let stderr = "";
-      child.stdout.on("data", (c) => (stdout += c));
-      child.stderr.on("data", (c) => (stderr += c));
-      child.on("error", reject);
-      child.stdin.end(opts.input ?? "");
-      child.on("close", (code) => resolve({ code: code ?? -1, stdout, stderr, out: stdout + stderr }));
-    });
-
-  return {
-    server,
-    configDir,
-    cli,
-    /** A real device-flow login against the fake auth server. */
-    login: () => cli(["login", "--dash-url", server.url, "--auth-url", server.url, "--no-browser"]),
-  };
-}
+import { describe, test } from "node:test";
+import { makeJwt } from "./fake-server.js";
+import { ENTRY, REPO, harness } from "./harness.js";
 
 // ── version ──────────────────────────────────────────────────────────────────
 
@@ -89,11 +23,20 @@ describe("version", () => {
     assert.match(r.stderr, /unknown command 'frobnicate'/);
   });
 
-  test("upload/download report that they are not in this build", async (t) => {
+  test("upload and download are listed and carry their positional path", async (t) => {
     const h = await harness(t);
-    const r = await h.cli(["upload", "./somewhere"]);
-    assert.equal(r.code, 2);
-    assert.match(r.stderr, /not available in this build/);
+    const root = await h.cli([]);
+    assert.equal(root.code, 0, root.out);
+    assert.match(root.stdout, /upload\s+Upload local experiments/);
+    assert.match(root.stdout, /download\s+Download experiments/);
+
+    for (const command of ["upload", "download"]) {
+      const help = await h.cli([command, "--help"]);
+      assert.equal(help.code, 0, help.out);
+      assert.match(help.stdout, /usage: ml-dash \w+ \[options\] \[PATH\]/);
+      assert.match(help.stdout, /--skip-metrics/);
+      assert.match(help.stdout, /--state-file/);
+    }
   });
 });
 
@@ -358,13 +301,36 @@ describe("remove", () => {
     assert.ok(!h.server.requests.some((q) => q.method === "DELETE"));
   });
 
-  test("without -y and without a terminal it refuses to delete", async (t) => {
+  test("a piped confirmation is accepted, as it was in the Python CLI", async (t) => {
     const h = await harness(t);
     await h.login();
-    const r = await h.cli(["remove", "-p", "alpha", "--dash-url", h.server.url]);
-    assert.equal(r.code, 1);
-    assert.match(r.stderr, /Refusing to delete/);
-    assert.ok(!h.server.requests.some((q) => q.method === "DELETE"), "deleted without confirmation");
+    const r = await h.cli(["remove", "-p", "alpha", "--dash-url", h.server.url], { input: "alpha\n" });
+    assert.equal(r.code, 0, r.out);
+    assert.ok(
+      h.server.requests.some((q) => q.method === "DELETE"),
+      "a piped confirmation did not reach the delete",
+    );
+    assert.ok(!h.server.state.projects.some((p) => p.slug === "alpha"));
+  });
+
+  test("a piped name that does not match cancels", async (t) => {
+    const h = await harness(t);
+    await h.login();
+    const r = await h.cli(["remove", "-p", "alpha", "--dash-url", h.server.url], { input: "beta\n" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.stdout, /Deletion cancelled/);
+    assert.ok(!h.server.requests.some((q) => q.method === "DELETE"));
+    assert.ok(h.server.state.projects.some((p) => p.slug === "alpha"));
+  });
+
+  test("end of input cancels instead of hanging on the prompt", async (t) => {
+    const h = await harness(t);
+    await h.login();
+    const r = await h.cli(["remove", "-p", "alpha", "--dash-url", h.server.url], { input: "" });
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.stdout, /Deletion cancelled/);
+    assert.match(r.stdout, /pass -y to confirm non-interactively/);
+    assert.ok(!h.server.requests.some((q) => q.method === "DELETE"));
     assert.ok(h.server.state.projects.some((p) => p.slug === "alpha"));
   });
 });

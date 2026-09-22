@@ -8,6 +8,12 @@
  *
  * A project that does not exist exits 0 — "make sure this is gone" has already
  * succeeded — while a permission failure exits 1.
+ *
+ * The confirmation is read from stdin whether or not it is a terminal, which
+ * is what `console.input()` did in Python: `echo my-project | ml-dash remove -p
+ * my-project` is a supported way to confirm. Refusing every non-tty invocation
+ * would have broken that. Reaching end-of-input without a matching line
+ * cancels and exits 0 rather than hanging on a prompt nobody can answer.
  */
 import { createInterface } from "node:readline/promises";
 import { HttpError } from "../client.js";
@@ -35,10 +41,19 @@ Examples:
   ],
 };
 
-async function promptForName(): Promise<string> {
+/** The typed confirmation, or null when stdin ended without one. */
+async function promptForName(): Promise<string | null> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
-    return (await rl.question("Type the project name to confirm deletion: ")).trim();
+    return await new Promise<string | null>((resolve) => {
+      rl.question("Type the project name to confirm deletion: ").then(
+        (answer) => resolve(answer.trim()),
+        () => resolve(null),
+      );
+      // A closed pipe never answers the question; without this the process
+      // would sit on a prompt that can no longer be typed into.
+      rl.once("close", () => resolve(null));
+    });
   } finally {
     rl.close();
   }
@@ -77,15 +92,6 @@ export async function run(args: ParsedArgs): Promise<number> {
     }
 
     if (!args.yes) {
-      // Without a terminal there is nobody to type the name, and defaulting to
-      // "delete" would make a piped invocation destructive by accident.
-      if (!process.stdin.isTTY) {
-        console.error(
-          `${red("Error:")} Refusing to delete '${fullPath}' without confirmation.\n` +
-            "stdin is not a terminal — pass -y to confirm non-interactively.",
-        );
-        return 1;
-      }
       console.log(
         `\n${red(bold("⚠ WARNING ⚠"))}\n\n` +
           `You are about to delete project: ${bold(fullPath)}\n` +
@@ -96,6 +102,12 @@ export async function run(args: ParsedArgs): Promise<number> {
           `${red("This action CANNOT be undone.")}\n`,
       );
       const answer = await promptForName();
+      if (answer === null) {
+        console.log(
+          `\n${yellow("Deletion cancelled.")} No confirmation on stdin — pass -y to confirm non-interactively.`,
+        );
+        return 0;
+      }
       if (answer !== split.project) {
         console.log(`\n${yellow("Deletion cancelled.")}`);
         return 0;
