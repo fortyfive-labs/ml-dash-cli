@@ -20,7 +20,9 @@ param(
     [string]$Version    = $env:ML_DASH_VERSION,
     [string]$Channel    = $(if ($env:ML_DASH_CHANNEL) { $env:ML_DASH_CHANNEL } else { 'latest' }),
     [string]$InstallDir = $(if ($env:ML_DASH_INSTALL_DIR) { $env:ML_DASH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'ml-dash\bin' }),
-    [string]$BaseUrl    = $(if ($env:ML_DASH_BASE_URL) { $env:ML_DASH_BASE_URL } else { 'https://dl.dash.ml' })
+    [string]$BaseUrl    = $(if ($env:ML_DASH_BASE_URL) { $env:ML_DASH_BASE_URL } else { 'https://dl.dash.ml' }),
+    # Take over an install-directory entry this installer does not own.
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Stop'
@@ -60,6 +62,9 @@ $rel = "$BaseUrl/$Prefix/$Version"
 # alike, so a broken download never lingers as a half-installed binary.
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("ml-dash-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $tmp -Force | Out-Null
+# Declared out here so the finally block can remove a staged file left inside
+# the install directory by a failure between the copy and the rename.
+$stage = $null
 
 try {
     Write-Host "ml-dash $Version ($platform)"
@@ -101,11 +106,14 @@ try {
 
     # ── install ──────────────────────────────────────────────────────────────
     New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
-    $target = Join-Path $InstallDir 'ml-dash.exe'
+    $target  = Join-Path $InstallDir 'ml-dash.exe'
+    # Written after a successful install and the only ownership claim trusted
+    # here: it records the sha256 this installer put at $target.
+    $receipt = Join-Path $InstallDir '.ml-dash.receipt'
 
     # An ml-dash from another channel (npm, pip) is reported and left alone:
     # deleting files this installer did not create would break whatever owns
-    # them. Reinstalling over an earlier run of this installer is fine.
+    # them.
     $existing = Get-Command ml-dash -ErrorAction SilentlyContinue |
                 Select-Object -First 1 -ExpandProperty Source -ErrorAction SilentlyContinue
     if ($existing -and $existing -ne $target) {
@@ -119,23 +127,65 @@ try {
         Write-Host "        remove it with its own tool if you want this one to take over."
     }
 
-    # Copy into the install directory first, then rename: the last step is a
-    # single move within one volume, so $target is either the old binary or
-    # the complete new one. Windows refuses to overwrite a running exe, which
-    # surfaces here as a clear error instead of a corrupted install.
+    # The install path may be occupied by something this installer did not put
+    # there. A matching path proves nothing about ownership, so the test is the
+    # receipt plus the bytes still being the ones it recorded. A reparse point
+    # (symlink or junction, as npm and pipx shims use) is never overwritten.
+    if (Test-Path -LiteralPath $target) {
+        $item = Get-Item -LiteralPath $target -Force
+        $owned = $false
+        $conflict = $null
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $conflict = "$target is a link, not a regular file"
+        } elseif (-not (Test-Path -LiteralPath $receipt)) {
+            $conflict = "$target already exists and has no install receipt"
+        } else {
+            $recorded = (Get-Content -LiteralPath $receipt |
+                         Where-Object { $_ -like 'sha256=*' } |
+                         Select-Object -First 1) -replace '^sha256=', ''
+            if ($recorded -and $recorded -eq (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLower()) {
+                $owned = $true
+            } else {
+                $conflict = "$target has been modified or replaced since this installer wrote it"
+            }
+        }
+        if (-not $owned -and -not $Force) {
+            Write-Host ""
+            Write-Host "  refusing to overwrite: $conflict"
+            Write-Host "  It was not installed by this installer, so removing it could break"
+            Write-Host "  whatever owns it. Options:"
+            Write-Host "    - install elsewhere:   -InstallDir <dir>"
+            Write-Host "    - remove it with the tool that installed it, then re-run"
+            Write-Host "    - take it over anyway: -Force"
+            exit 1
+        }
+    }
+
+    # Copy in, then rename: the last step is a move within one volume, so
+    # $target is either the old binary or the complete new one. Windows refuses
+    # to replace a running exe, which surfaces as a clear error rather than a
+    # corrupted install. $stage is cleaned up in finally either way.
     $stage = Join-Path $InstallDir (".ml-dash." + [Guid]::NewGuid().ToString('N') + ".tmp")
-    Copy-Item -Path $staged -Destination $stage -Force
+    Copy-Item -LiteralPath $staged -Destination $stage -Force
     try {
-        Move-Item -Path $stage -Destination $target -Force
+        Move-Item -LiteralPath $stage -Destination $target -Force
+        $stage = $null   # renamed, not ours to delete any more
     } catch {
-        Remove-Item -Path $stage -Force -ErrorAction SilentlyContinue
         Die "cannot install to $target (is ml-dash running?): $($_.Exception.Message)"
     }
+
+    @(
+        "channel=r2"
+        "version=$Version"
+        "platform=$platform"
+        "sha256=$gotSha"
+        "source=$rel/$platform/$binary"
+    ) | Set-Content -LiteralPath $receipt -Encoding ASCII
 
     Write-Host ""
     Write-Host "  installed $target"
 
-    # PATH is only extended for the current user, and only when this directory
+    # PATH is extended for the current user only, and only when this directory
     # is not already there — appending a duplicate on every reinstall would
     # grow the user PATH without bound.
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -147,5 +197,6 @@ try {
         Write-Host "  run: ml-dash --help"
     }
 } finally {
-    Remove-Item -Path $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+    if ($stage) { Remove-Item -LiteralPath $stage -Force -ErrorAction SilentlyContinue }
 }

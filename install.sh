@@ -9,6 +9,8 @@
 #   --channel <name>    ML_DASH_CHANNEL       latest (default) or stable
 #   --install-dir <d>   ML_DASH_INSTALL_DIR   default: ~/.local/bin
 #   --base-url <url>    ML_DASH_BASE_URL      default: https://dl.dash.ml
+#   --force                                   take over an install dir entry
+#                                             this installer does not own
 #
 # Installs one self-contained binary: no Node, npm, Python or compiler is
 # needed here or afterwards. Every download is checked against the sha256 in
@@ -21,6 +23,7 @@ PREFIX="ml-dash-cli/releases"
 CHANNEL="${ML_DASH_CHANNEL:-latest}"
 VERSION="${ML_DASH_VERSION:-}"
 INSTALL_DIR="${ML_DASH_INSTALL_DIR:-$HOME/.local/bin}"
+FORCE=0
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -28,6 +31,7 @@ while [ $# -gt 0 ]; do
         --channel)     CHANNEL="${2:?--channel needs a value}"; shift 2 ;;
         --install-dir) INSTALL_DIR="${2:?--install-dir needs a value}"; shift 2 ;;
         --base-url)    BASE_URL="${2:?--base-url needs a value}"; shift 2 ;;
+        --force)       FORCE=1; shift ;;
         -h|--help)     sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown option: $1" >&2; exit 2 ;;
     esac
@@ -89,10 +93,14 @@ if [ -z "$VERSION" ]; then
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/ml-dash-install.XXXXXX")" || die "cannot create a temp directory"
-# Every exit path removes the download, including a failed or interrupted one.
-trap 'rm -rf "$TMP"' EXIT
-trap 'rm -rf "$TMP"; exit 130' INT
-trap 'rm -rf "$TMP"; exit 143' TERM
+# STAGE is created later inside the install directory; naming it now means one
+# cleanup handles both, so a failure or Ctrl-C between copy and rename cannot
+# leave a stray .ml-dash.*.tmp sitting next to the real binary.
+STAGE=""
+cleanup() { rm -rf "$TMP"; [ -n "$STAGE" ] && rm -f "$STAGE"; return 0; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 echo "ml-dash $VERSION ($PLATFORM)"
 
@@ -105,11 +113,15 @@ fetch "$REL/manifest.json" "$TMP/manifest.json" ||
 # file name — Windows builds are ml-dash.exe and a hardcoded name would ship
 # the wrong object.
 read_field() {  # read_field <field>
-    awk -v p="\"$PLATFORM\"" -v f="\"$1\"" '
-        $1 == p ":" || $1 == p { inside = 1 }
+    # `tr` puts every JSON token on its own line first, so the same awk reads a
+    # pretty-printed manifest and a minified one alike — no jq, no python on
+    # the installing machine. The binary name is read rather than assumed:
+    # Windows builds are ml-dash.exe and a hardcoded name ships nothing.
+    tr '{,' '\n\n' < "$TMP/manifest.json" | awk -v p="\"$PLATFORM\"" -v f="\"$1\"" '
+        $1 == p ":" || $1 == p { inside = 1; next }
         inside && $1 == f ":" { v = $2; gsub(/[",]/, "", v); print v; exit }
-        inside && /^[ \t]*}/ { inside = 0 }
-    ' "$TMP/manifest.json"
+        inside && /}/ { inside = 0 }
+    '
 }
 BINARY="$(read_field binary)"
 WANT_SHA="$(read_field checksum)"
@@ -134,17 +146,20 @@ chmod +x "$TMP/$BINARY"
 # ── install ──────────────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 TARGET="$INSTALL_DIR/ml-dash"
+# Written next to the binary after a successful install, and the only claim of
+# ownership this installer trusts: it records the sha256 it put there, so an
+# entry that has since been replaced by another tool no longer matches.
+RECEIPT="$INSTALL_DIR/.ml-dash.receipt"
 
-# Another channel's ml-dash (npm, pipx, a package manager) is left exactly as
-# it is: removing files this installer did not create would break whatever
-# manages them. Reinstalling over an earlier run of this installer is fine —
-# that is the same channel and the same path.
+# An ml-dash from another channel (npm, pipx, a package manager) is reported
+# and left exactly as it is — removing files this installer did not create
+# would break whatever manages them.
 existing="$(command -v ml-dash 2>/dev/null || true)"
 if [ -n "$existing" ] && [ "$existing" != "$TARGET" ]; then
     case "$existing" in
-        *node_modules*|*/npm/*)     other="an npm install" ;;
-        *site-packages*|*pipx*)     other="a pip/pipx install" ;;
-        *)                          other="another install" ;;
+        *node_modules*|*/npm/*)  other="an npm install" ;;
+        *site-packages*|*pipx*)  other="a pip/pipx install" ;;
+        *)                       other="another install" ;;
     esac
     echo ""
     echo "  note: $other of ml-dash is already on your PATH at:"
@@ -153,14 +168,51 @@ if [ -n "$existing" ] && [ "$existing" != "$TARGET" ]; then
     echo "        remove it with its own tool if you want this one to take over."
 fi
 
-# Staged in the install directory itself so the final step is a rename within
-# one filesystem: either the old binary or the complete new one is at TARGET,
-# never a half-written file, and never a running binary truncated mid-write.
+# The install path itself may be occupied by something this installer did not
+# put there — ~/.local/bin is shared with pipx, npm prefixes and hand-written
+# scripts. Matching paths proves nothing about who owns the file, so the check
+# is against the receipt: same path AND the bytes still being the ones recorded
+# there. Anything else (no receipt, a changed file, a symlink into another
+# tool's store) is refused rather than overwritten.
+if [ -e "$TARGET" ] || [ -L "$TARGET" ]; then
+    owned=0
+    if [ -L "$TARGET" ]; then
+        conflict="$TARGET is a symlink to $(readlink "$TARGET" 2>/dev/null || echo '?')"
+    elif [ ! -f "$RECEIPT" ]; then
+        conflict="$TARGET already exists and has no install receipt"
+    else
+        recorded="$(sed -n 's/^sha256=//p' "$RECEIPT" | head -1)"
+        if [ -n "$recorded" ] && [ "$recorded" = "$(sha256 "$TARGET")" ]; then
+            owned=1
+        else
+            conflict="$TARGET has been modified or replaced since this installer wrote it"
+        fi
+    fi
+    if [ "$owned" != "1" ] && [ "$FORCE" != "1" ]; then
+        echo "" >&2
+        echo "  refusing to overwrite: $conflict" >&2
+        echo "  It was not installed by this installer, so removing it could break" >&2
+        echo "  whatever owns it. Options:" >&2
+        echo "    - install elsewhere:  --install-dir <dir>" >&2
+        echo "    - remove it with the tool that installed it, then re-run" >&2
+        echo "    - take it over anyway: --force" >&2
+        exit 1
+    fi
+fi
+
+# Staged inside the install directory so the final step is a rename within one
+# filesystem: $TARGET is either the old binary or the complete new one, never a
+# half-written file.
 STAGE="$INSTALL_DIR/.ml-dash.$$.tmp"
 rm -f "$STAGE"
 cp "$TMP/$BINARY" "$STAGE" || die "cannot write to $INSTALL_DIR"
 chmod 755 "$STAGE"
-mv -f "$STAGE" "$TARGET" || { rm -f "$STAGE"; die "cannot install to $TARGET"; }
+mv -f "$STAGE" "$TARGET" || die "cannot install to $TARGET"
+STAGE=""   # renamed, not ours to delete any more
+
+printf 'channel=r2\nversion=%s\nplatform=%s\nsha256=%s\nsource=%s\n' \
+    "$VERSION" "$PLATFORM" "$GOT_SHA" "$REL/$PLATFORM/$BINARY" > "$RECEIPT" ||
+    echo "  warning: could not write $RECEIPT; the next run will not recognise this install" >&2
 
 echo ""
 echo "  installed $TARGET"

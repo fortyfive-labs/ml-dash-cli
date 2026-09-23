@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# Publish an already-built release: binaries to R2, the package to npm, and
-# only then the channel pointers.
+# Publish an already-built release: artifacts to R2, the packed tarball to npm,
+# and only then the channel pointers.
 #
 #   ./scripts/publish-release.sh 0.1.0                # R2 + npm, move `latest`
 #   ./scripts/publish-release.sh 0.1.0 --stable       # also move `stable`
@@ -9,20 +9,18 @@
 #   ./scripts/publish-release.sh 0.1.0 --no-pointer
 #   ./scripts/publish-release.sh 0.1.0 --verify-only  # re-check, upload nothing
 #
-# This script never builds. It publishes exactly the artifacts already sitting
-# in release/<version>/, after re-hashing each one against the manifest, so
-# what ships is the build that was reviewed — not a fresh, unreviewed compile
-# smuggled in by the publish step.
+# This script produces nothing. No compile, no `npm run build`, no `npm pack`:
+# it uploads the exact bytes in release/<version>/ after re-hashing each one
+# against that release's manifest, and publishes the tarball packed at build
+# time. An artifact rebuilt after review cannot ride out under the reviewed
+# version, and a publish interrupted halfway can be re-run.
 #
-# Requires: wrangler auth (CLOUDFLARE_API_TOKEN with R2 write, or `wrangler
-# login`) and `npm whoami` as a publisher of the package.
+# Requires: wrangler auth (`npx wrangler login` or CLOUDFLARE_API_TOKEN with R2
+# write) and `npm whoami` as a publisher of the package.
 set -euo pipefail
 
 BUCKET="${ML_DASH_R2_BUCKET:-dash-downloads}"
 PREFIX="ml-dash-cli/releases"
-# Reads go through the public URL — the same path an install takes — so
-# verification exercises the domain and cache layer, not just the bucket API.
-PUBLIC="${ML_DASH_PUBLIC_URL:-https://dl.dash.ml}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 VERSION="${1:-}"
@@ -47,10 +45,24 @@ REL="$ROOT/release/$VERSION"
 [ -f "$REL/manifest.json" ] ||
     { echo "No build at release/$VERSION — run: bun run scripts/build-release.ts" >&2; exit 1; }
 
-wr() { npx --yes wrangler "$@"; }
+# One temp directory for the whole run, removed on success, failure and
+# interrupt alike — a failed verification must not leave hundreds of MB of
+# downloaded binaries behind. Function-scoped RETURN traps were tried first and
+# fight with this one; a single owner is the thing that reliably fires.
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/ml-dash-publish.XXXXXX")"
+cleanup() { rm -rf "$TMP"; }
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+mget() {  # mget <python-expression over the manifest dict `m`>
+    python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$REL/manifest.json" "$1"
+}
+sha_of() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+size_of() { wc -c < "$1" | tr -d ' '; }
 
 # `while read` rather than `mapfile`: macOS ships bash 3.2.
-manifest_rows() {  # platform binary checksum size, one per line
+manifest_rows() {  # platform binary checksum size
     python3 -c '
 import json, sys
 for platform, e in json.load(open(sys.argv[1]))["platforms"].items():
@@ -58,54 +70,94 @@ for platform, e in json.load(open(sys.argv[1]))["platforms"].items():
 ' "$REL/manifest.json"
 }
 
-sha_of() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
+# The release states the host it was built for; publishing it somewhere else
+# would ship installers whose baked-in base URL points at a different origin
+# than the one serving them.
+PUBLIC="$(mget 'm.get("publicUrl","")')"
+if [ -n "${ML_DASH_PUBLIC_URL:-}" ] && [ "$ML_DASH_PUBLIC_URL" != "$PUBLIC" ]; then
+    echo "Manifest was built for $PUBLIC but ML_DASH_PUBLIC_URL is $ML_DASH_PUBLIC_URL." >&2
+    echo "Rebuild with --public-url=$ML_DASH_PUBLIC_URL rather than redirecting the upload." >&2
+    exit 1
+fi
+[ -n "$PUBLIC" ] || { echo "Manifest has no publicUrl — rebuild with the current build script." >&2; exit 1; }
 
-# ── 1. the local artifacts must be the ones the manifest describes ───────────
-# Cheap, and it catches the case this whole script exists to prevent: a binary
-# rebuilt or edited after review, sharing a version with the reviewed one.
+MANIFEST_VERSION="$(mget 'm["version"]')"
+[ "$MANIFEST_VERSION" = "$VERSION" ] ||
+    { echo "release/$VERSION/manifest.json says version $MANIFEST_VERSION" >&2; exit 1; }
+PKG_VERSION="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$ROOT/package.json")"
+[ "$PKG_VERSION" = "$VERSION" ] ||
+    { echo "package.json is $PKG_VERSION but publishing $VERSION" >&2; exit 1; }
+TARBALL="$(mget 'm["npm"]["tarball"]')"
+# The tarball's own package.json is the version npm will register — a stale
+# .tgz left in the release directory would otherwise publish a past build.
+TGZ_VERSION="$(tar -xzOf "$REL/$TARBALL" package/package.json | python3 -c 'import json,sys; print(json.load(sys.stdin)["version"])')"
+[ "$TGZ_VERSION" = "$VERSION" ] ||
+    { echo "$TARBALL contains version $TGZ_VERSION, not $VERSION" >&2; exit 1; }
+
+# ── 1. local artifacts must be the ones the manifest describes ───────────────
 check_local() {
     echo "Checking local artifacts in release/$VERSION"
     manifest_rows | while read -r platform binary checksum size; do
         src="$REL/$platform/$binary"
         [ -f "$src" ] || { echo "  ✗ manifest lists $platform/$binary but the file is missing" >&2; exit 1; }
-        actual_size="$(wc -c < "$src" | tr -d ' ')"
-        actual_sha="$(sha_of "$src")"
-        if [ "$actual_size" != "$size" ] || [ "$actual_sha" != "$checksum" ]; then
+        if [ "$(size_of "$src")" != "$size" ] || [ "$(sha_of "$src")" != "$checksum" ]; then
             echo "  ✗ $platform/$binary does not match the manifest — rebuild, do not publish" >&2
             exit 1
         fi
         echo "  ✓ $platform/$binary"
     done || exit 1
+    for name in "$TARBALL" install.sh install.ps1; do
+        key="m[\"npm\"]"; [ "$name" = "$TARBALL" ] || key="m[\"installers\"][\"$name\"]"
+        want_sha="$(mget "$key[\"checksum\"]")"; want_size="$(mget "$key[\"size\"]")"
+        if [ "$(size_of "$REL/$name")" != "$want_size" ] || [ "$(sha_of "$REL/$name")" != "$want_sha" ]; then
+            echo "  ✗ $name does not match the manifest — rebuild, do not publish" >&2
+            exit 1
+        fi
+        echo "  ✓ $name"
+    done
 }
 
-# ── 2. read every uploaded byte back over the public URL ─────────────────────
-# A successful wrangler exit is not evidence the bytes are fetchable: the
-# object may be missing, truncated, or shadowed by an edge-cached 404 from an
-# earlier failed attempt of the same version. The `?v=` query busts that cache;
-# versioned objects are otherwise served as immutable.
+# ── 2. read every published byte back over the public URL ────────────────────
+# A successful wrangler exit is not evidence the bytes are fetchable: an object
+# can be missing, truncated, or shadowed by an edge-cached 404 from an earlier
+# failed attempt at the same version. `?v=` busts that cache; versioned objects
+# are otherwise served as immutable.
+remote_matches() {  # remote_matches <url> <sha> <size> — prints nothing, returns status
+    local out="$TMP/probe.$$"
+    curl -fsSL --retry 3 -o "$out" "$1?v=$(date +%s)" || { rm -f "$out"; return 1; }
+    local got_sha got_size
+    got_sha="$(sha_of "$out")"; got_size="$(size_of "$out")"
+    rm -f "$out"
+    [ "$got_sha" = "$2" ] && [ "$got_size" = "$3" ]
+}
+
 verify_remote() {
     echo "Verifying $VERSION via $PUBLIC/$PREFIX"
-    local vtmp stamp
-    vtmp="$(mktemp -d)"; stamp="$(date +%s)"
-    trap 'rm -rf "$vtmp"' RETURN
-    if ! cmp -s <(curl -fsSL --retry 3 "$PUBLIC/$PREFIX/$VERSION/manifest.json?v=$stamp") "$REL/manifest.json"; then
+    if ! cmp -s <(curl -fsSL --retry 3 "$PUBLIC/$PREFIX/$VERSION/manifest.json?v=$(date +%s)") "$REL/manifest.json"; then
         echo "  ✗ remote manifest.json is unreachable or differs from the local one" >&2
         exit 1
     fi
     echo "  ✓ manifest.json"
     manifest_rows | while read -r platform binary checksum size; do
-        out="$vtmp/$platform-$binary"
-        curl -fsSL --retry 3 -o "$out" "$PUBLIC/$PREFIX/$VERSION/$platform/$binary?v=$stamp" ||
-            { echo "  ✗ $platform/$binary: download failed" >&2; exit 1; }
-        actual_size="$(wc -c < "$out" | tr -d ' ')"
-        actual_sha="$(sha_of "$out")"
-        rm -f "$out"
-        if [ "$actual_size" != "$size" ] || [ "$actual_sha" != "$checksum" ]; then
-            echo "  ✗ $platform/$binary: remote bytes differ from the manifest (size $actual_size, sha $actual_sha)" >&2
-            exit 1
-        fi
+        remote_matches "$PUBLIC/$PREFIX/$VERSION/$platform/$binary" "$checksum" "$size" ||
+            { echo "  ✗ $platform/$binary: missing or differs from the manifest" >&2; exit 1; }
         echo "  ✓ $platform/$binary"
     done || exit 1
+    remote_matches "$PUBLIC/$PREFIX/$VERSION/$TARBALL" "$(mget 'm["npm"]["checksum"]')" "$(mget 'm["npm"]["size"]')" ||
+        { echo "  ✗ $TARBALL: missing or differs from the manifest" >&2; exit 1; }
+    echo "  ✓ $TARBALL"
+    # Both copies of each installer, at the exact URLs README and docs tell
+    # people to pipe into a shell. The root copy keeps the headline command
+    # short; the prefixed copy leaves the root free for another tool later.
+    for name in install.sh install.ps1; do
+        want_sha="$(mget "m[\"installers\"][\"$name\"][\"checksum\"]")"
+        want_size="$(mget "m[\"installers\"][\"$name\"][\"size\"]")"
+        for url in "$PUBLIC/$name" "$PUBLIC/ml-dash-cli/$name"; do
+            remote_matches "$url" "$want_sha" "$want_size" ||
+                { echo "  ✗ $url: missing or differs from the built installer" >&2; exit 1; }
+            echo "  ✓ $url"
+        done
+    done
 }
 
 if [ "$VERIFY_ONLY" = "1" ]; then
@@ -118,9 +170,25 @@ fi
 
 check_local
 
+# ── 3. an already-published version is immutable ─────────────────────────────
+# Re-running after a half-finished publish must be safe; silently rewriting a
+# version someone already installed must not be possible. The published
+# manifest decides which case this is.
+existing="$TMP/remote-manifest.json"
+if curl -fsSL --retry 2 -o "$existing" "$PUBLIC/$PREFIX/$VERSION/manifest.json?v=$(date +%s)" 2>/dev/null; then
+    if cmp -s "$existing" "$REL/manifest.json"; then
+        echo "Version $VERSION is already published with these exact artifacts — resuming."
+    else
+        echo "Version $VERSION is already published with DIFFERENT artifacts." >&2
+        echo "Versioned objects are immutable and installs pin them. Bump the version." >&2
+        exit 1
+    fi
+fi
+
 IMMUTABLE="public, max-age=31536000, immutable"   # versioned objects never change
 POINTER="public, max-age=60, must-revalidate"     # pointers decide new installs
 
+wr() { npx --yes wrangler "$@"; }
 put() {  # put <key> <file> <content-type> <cache-control>
     wr r2 object put "$BUCKET/$1" --file="$2" --content-type="$3" --cache-control="$4" --remote
 }
@@ -132,59 +200,63 @@ manifest_rows | while read -r platform binary checksum size; do
     put "$PREFIX/$VERSION/$platform/$binary" "$REL/$platform/$binary" "application/octet-stream" "$IMMUTABLE"
 done || exit 1
 
+echo "  → $TARBALL"
+put "$PREFIX/$VERSION/$TARBALL" "$REL/$TARBALL" "application/gzip" "$IMMUTABLE"
+
+echo "  → install.sh / install.ps1 (root + prefixed)"
+for name in install.sh install.ps1; do
+    put "$name" "$REL/$name" "text/plain; charset=utf-8" "public, max-age=300"
+    put "ml-dash-cli/$name" "$REL/$name" "text/plain; charset=utf-8" "public, max-age=300"
+done
+
 echo "  → manifest.json"
 put "$PREFIX/$VERSION/manifest.json" "$REL/manifest.json" "application/json" "$IMMUTABLE"
 
-echo "  → install.sh / install.ps1"
-for script in install.sh install.ps1; do
-    # Root copy keeps the headline command short; the prefixed copy leaves the
-    # root free for another tool later without breaking pinned URLs.
-    put "$script" "$ROOT/$script" "text/plain; charset=utf-8" "public, max-age=300"
-    put "ml-dash-cli/$script" "$ROOT/$script" "text/plain; charset=utf-8" "public, max-age=300"
-done
-
-# The gate. No pointer moves, and npm does not publish, until everything
-# uploaded reads back byte-for-byte over the public URL.
+# The gate: npm does not publish and no pointer moves until every uploaded
+# object — binaries, tarball, and both installer URLs — reads back correct.
 verify_remote
 
 # ── npm ──────────────────────────────────────────────────────────────────────
-# One ordinary JavaScript package: `bin/ml-dash.js` over `dist/`, running the
-# same src/index.ts the binaries compile from. No per-platform subpackages —
-# the eight compiled targets are the R2 channel's job, and duplicating them as
-# npm packages would mean eight more immutable publishes to keep in sync for
-# users who already have Node.
+# One ordinary JavaScript package: bin/ml-dash.js over dist/, from the same
+# src/index.ts the binaries compile from. No per-platform subpackages — the
+# eight compiled targets are the R2 channel's job, and duplicating them on npm
+# would mean eight more immutable publishes to keep in step.
 publish_npm() {
     echo ""
     echo "Publishing ml-dash@$VERSION to npm"
-    local pkg_version
-    pkg_version="$(python3 -c 'import json;print(json.load(open("'"$ROOT"'/package.json"))["version"])')"
-    [ "$pkg_version" = "$VERSION" ] ||
-        { echo "  ✗ package.json is $pkg_version but publishing $VERSION" >&2; exit 1; }
+    local local_integrity registry_integrity
+    # npm's own integrity of the exact file we would upload, so a version
+    # already on the registry can be compared byte-for-byte instead of being
+    # skipped on a version-string match that proves nothing about its contents.
+    local_integrity="$(npm pack --dry-run --json "$REL/$TARBALL" 2>/dev/null |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["integrity"])')"
+    registry_integrity="$(npm view "ml-dash@$VERSION" dist.integrity 2>/dev/null || true)"
 
-    if [ "$(npm view "ml-dash@$VERSION" version 2>/dev/null || true)" = "$VERSION" ]; then
-        echo "  ✓ ml-dash@$VERSION is already on the registry — skipping"
-        return 0
+    if [ -n "$registry_integrity" ]; then
+        if [ "$registry_integrity" = "$local_integrity" ]; then
+            echo "  ✓ ml-dash@$VERSION is on the registry with these exact bytes — skipping"
+            return 0
+        fi
+        echo "  ✗ ml-dash@$VERSION is on the registry with DIFFERENT bytes" >&2
+        echo "    registry: $registry_integrity" >&2
+        echo "    local:    $local_integrity" >&2
+        echo "    npm versions are immutable. Bump the version; do not republish." >&2
+        exit 1
     fi
 
-    # dist/ is what bin/ml-dash.js imports; publishing without it yields a
-    # package that installs cleanly and fails on first run.
-    (cd "$ROOT" && npm run build >/dev/null)
-    [ -f "$ROOT/dist/index.js" ] || { echo "  ✗ dist/index.js missing after build" >&2; exit 1; }
-
-    # Dry run first: the file list is the last chance to notice that `files`
-    # in package.json is shipping too little or too much.
-    (cd "$ROOT" && npm pack --dry-run)
-
-    # One submission only. An error can follow an accepted upload, and npm
-    # versions are immutable — retrying an uncertain publish cannot help, so
-    # reconcile against the registry by hand instead.
-    (cd "$ROOT" && npm publish --access public) ||
+    # The tarball packed at build time, published as-is. `npm publish` on a
+    # directory would re-pack whatever is on disk now — a different artifact
+    # from the reviewed one.
+    #
+    # One submission only. An error can follow an accepted upload, and the
+    # version is immutable, so a retry cannot help: reconcile by hand.
+    npm publish --access public "$REL/$TARBALL" ||
         { echo "  ✗ ml-dash@$VERSION outcome unresolved; check the registry before retrying. No retry here." >&2; exit 1; }
 
-    published="$(npm view "ml-dash@$VERSION" version 2>/dev/null || true)"
-    [ "$published" = "$VERSION" ] ||
-        { echo "  ✗ registry does not report $VERSION after publish (got '${published:-<nothing>}')" >&2; exit 1; }
-    echo "  ✓ ml-dash@$VERSION on the registry"
+    registry_integrity="$(npm view "ml-dash@$VERSION" dist.integrity 2>/dev/null || true)"
+    [ "$registry_integrity" = "$local_integrity" ] ||
+        { echo "  ✗ registry integrity after publish is '${registry_integrity:-<nothing>}', expected $local_integrity" >&2; exit 1; }
+    echo "  ✓ ml-dash@$VERSION on the registry, integrity matches"
 }
 
 if [ "$PUBLISH_NPM" = "1" ]; then
@@ -192,10 +264,7 @@ if [ "$PUBLISH_NPM" = "1" ]; then
 fi
 
 # ── pointers, last ───────────────────────────────────────────────────────────
-TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
 printf '%s' "$VERSION" > "$TMP/pointer"
-
 check_pointer() {  # check_pointer <channel>
     got="$(curl -fsSL "$PUBLIC/$PREFIX/$1?v=$(date +%s)" 2>/dev/null || true)"
     [ "$got" = "$VERSION" ] ||
