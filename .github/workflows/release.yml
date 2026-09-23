@@ -299,22 +299,51 @@ jobs:
             echo "and the commit \`v$V\` tags."
           } > "$notes"
 
+          # The tag is made with git, before the Release exists, and points at
+          # the manifest's commit — the one the published bytes were built
+          # from, which on a resumed release is *not* this run's checkout.
+          #
+          # It is deliberately not `gh release create --target "$SRC_COMMIT"`.
+          # That asks the releases API to resolve a commit, and the API then
+          # refuses when the resolved commit's `.github/workflows/` differs
+          # from the default branch's, because creating that release would
+          # amount to changing workflow files — a permission GITHUB_TOKEN
+          # cannot be granted at all. v0.1.1 hit exactly that: the artifacts
+          # were built from 41ece18, and the only later commit on main,
+          # 4f45e92, edited this file. Runs 35839740311 and 35839865703 both
+          # answered `403 Resource not accessible by integration` while the
+          # job log showed `Contents: write` granted. `contents: write` is not
+          # the missing piece and no organization setting is either.
+          #
+          # Creating the tag over git is not subject to that rule — it adds no
+          # workflow content, it points at a commit GitHub already has — and
+          # once the tag exists `gh release create` needs no target, so the
+          # API never resolves one.
+          existing="$(git ls-remote origin "refs/tags/v$V^{}" | cut -f1)"
+          [ -n "$existing" ] || existing="$(git ls-remote origin "refs/tags/v$V" | cut -f1)"
+
+          if [ -z "$existing" ]; then
+            # The checkout is depth-1 on the dispatched ref, which on a
+            # resumed release does not contain the manifest's commit.
+            git cat-file -e "$SRC_COMMIT^{commit}" 2>/dev/null ||
+              git fetch --no-tags --depth=1 origin "$SRC_COMMIT"
+            git tag "v$V" "$SRC_COMMIT"
+            git push origin "v$V"
+            echo "  ✓ tagged v$V at $SRC_COMMIT"
+          elif [ "$existing" = "$SRC_COMMIT" ]; then
+            echo "  ✓ v$V already tags $SRC_COMMIT"
+          else
+            echo "::error::v$V already exists at $existing, but $V was built from $SRC_COMMIT." >&2
+            echo "Tags that installs and release notes point at are not moved by this pipeline." >&2
+            exit 1
+          fi
+
           # Re-runnable: a Release left behind by a failed earlier attempt gets
           # its assets replaced rather than blocking the run.
-          #
-          # --target is not optional here. Without it `gh release create` tags
-          # the default branch's current head, and that is not necessarily the
-          # commit the artifacts came from: a release that fails after R2 and
-          # npm are written is resumed by a *later* main, which adopts the
-          # published manifest and its original commit. Run 35839242613 would
-          # have tagged v0.1.1 at 98ec567 while every published byte was built
-          # from 41ece18. The manifest is the record of what shipped, so the
-          # tag comes from the manifest.
           if gh release view "v$V" >/dev/null 2>&1; then
             gh release upload "v$V" "$staged"/* --clobber
           else
-            gh release create "v$V" "$staged"/* \
-              --target "$SRC_COMMIT" --title "v$V" --notes-file "$notes"
+            gh release create "v$V" "$staged"/* --title "v$V" --notes-file "$notes"
           fi
 
       # Small enough to keep on every run, dry or not: the manifest is the

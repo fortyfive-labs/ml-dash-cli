@@ -40,10 +40,11 @@ What a successful run has done, in order:
    `dist.integrity` was compared against sha512 computed from those same bytes.
 5. `releases/latest` was moved and read back. **`stable` is not moved**; a
    pinned `--version` install is how a platform gets its first real run.
-6. A GitHub Release `v<version>` was created with the manifest, both
-   installers, the tarball and all eight binaries, named per platform. It is
-   last on purpose: a Release is an announcement, and announcing a publish that
-   did not happen is the failure this pipeline is shaped against.
+6. `v<version>` was tagged at the manifest's commit, and a GitHub Release was
+   created on that tag with the manifest, both installers, the tarball and all
+   eight binaries, named per platform. It is last on purpose: a Release is an
+   announcement, and announcing a publish that did not happen is the failure
+   this pipeline is shaped against.
 
 ### The npm package is `@dreamlake/ml-dash`
 
@@ -177,39 +178,94 @@ The two fixes in items 1 and 2 are commit `98ec567`. Item 3's bug is commit
 current head, which is only the right commit when the release runs on the
 commit it ships. A resumed release does not — run `35839242613` would have
 tagged `v0.1.1` at `98ec567` while every published byte was built from
-`41ece18`. The tag target and the release notes now both come from the
-manifest's `commit` field.
+`41ece18`. The tag and the release notes now both come from the manifest's
+`commit` field — though not by the `--target` that commit introduced, which
+turned out to be unusable for the reason below; the tag is made with git
+instead.
 
 #### What is still outstanding
 
-**The GitHub Release `v0.1.1` has not been created, and CI cannot create it.**
-`gh release create` answered:
+**The GitHub Release `v0.1.1` has not been created yet.** `gh release create`
+answered:
 
 ```
 HTTP 403: Resource not accessible by integration
 ```
 
-This is not the workflow's `permissions:` block, which asks for
-`contents: write` and is shown being granted it in the run log. It is an
-organization-level policy. Asking the repository to default to write
-permissions is refused with the reason stated outright:
+The first reading of that was wrong and is worth correcting in place, because
+it pointed at the wrong fix: it was recorded here as an organization policy
+capping `GITHUB_TOKEN`, on the strength of this refusal —
 
 ```
 PUT /repos/fortyfive-labs/ml-dash-cli/actions/permissions/workflow
 409  Write permissions for workflows are disabled by the organization
 ```
 
-So `GITHUB_TOKEN` is capped at read for every workflow in `fortyfive-labs`
-regardless of what a workflow asks for, and **an organization owner has to
-change Organization Settings → Actions → General → Workflow permissions to
-"Read and write permissions"** before the Release step can succeed. Once that
-is done, re-dispatching `release.yml` with `version=0.1.1` is safe and is the
-whole fix: R2 and npm are found already published with identical bytes and are
-skipped, and the run proceeds to create the Release — tagging `41ece18`, the
-commit the artifacts came from.
+That refusal is real, and it is why the repository's "Read and write
+permissions" radio is greyed out. It is also **not the cause of the 403**, and
+no organization setting needs to change. An organization default is a
+*default*: this job's `permissions:` block overrides it, and the job log of
+every run — including `35837574886`, where OIDC trusted publishing then worked
+— shows the override taking effect:
 
-Nothing should be uploaded to a Release by hand. The assets have to be the same
-bytes as R2, and the run that has them is the one that should attach them.
+```
+##[group]GITHUB_TOKEN Permissions
+Contents: write
+Metadata: read
+```
+
+The real cause is `--target`, and it is documented. [Create a
+release](https://docs.github.com/en/rest/releases/releases#create-a-release)
+says that when the commit resolved from `target_commitish` "adds or modifies
+any file under .github/workflows/ relative to the repository's default
+branch", the token must be allowed to change workflows — and that "The
+GITHUB_TOKEN available to GitHub Actions cannot be authorized for this". The
+documented failure is a 404, with some authentication paths surfacing "403
+Resource not accessible by integration" instead.
+
+0.1.1 meets that condition exactly. Its artifacts were built from `41ece18`,
+and the one commit added to `main` after it, `4f45e92`, edited
+`.github/workflows/release.yml`:
+
+```
+git diff --stat 41ece18 4f45e92 -- .github/workflows/
+ .github/workflows/release.yml | 16 +++++++++++++++-
+```
+
+So tagging `41ece18` through the releases API reads as changing a workflow
+file, which `GITHUB_TOKEN` may never do. `contents: write` cannot fix it and
+neither can `write-all`. The tell was there from the start: the 403 appeared
+only once `--target` was introduced in `4f45e92`, and the pre-`--target`
+Release step was never actually observed failing — run `35839242613` was
+cancelled before reaching it.
+
+Also ruled out, rather than assumed: the repository is not a fork, Actions is
+enabled with `allowed_actions: all`, and there are no rulesets at any level
+(`rulesets?includes_parents=true` and the tag rules endpoint both return
+`[]`), so nothing is protecting `v*`.
+
+**The fix is to stop asking the releases API to resolve a commit.** The tag is
+now created with git first, pointing at the manifest's commit, and
+`gh release create` is called on the tag that already exists, with no
+`--target`. Creating a tag over git introduces no workflow content and points
+at a commit GitHub already has, so the rule above does not apply; and with the
+tag present the API has no `target_commitish` to resolve. The whole change
+lives in one step and needs nothing beyond the `contents: write` the job
+already has.
+
+The step is idempotent in the way a resumed release needs. It reads the remote
+tag first — the peeled ref, so an annotated tag compares as its commit — and
+then: no tag, create it; a tag already at the manifest's commit, say so and
+carry on; a tag at any other commit, stop. That last case is a genuine
+conflict, because installs and release notes point at that tag, so this
+pipeline will not move it.
+
+**Next action.** Re-dispatch `release.yml` with `version=0.1.1`,
+`dry_run=false`. npm and R2 are found already published with identical bytes
+and skipped; the run tags `v0.1.1` at `41ece18` and creates the Release.
+Nothing should be uploaded to a Release by hand: the assets have to be the
+same bytes as R2, and the run that has them is the one that should attach
+them.
 
 #### Verified by installing what was published
 
@@ -642,9 +698,10 @@ can reach, which is the way to do that.
   credential check still runs after the tests and the build and before a single
   byte is uploaded, so a missing secret costs a red run, never a half-published
   version. `-f dry_run=true` exercises the same path deliberately.
-- **The GitHub Release is blocked by organization policy.** Write permissions
-  for workflows are disabled org-wide in `fortyfive-labs`, so `GITHUB_TOKEN`
-  is capped at read and `gh release create` answers
-  `403 Resource not accessible by integration` no matter what the workflow's
-  `permissions:` block asks for. An organization owner has to enable
-  "Read and write permissions" before `v0.1.1` can be created.
+- **The GitHub Release is not created yet, and no setting needs to change.**
+  `gh release create --target 41ece18` answered `403 Resource not accessible
+  by integration` because the releases API refuses to resolve a commit whose
+  `.github/workflows/` differs from the default branch's, which `GITHUB_TOKEN`
+  may never do. The job had `contents: write` throughout. The tag is now made
+  with git before the Release, and `gh release create` is called on the
+  existing tag with no `--target`. See "What is still outstanding".
