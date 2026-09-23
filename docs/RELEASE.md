@@ -144,26 +144,33 @@ it published by path, so the bytes on npm are the bytes the manifest describes.
 
 #### The runs it took, and why
 
-Four dispatches, all of version 0.1.1. They are worth recording because three
-of them failed and none of the failures meant what the exit code said.
+Six dispatches, all of version 0.1.1. They are worth recording because five
+of them failed and none of the failures meant what the exit code said. Two of
+the failure modes were each hit twice, from two machines driving the same
+release at once; the pairs are listed together.
 
 1. [`35837574886`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35837574886)
    (`41ece18`) — R2 uploaded and read back, **npm publish succeeded** over OIDC
    with provenance, and the step then failed: the readback ran 0.24 s later and
    npm had not yet served the version it had just accepted. The release was
    real; the verification was wrong.
-2. [`35838698679`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35838698679)
-   (`41ece18`) — refused at the immutability gate, which `cmp`d the published
-   manifest against the rebuilt one. The manifest carries a `built` wall-clock
-   stamp, so that comparison could never hold across two runs.
+2. [`35838377367`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35838377367)
+   and [`35838698679`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35838698679)
+   (both `41ece18`) — refused at the immutability gate, which `cmp`d the
+   published manifest against the rebuilt one. The manifest carries a `built`
+   wall-clock stamp, so that comparison could never hold across two runs. The
+   two manifests were diffed to confirm it: `built` was the only field that
+   differed, across all eight checksums, the tarball and both installers.
 3. [`35839242613`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35839242613)
    (`98ec567`) — with both of those fixed, it resumed correctly, re-verified
    every object and **moved `latest` to 0.1.1**. It was then **cancelled on
    purpose**, before the Release step, because of the bug in item 4 below. No
    tag and no Release were created.
 4. [`35839740311`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35839740311)
-   (`4f45e92`) — publish and verify green end to end; failed creating the
-   GitHub Release, on org policy rather than on anything about the artifacts.
+   and [`35839865703`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35839865703)
+   (both `4f45e92`) — publish and verify green end to end, npm and R2 found
+   already published and skipped; both failed creating the GitHub Release, on
+   org policy rather than on anything about the artifacts.
 
 The two fixes in items 1 and 2 are commit `98ec567`. Item 3's bug is commit
 `4f45e92`: `gh release create` without `--target` tags the default branch's
