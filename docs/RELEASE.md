@@ -112,12 +112,20 @@ A local `npm login` is deliberately not a dependency of any of this.
 
 ### What CI has actually proven so far
 
-One `dry_run=true` run on `ubuntu-latest`
-([35813302906](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35813302906),
-commit `7637326`): `npm test` passed, all eight targets plus the tarball,
-installers and manifest built in a single run, and the manifest check passed.
-The three publish steps were skipped, as the dry run intends — **nothing has
-been published to npm, R2 or Releases by CI or by anyone else.**
+Three `dry_run=true` runs on `ubuntu-latest`, the most recent
+([35815006139](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35815006139),
+commit `4e239bc`) being the one that matters now: 71 tests passed, all eight
+targets plus the tarball, installers and manifest built in a single run, and
+the manifest check passed. The publish steps were skipped, as a dry run
+intends — **nothing has been published to npm, R2 or Releases by CI or by
+anyone else.**
+
+That run is also the evidence that the scoped rename works end to end and not
+just locally. Its manifest records `name: @dreamlake/ml-dash` and `tarball:
+dreamlake-ml-dash-0.1.0.tgz`, and the packed tarball's own `package.json`
+carries the scoped name, `version 0.1.0`, `bin: {"ml-dash": …}` and
+`publishConfig.access: public` — so the command stays `ml-dash` and the
+package publishes publicly under the scope.
 
 Worth recording, because it was not assumed: the eight binaries CI produced on
 `ubuntu-latest` are **byte-identical** to the ones built on a macOS arm64
