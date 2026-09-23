@@ -60,6 +60,36 @@ trap 'cleanup; exit 143' TERM
 mget() {  # mget <python-expression over the manifest dict `m`>
     python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$REL/manifest.json" "$1"
 }
+
+# Two manifests describe the same release when every field that *names bytes*
+# agrees: name, version, every platform's checksum and size, the tarball, both
+# installers. Two fields are excluded, for different reasons:
+#
+#   `built`   wall-clock, so it differs on every rebuild and never means
+#             anything changed.
+#   `commit`  the tree that did the rebuilding. A source change cannot hide
+#             here — it would move a binary checksum or an installer checksum
+#             and be refused above. What it does cover is the case that
+#             actually arose: a fix to *this script* is only reachable from a
+#             later commit, so insisting on commit equality would make the
+#             publishing bug unfixable on the release it broke. The published
+#             manifest keeps its original `commit`; it is adopted, never
+#             rewritten, so the record of which tree produced the bytes stays
+#             true.
+#
+# A commit difference is still worth saying out loud, so it is reported.
+manifests_agree() {  # manifests_agree <published.json> <rebuilt.json>
+    python3 -c '
+import json, sys
+a, b = (json.load(open(p)) for p in sys.argv[1:3])
+for d in (a, b):
+    d.pop("built", None)
+if a.pop("commit", None) != b.pop("commit", None):
+    print("  note: rebuilt from a different commit; every checksum still matches,")
+    print("        and the published manifest keeps its original commit.")
+sys.exit(0 if a == b else 1)
+' "$1" "$2"
+}
 sha_of() { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
 size_of() { wc -c < "$1" | tr -d ' '; }
 
@@ -345,8 +375,19 @@ case "$code" in
     404)
         : ;;   # first publish of this version
     200)
-        if cmp -s "$existing" "$REL/manifest.json"; then
+        # Not `cmp`: the manifest carries a `built` wall-clock stamp, so a
+        # rebuild produces a manifest differing in that one field while
+        # describing byte-identical artifacts. Run 35838377367 rebuilt 41ece18
+        # and was refused on that alone, which made "re-running a failed
+        # release is safe" untrue precisely when it was needed. Everything
+        # that names bytes still has to match exactly — see manifests_agree.
+        if manifests_agree "$existing" "$REL/manifest.json"; then
             echo "Version $VERSION is already published with these exact artifacts — resuming."
+            # Adopt the published bytes as the local manifest. The versioned
+            # object is immutable and must not be rewritten with a new
+            # timestamp, and every later step — the R2 readback, the Release
+            # assets — compares against this file byte-for-byte.
+            cp "$existing" "$REL/manifest.json"
         else
             echo "Version $VERSION is already published with DIFFERENT artifacts." >&2
             echo "Versioned objects are immutable and installs pin them. Bump the version." >&2
@@ -444,7 +485,23 @@ publish_npm() {
     npm publish --access public "${provenance[@]+"${provenance[@]}"}" "$REL/$TARBALL" ||
         { echo "  ✗ $PKG_NAME@$VERSION outcome unresolved; check the registry before retrying. No retry here." >&2; exit 1; }
 
-    registry_integrity="$(npm view "$PKG_NAME@$VERSION" dist.integrity 2>/dev/null || true)"
+    # `npm publish` returns before the version is readable — the registry says
+    # so itself ("Your package is being processed and may take a few minutes to
+    # become available"), and `npm view` answers *nothing* until it lands.
+    # Run 35837574886 read back 0.24s after an accepted publish, got the empty
+    # answer, and failed a release that had in fact succeeded. An empty answer
+    # is "not yet", so it is waited out; a non-empty one is final in both
+    # directions — the right bytes pass, and the wrong bytes are an
+    # immutable-version problem that no amount of waiting repairs.
+    local attempt=1 attempts=20 delay=15
+    while : ; do
+        registry_integrity="$(npm view "$PKG_NAME@$VERSION" dist.integrity 2>/dev/null || true)"
+        [ -z "$registry_integrity" ] && [ "$attempt" -lt "$attempts" ] || break
+        echo "  … published; waiting for the registry to serve $VERSION ($attempt/$attempts)"
+        attempt=$((attempt + 1))
+        sleep "$delay"
+    done
+
     [ "$registry_integrity" = "$want" ] ||
         { echo "  ✗ registry integrity after publish is '${registry_integrity:-<nothing>}', expected $want" >&2; exit 1; }
     echo "  ✓ $PKG_NAME@$VERSION on the registry, integrity matches"
