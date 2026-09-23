@@ -15,9 +15,9 @@ run, and only then touches a credential. A developer machine cannot be asked to
 vouch for bytes nobody else can reproduce.
 
 ```sh
-gh workflow run release.yml -f version=0.1.0                 # publish 0.1.0
-gh workflow run release.yml -f version=0.1.0 -f dry_run=true # build + check, publish nothing
-git tag v0.1.0 && git push origin v0.1.0                     # same thing, tag-triggered
+gh workflow run release.yml -f version=0.1.1                 # publish 0.1.1
+gh workflow run release.yml -f version=0.1.1 -f dry_run=true # build + check, publish nothing
+git tag v0.1.1 && git push origin v0.1.1                     # same thing, tag-triggered
 ```
 
 `-f ref=<sha>` builds an exact commit rather than the dispatched branch. The run
@@ -92,40 +92,153 @@ rebuilds from source on every run, so nothing needs rescuing.
 | Name | Where it comes from | Used for |
 | --- | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | the account owning `dash-downloads` | wrangler target account — **set** |
-| `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard → My Profile → API Tokens, a **custom token** scoped to that account with `Workers R2 Storage: Edit` and nothing else | uploading and pointer moves — **not set** |
-| `NPM_TOKEN` | npmjs.com → Access Tokens → **Granular access token**, read+write on the package named in `package.json` (once that name is publishable), no org scope | the first publish only — **not set** |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard → My Profile → API Tokens, a **custom token** scoped to that account with `Workers R2 Storage: Edit` and nothing else | uploading and pointer moves — **set** |
+| `NPM_TOKEN` | — | **deleted.** npm is authenticated by OIDC now; see below |
 
-The npm token is genuinely required for the first publish and genuinely
-avoidable after it. npm trusted publishing (OIDC) can only be configured on a
-package that already exists — the registry's settings page is the only place to
-enable it — so a new name has to be claimed once with a token
-([npm/cli#8544](https://github.com/npm/cli/issues/8544)). The workflow is
-written for both: with `NPM_TOKEN` present it publishes with `--provenance`;
-with it absent it performs the OIDC handshake and publishes nothing else
-differently. So once the first version is out, configure the trusted publisher on
-npmjs.com (org `fortyfive-labs`, repo `ml-dash-cli`, workflow `release.yml`),
-**delete the `NPM_TOKEN` secret and revoke the token**, and later releases need
-no npm credential at all. Skipping that last step is the whole point of the
-exercise thrown away.
+There is no npm credential in this repository any more.
+
+npm trusted publishing (OIDC) can only be configured on a package that already
+exists — the registry's settings page is the only place to enable it — so the
+name had to be claimed once with a token
+([npm/cli#8544](https://github.com/npm/cli/issues/8544)). That is what 0.1.0
+was: a bootstrap publish, authenticated by `NPM_TOKEN`, whose purpose was to
+make the package exist so the trusted publisher could be configured against it.
+
+It has been. A trusted publisher for `@dreamlake/ml-dash` (org `fortyfive-labs`,
+repo `ml-dash-cli`, workflow `release.yml`) was configured on npmjs.com, the
+repository variable `ML_DASH_NPM_TRUSTED=1` records that a human read that
+settings page, and the `NPM_TOKEN` repository secret was **deleted**. 0.1.1 was
+published with no npm credential present in the run at all — the job log shows
+`NODE_AUTH_TOKEN:` empty, `npm auth: trusted publishing (OIDC)`, and npm's own
+`Signed provenance statement with source and build information from GitHub
+Actions`. Revoking the now-unused token on npmjs.com is the remaining manual
+step.
 
 A local `npm login` is deliberately not a dependency of any of this.
 
-### What CI has actually proven so far
+### What has actually been published
 
-Three `dry_run=true` runs on `ubuntu-latest`, the most recent
+**0.1.1 is released on npm and on R2, from CI, from commit `41ece18`.** The
+GitHub Release is not created — see "What is still outstanding" below.
+
+| | |
+| --- | --- |
+| Source commit | `41ece18b1c315848fd6f10d1608ab66a31d5761e` |
+| Built | 2026-09-23T08:31:44.341Z, Bun 1.3.14, `ubuntu-latest` |
+| npm | [`@dreamlake/ml-dash@0.1.1`](https://www.npmjs.com/package/@dreamlake/ml-dash/v/0.1.1) — 37 files, 71 146 B |
+| npm integrity | `sha512-dXCprQ+cEpmDV9Bp84/o7iJMdxRz449TS0tG0AW62tUtI/ykD0R3pobmhKqDgRgdTHLYBG/IEHmj4PDq8JVS4w==` |
+| npm provenance | present, `https://slsa.dev/provenance/v1` |
+| tarball sha256 | `2c67022ac9708028636cbe83afc61c8218fbb8aac9372b9fe327cc1e97007444` (`dreamlake-ml-dash-0.1.1.tgz`) |
+| `install.sh` sha256 | `d424e17ff6f9e39108fdf2d07ebc22a4a9209db8132ebc2d32f39c1bdbdc77cc` |
+| `install.ps1` sha256 | `9a4edececf52283bf0c74b3e572645e5c13df9ca51d7c8c019d8b0406379bf08` |
+| `latest` | `0.1.1` — moved and read back |
+| `stable` | **still 404, deliberately untouched** |
+
+All eight platform binaries were uploaded and read back over the public URL
+against the manifest's sha256 and size, as were the tarball, the manifest and
+both installer URLs — the short `/install.sh` and the prefixed
+`/ml-dash-cli/install.sh`, and the same pair for `install.ps1`.
+
+The registry's `dist.integrity` equals the sha512 CI computed from the tarball
+it published by path, so the bytes on npm are the bytes the manifest describes.
+
+#### The runs it took, and why
+
+Four dispatches, all of version 0.1.1. They are worth recording because three
+of them failed and none of the failures meant what the exit code said.
+
+1. [`35837574886`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35837574886)
+   (`41ece18`) — R2 uploaded and read back, **npm publish succeeded** over OIDC
+   with provenance, and the step then failed: the readback ran 0.24 s later and
+   npm had not yet served the version it had just accepted. The release was
+   real; the verification was wrong.
+2. [`35838698679`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35838698679)
+   (`41ece18`) — refused at the immutability gate, which `cmp`d the published
+   manifest against the rebuilt one. The manifest carries a `built` wall-clock
+   stamp, so that comparison could never hold across two runs.
+3. [`35839242613`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35839242613)
+   (`98ec567`) — with both of those fixed, it resumed correctly, re-verified
+   every object and **moved `latest` to 0.1.1**. It was then **cancelled on
+   purpose**, before the Release step, because of the bug in item 4 below. No
+   tag and no Release were created.
+4. [`35839740311`](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35839740311)
+   (`4f45e92`) — publish and verify green end to end; failed creating the
+   GitHub Release, on org policy rather than on anything about the artifacts.
+
+The two fixes in items 1 and 2 are commit `98ec567`. Item 3's bug is commit
+`4f45e92`: `gh release create` without `--target` tags the default branch's
+current head, which is only the right commit when the release runs on the
+commit it ships. A resumed release does not — run `35839242613` would have
+tagged `v0.1.1` at `98ec567` while every published byte was built from
+`41ece18`. The tag target and the release notes now both come from the
+manifest's `commit` field.
+
+#### What is still outstanding
+
+**The GitHub Release `v0.1.1` has not been created, and CI cannot create it.**
+`gh release create` answered:
+
+```
+HTTP 403: Resource not accessible by integration
+```
+
+This is not the workflow's `permissions:` block, which asks for
+`contents: write` and is shown being granted it in the run log. It is an
+organization-level policy. Asking the repository to default to write
+permissions is refused with the reason stated outright:
+
+```
+PUT /repos/fortyfive-labs/ml-dash-cli/actions/permissions/workflow
+409  Write permissions for workflows are disabled by the organization
+```
+
+So `GITHUB_TOKEN` is capped at read for every workflow in `fortyfive-labs`
+regardless of what a workflow asks for, and **an organization owner has to
+change Organization Settings → Actions → General → Workflow permissions to
+"Read and write permissions"** before the Release step can succeed. Once that
+is done, re-dispatching `release.yml` with `version=0.1.1` is safe and is the
+whole fix: R2 and npm are found already published with identical bytes and are
+skipped, and the run proceeds to create the Release — tagging `41ece18`, the
+commit the artifacts came from.
+
+Nothing should be uploaded to a Release by hand. The assets have to be the same
+bytes as R2, and the run that has them is the one that should attach them.
+
+#### Verified by installing what was published
+
+Not by reading the manifest back — by installing from the public URLs and
+running the result.
+
+- **npm, macOS arm64.** `npm install -g @dreamlake/ml-dash@0.1.1` into a
+  throwaway prefix, from the registry. `ml-dash version` reports `0.1.1`,
+  `--help` lists all eleven commands, and `ml-dash update --check --json`
+  reports `{"channel":"npm","current":"0.1.1","target":"0.1.1",
+  "update_available":false,"action":"up-to-date"}` — so the npm channel is
+  detected from the running process and agrees with the registry.
+- **Standalone, Linux x64.** The public `install.sh`, piped to `sh` on an
+  Ubuntu 24.04 host with **no `--version`**, so it resolved the `latest`
+  pointer: it installed `0.1.1`, checksum verified. Run with `node`, `npm` and
+  `python3` all absent from `PATH`, the binary reports `0.1.1` and
+  `update --check --json` reports `{"channel":"standalone",...,
+  "action":"up-to-date"}`. That is the self-contained claim and the `latest`
+  pointer, both checked by execution.
+
+Both installs were made in temporary directories and removed afterwards.
+
+**Not verified.** The other seven platforms were checked by hash and size over
+their public URLs, not executed — in particular **neither Windows target nor
+either musl target has been run**, and `darwin-x64`, `linux-arm64` and the
+arm64 musl build have not either. `install.ps1` has never been executed at all;
+it is published and hash-verified, nothing more. `stable` is untouched, so
+nothing has been proven about moving it.
+
+#### What the dry runs had established before any of this
+
+Three `dry_run=true` runs, the most recent
 ([35815006139](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35815006139),
-commit `4e239bc`) being the one that matters now: 71 tests passed, all eight
-targets plus the tarball, installers and manifest built in a single run, and
-the manifest check passed. The publish steps were skipped, as a dry run
-intends — **nothing has been published to npm, R2 or Releases by CI or by
-anyone else.**
-
-That run is also the evidence that the scoped rename works end to end and not
-just locally. Its manifest records `name: @dreamlake/ml-dash` and `tarball:
-dreamlake-ml-dash-0.1.0.tgz`, and the packed tarball's own `package.json`
-carries the scoped name, `version 0.1.0`, `bin: {"ml-dash": …}` and
-`publishConfig.access: public` — so the command stays `ml-dash` and the
-package publishes publicly under the scope.
+commit `4e239bc`): 71 tests passed, all eight targets plus the tarball,
+installers and manifest built in a single run, and the manifest check passed.
+That run is also the evidence that the scoped rename works end to end.
 
 Worth recording, because it was not assumed: the eight binaries CI produced on
 `ubuntu-latest` are **byte-identical** to the ones built on a macOS arm64
@@ -185,10 +298,12 @@ only catches the exact-collision case (strip `-`, `_`, `.` and look the result
 up), which is the case that actually bit here. A subtler collision would still
 surface as an E403 from npm.
 
-For `0.1.0` as it stands, this gate stops the run before any upload: the
-package does not exist yet, which makes it a first publish, and no `NPM_TOKEN`
-is set. The name is no longer a problem — `@dreamlake/ml-dash` is scoped and
-unused.
+For 0.1.1 this gate took the "package exists, version is new, no token" row:
+it stopped by default and was let through by `ML_DASH_NPM_TRUSTED=1`, which is
+a human asserting they have read the package's trusted-publisher settings page.
+On the three later runs it took the "already published, same bytes" row instead
+and reported that the npm step would verify and skip, which is exactly what
+happened.
 
 ### Re-running a failed release
 
@@ -212,9 +327,9 @@ release gets published.
 bun run scripts/build-release.ts                     # all eight targets
 bun run scripts/build-release.ts --targets=darwin-arm64,linux-x64
 bun run scripts/build-release.ts --public-url=https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev   # the default
-./scripts/publish-release.sh 0.1.0                   # R2 + npm, move `latest`
-./scripts/publish-release.sh 0.1.0 --stable          # also move `stable`
-./scripts/publish-release.sh 0.1.0 --verify-only     # re-check, upload nothing
+./scripts/publish-release.sh 0.1.1                   # R2 + npm, move `latest`
+./scripts/publish-release.sh 0.1.1 --stable          # also move `stable`
+./scripts/publish-release.sh 0.1.1 --verify-only     # re-check, upload nothing
 ```
 
 The build produces **every** artifact a release publishes; the publish step
@@ -500,24 +615,29 @@ can reach, which is the way to do that.
   whose `pyproject.toml` declares the same MIT terms for the same project name.
   Nothing was invented and `package.json`'s `"license": "MIT"` already matched,
   so it was left untouched.
-- **npm: `0.1.0` is published; CI still cannot publish.** `@dreamlake/ml-dash`
-  (the unscoped name was refused — see above) was published to the registry by
-  hand from a machine holding an npm login, because trusted publishing cannot
-  be configured for a package that does not exist yet. That first publish is
-  what unblocks it: the package now has a settings page, so a **GitHub trusted
-  publisher can and should be configured** — owner `fortyfive-labs`, repository
-  `ml-dash-cli`, workflow `release.yml` — after which `NPM_TOKEN` should be
-  deleted rather than left in the repository. Until that is done, CI has no way
-  to publish to npm and `0.1.1` cannot be released.
-- **R2: `0.1.0` is published but no pointer names it.** The versioned objects
-  under `ml-dash-cli/releases/0.1.0/` and both installers are live and readable;
-  `ml-dash-cli/releases/latest` and `stable` are still 404. So
-  `curl … install.sh | sh` fails at channel resolution today, and
-  `ml-dash update` on a standalone install has nothing to read. Both need
-  `--version 0.1.0` until a release run moves `latest`.
-- **`CLOUDFLARE_API_TOKEN` and `NPM_TOKEN` are not set on the repository**, so
-  no release has been published by CI either. `CLOUDFLARE_ACCOUNT_ID` is set.
-  Until both are added the workflow stops at its credential check — after the
-  tests and the build, before a single byte is uploaded — so a missing secret
-  costs a red run, never a half-published version. `-f dry_run=true` exercises
-  the same path deliberately.
+- **npm: `0.1.1` is published by CI, with no npm credential.** `0.1.0` was
+  published by hand from a machine holding an npm login, because trusted
+  publishing cannot be configured for a package that does not exist yet. That
+  bootstrap is spent: a GitHub trusted publisher is now configured for
+  `@dreamlake/ml-dash` (owner `fortyfive-labs`, repository `ml-dash-cli`,
+  workflow `release.yml`), the `NPM_TOKEN` repository secret has been
+  **deleted**, and `0.1.1` was published over OIDC with provenance. Revoking
+  the unused token on npmjs.com is the remaining manual step.
+- **R2: `0.1.1` is published and `latest` names it.** The versioned objects
+  under `ml-dash-cli/releases/0.1.1/`, the tarball, the manifest and both
+  installers are live and were read back byte-for-byte;
+  `ml-dash-cli/releases/latest` reads `0.1.1`. So `curl … install.sh | sh`
+  resolves and installs without `--version`, and `ml-dash update` on a
+  standalone install has a pointer to read — both checked by execution.
+  `ml-dash-cli/releases/stable` is still 404 on purpose.
+- **`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are set**; `NPM_TOKEN`
+  is deleted and `ML_DASH_NPM_TRUSTED=1` is set as a repository variable. The
+  credential check still runs after the tests and the build and before a single
+  byte is uploaded, so a missing secret costs a red run, never a half-published
+  version. `-f dry_run=true` exercises the same path deliberately.
+- **The GitHub Release is blocked by organization policy.** Write permissions
+  for workflows are disabled org-wide in `fortyfive-labs`, so `GITHUB_TOKEN`
+  is capped at read and `gh release create` answers
+  `403 Resource not accessible by integration` no matter what the workflow's
+  `permissions:` block asks for. An organization owner has to enable
+  "Read and write permissions" before `v0.1.1` can be created.

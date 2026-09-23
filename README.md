@@ -27,11 +27,16 @@ The command is still `ml-dash`. The package is scoped because the unscoped
 name is not claimable — npm refuses `ml-dash` as too similar to the existing
 `mldash`.
 
-*Current state:* `@dreamlake/ml-dash@0.1.0` is on the registry. On R2 the
-0.1.0 artifacts and both installers are published, but the `latest` and
-`stable` channel pointers have not been written yet — so the two install
-commands above need an explicit `--version 0.1.0` until a release run moves
-them. `docs/RELEASE.md` tracks what is outstanding.
+*Current state:* **0.1.1 is published and is what the commands above
+install.** It is on npm as
+[`@dreamlake/ml-dash@0.1.1`](https://www.npmjs.com/package/@dreamlake/ml-dash/v/0.1.1),
+published from CI by npm trusted publishing (OIDC, no token) and carrying a
+provenance attestation; on R2 all eight platform binaries, the tarball, the
+manifest and both installers are published and were read back byte-for-byte;
+and `latest` now reads `0.1.1`, so no `--version` is needed. `stable` is
+deliberately still unwritten. The **GitHub Release `v0.1.1` does not exist
+yet** — it is the one step that has not run — see `docs/RELEASE.md`. Both
+channels were installed from their public URLs and run on 0.1.1.
 
 Both channels run the same code — the binaries are `src/index.ts` compiled
 ahead of time, the npm package is the same source compiled to `dist/`.
@@ -39,11 +44,11 @@ ahead of time, the npm package is the same source compiled to `dist/`.
 ### Pinning a version
 
 ```sh
-curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.1.0
+curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.1.1
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.1.0
+& ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.1.1
 ```
 
 An installer always downloads from the host it was itself served from — that
