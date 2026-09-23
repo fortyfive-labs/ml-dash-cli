@@ -384,6 +384,47 @@ The scripts below still work by hand, and `--verify-only` is the right way to
 re-check a published release from anywhere. They are no longer the way a
 release gets published.
 
+#### When a re-run cannot reproduce the bytes: `release_only`
+
+A re-run rebuilds, and a rebuild is only a no-op while the packed files have
+not moved. `npm pack` includes `README.md` whatever `package.json`'s `files`
+says, so **any commit that edits the README changes the tarball** — and the
+version is already immutable on npm. That is not hypothetical: 0.1.1 was
+published from `41ece18`, the README was then rewritten to describe the
+release, and the next dispatch
+([35846188686](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35846188686))
+was refused before it uploaded anything:
+
+```
+✗ @dreamlake/ml-dash@0.1.1 is on the registry with DIFFERENT bytes
+  npm versions are immutable. Bump the version; do not republish.
+```
+
+That refusal is correct, and it leaves the GitHub Release unreachable by any
+amount of rebuilding. So there is a third dispatch mode:
+
+```sh
+gh workflow run release.yml -f version=0.1.1 -f release_only=true
+```
+
+It builds nothing, runs no tests, touches no credential, and writes to neither
+npm nor R2 — the two publish steps are skipped outright. Instead
+`scripts/fetch-published-release.sh` downloads the published release back from
+the public URL into `release/<version>/` and re-hashes every byte against that
+release's own manifest: all eight binaries, the tarball, and both published
+copies of each installer (the short URL and the prefixed one), by sha256 *and*
+size. It also checks that the manifest describes the version asked for, that
+it was built for the host it was just fetched from, that its commit is a plain
+sha, and that npm's `dist.integrity` for that version is the sha512 of the
+very tarball R2 serves — so the Release cannot attach one artifact while
+`npm install` serves another.
+
+From there the run rejoins the normal path: the same manifest-completeness
+check, then the same Release step, which tags the manifest's commit and
+creates the Release from the existing tag. The mode is a recovery path, not a
+shortcut — it can only ever attach bytes that are already published, and it
+fails rather than invent any that are not.
+
 ## Commands
 
 ```sh

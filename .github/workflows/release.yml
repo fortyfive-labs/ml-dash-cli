@@ -32,6 +32,11 @@ on:
         required: false
         default: false
         type: boolean
+      release_only:
+        description: "Only create the GitHub Release for a version already on npm and R2 — build nothing, publish nothing"
+        required: false
+        default: false
+        type: boolean
   push:
     # A `v0.1.0` tag publishes 0.1.0. This cannot double-publish alongside a
     # manual dispatch of the same version: R2 objects and npm versions are
@@ -70,6 +75,9 @@ jobs:
       # Resolved once so every later step agrees, including the failure paths.
       VERSION: ${{ inputs.version || '' }}
       DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      # Recovery mode: the artifacts already exist and are immutable, so they
+      # are fetched back and verified instead of rebuilt. Nothing is published.
+      RELEASE_ONLY: ${{ inputs.release_only && 'true' || 'false' }}
       # Pinned: `npx wrangler` unpinned would let a wrangler release change how
       # a publish behaves without a commit here.
       ML_DASH_WRANGLER: wrangler@4.136.3
@@ -92,7 +100,7 @@ jobs:
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Publishing version $version (dry_run=$DRY_RUN)"
+          echo "Version $version (dry_run=$DRY_RUN, release_only=$RELEASE_ONLY)"
 
       - uses: actions/checkout@v4
         with:
@@ -115,6 +123,7 @@ jobs:
       # necessarily ship yet. Pinned rather than `@latest` so the publish path
       # cannot change under us between two runs of the same commit.
       - name: Pin npm
+        if: env.RELEASE_ONLY != 'true'
         run: npm install -g npm@11.12.1
 
       # The exact Bun the 0.1.0 artifacts were built with. `latest` would mean
@@ -122,19 +131,23 @@ jobs:
       # the immutability check in publish-release.sh fire on a re-run that
       # should have been a no-op.
       - uses: oven-sh/setup-bun@v2
+        if: env.RELEASE_ONLY != 'true'
         with:
           bun-version: "1.3.14"
 
       - name: Install dependencies
+        if: env.RELEASE_ONLY != 'true'
         run: npm ci
 
       # Before anything is built, let alone published. The Python interop
       # suites skip on a machine without the ml-dash virtualenv — they report
       # "skipped", not "passed", so this gate never turns unverified into green.
       - name: Test
+        if: env.RELEASE_ONLY != 'true'
         run: npm test
 
       - name: Check the version being published is the one in the tree
+        if: env.RELEASE_ONLY != 'true'
         run: |
           set -euo pipefail
           pkg="$(node -p 'require("./package.json").version')"
@@ -147,7 +160,20 @@ jobs:
           # misreport itself.
 
       - name: Build all eight targets, the npm tarball and the installers
+        if: env.RELEASE_ONLY != 'true'
         run: bun run scripts/build-release.ts
+
+      # Recovery path for a release whose GitHub Release step failed after npm
+      # and R2 had already been written. Those bytes are immutable and a
+      # rebuild cannot be trusted to reproduce them — `npm pack` includes
+      # README.md, so any later commit touching the README yields a different
+      # tarball, which is exactly what stopped run 35846188686. The published
+      # release is fetched back and re-hashed against its own manifest, and
+      # that manifest then flows into the same completeness check and the same
+      # Release step the full pipeline uses.
+      - name: Fetch the published release instead of building it
+        if: env.RELEASE_ONLY == 'true'
+        run: ./scripts/fetch-published-release.sh "${{ steps.v.outputs.version }}"
 
       # `bun build` exiting 0 is not proof eight files landed. The manifest is
       # what the publish step trusts, so it is what gets counted.
@@ -187,7 +213,7 @@ jobs:
       #   * new unscoped name whose punctuation-stripped form is taken → stop,
       #     npm would answer E403 "too similar"
       - name: Check R2 credentials and npm feasibility, before anything is uploaded
-        if: env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && env.RELEASE_ONLY != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -217,7 +243,7 @@ jobs:
       # Whichever is in play, the *tarball* is the one built above and hashed
       # into the manifest; publish-release.sh publishes it by path.
       - name: Publish to R2 and npm
-        if: env.DRY_RUN != 'true'
+        if: env.DRY_RUN != 'true' && env.RELEASE_ONLY != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
