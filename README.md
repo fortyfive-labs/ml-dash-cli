@@ -5,23 +5,23 @@ and experiments, and move experiment data to and from an ML-Dash server.
 
 ## Install
 
-> The download host is not live yet: nothing is published, and `dl.dash.ml`
-> does not resolve. The commands below are the shape of the released install
-> and will work once the first release is published — see
-> [docs/RELEASE.md](docs/RELEASE.md) for what is still open. If the release is
-> served from the bucket's `r2.dev` URL instead, that URL is baked into the
-> installers published there, and it is the one to curl.
+> No release is published yet, so these commands do not work today — the
+> bucket they point at is live but empty. They are the exact commands the
+> first release makes work. `dl.dash.ml` is not used: `dash.ml` runs on NS1
+> nameservers and an R2 custom domain needs the zone in Cloudflare, so the
+> download host is the bucket's public URL below. See
+> [docs/RELEASE.md](docs/RELEASE.md).
 
 **macOS / Linux** — one self-contained binary, no Node or Python needed:
 
 ```sh
-curl -fsSL https://dl.dash.ml/install.sh | sh
+curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh
 ```
 
 **Windows** (PowerShell):
 
 ```powershell
-irm https://dl.dash.ml/install.ps1 | iex
+irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1 | iex
 ```
 
 **With Node ≥ 20.19 already installed:**
@@ -36,11 +36,11 @@ ahead of time, the npm package is the same source compiled to `dist/`.
 ### Pinning a version
 
 ```sh
-curl -fsSL https://dl.dash.ml/install.sh | sh -s -- --version 0.1.0
+curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.1.0
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://dl.dash.ml/install.ps1))) -Version 0.1.0
+& ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.1.0
 ```
 
 An installer always downloads from the host it was itself served from — that

@@ -9,7 +9,7 @@ channel. There is no second implementation to drift.
 ```sh
 bun run scripts/build-release.ts                     # all eight targets
 bun run scripts/build-release.ts --targets=darwin-arm64,linux-x64
-bun run scripts/build-release.ts --public-url=https://pub-xxxx.r2.dev
+bun run scripts/build-release.ts --public-url=https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev   # the default
 ./scripts/publish-release.sh 0.1.0                   # R2 + npm, move `latest`
 ./scripts/publish-release.sh 0.1.0 --stable          # also move `stable`
 ./scripts/publish-release.sh 0.1.0 --verify-only     # re-check, upload nothing
@@ -26,6 +26,28 @@ release/<version>/manifest.json              sha256 + size of all of the above,
                                              plus source commit, bun version
                                              and the public base URL
 ```
+
+## Where it is served from
+
+| | |
+| --- | --- |
+| R2 bucket | `dash-downloads` (created for this; public access enabled) |
+| Public base URL | `https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev` |
+| Versioned objects | `<base>/ml-dash-cli/releases/<version>/…` |
+| Installers | `<base>/install.sh`, `<base>/ml-dash-cli/install.sh` |
+
+That URL is the build script's default, so the plain command is enough:
+
+```sh
+bun run scripts/build-release.ts
+```
+
+`dl.dash.ml` is **not** in play. `dash.ml` is served by NS1 nameservers
+(`dns[1-4].p06.nsone.net`) and an R2 custom domain requires the zone in
+Cloudflare; no DNS was touched. If that changes, rebuild with
+`--public-url=https://dl.dash.ml` — the URL is baked into the installers and
+recorded in the manifest, and `publish-release.sh` refuses to upload a release
+to an origin other than the one it was built for.
 
 ## Platforms
 
@@ -55,11 +77,16 @@ picks AVX paths at runtime, so a baseline build would be a duplicate.
   records the source commit (and marks a dirty tree) so the artifacts can be
   traced back.
 - **Versions are immutable, retries are not republishes.** Before uploading,
-  the published manifest for that version is fetched: identical means a
-  half-finished publish is resumed, different means the run aborts rather than
-  rewriting bytes someone may already have installed. The same test is applied
-  to npm by comparing the registry's `dist.integrity` against the local
-  tarball's — a version-string match alone says nothing about contents.
+  the published manifest for that version is fetched, and only a definite HTTP
+  404 counts as "not published yet": identical bytes mean a half-finished
+  publish is resumed, different bytes abort the run, and a connectivity
+  failure, 403 or 5xx also aborts — an unreachable host is not an empty one,
+  and treating it as one is how an immutable version gets silently rewritten. The same test is applied
+  to npm by comparing the registry's `dist.integrity` against `sha512-<base64>`
+  computed directly from the tarball's bytes — a version-string match alone
+  says nothing about contents, and computing it from the bytes keeps the check
+  clear of the packing path this script avoids. (Verified equal to npm's own
+  value for a fixture tarball.)
 - **Nothing is announced until it is fetchable.** Binaries, tarball, manifest
   and installers upload first; then every one of them is read back over the
   public URL and compared byte-for-byte — including both installer URLs, the
@@ -123,7 +150,9 @@ This is a macOS arm64 machine, so what has actually been exercised here is:
   a fixture release: local digests pass, an artifact edited after the build is
   refused, an edited installer is refused, a stale tarball version is refused,
   a redirected `ML_DASH_PUBLIC_URL` is refused, and an unreachable host fails
-  before anything is uploaded or moved. Shell/bash syntax checks on all three
+  before anything is uploaded or moved. The immutability probe was run against
+  an unreachable host and against a server returning 500: both stop, neither
+  is mistaken for an unpublished version. Shell/bash syntax checks on all three
   scripts; the build script parses and resolves under Bun.
 - **Not done here:** no build of any kind has been run — no binaries, no
   tarball, no manifest exists yet; the fixtures above were hand-made to the
@@ -140,22 +169,18 @@ can reach, which is the way to do that.
 
 ## Prerequisites still open
 
-- **Cloudflare access works; the bucket does not exist.** `npx wrangler
-  whoami` succeeds against a stored OAuth login on this machine, and `wrangler
-  r2 bucket list` returns the account's buckets — `dreamlake-downloads` and
-  `lakeshore-releases`. There is no `dash-downloads`; creating it, and turning
-  on public access for it, are release-authorization steps that were not taken
-  here. (The first `r2 bucket list` failed with `fetch failed`; a retry
-  succeeded, so treat a single connectivity error during publish as worth one
-  retry — but never treat an upload's exit code as proof, which is what the
-  read-back gate is for.)
-- **`dl.dash.ml` does not resolve, and `dash.ml` is not on Cloudflare DNS** —
-  its nameservers are NS1 (`dns[1-4].p06.nsone.net`). An R2 custom domain needs
-  the zone in Cloudflare, so either the zone moves, or a CNAME to the bucket's
-  custom-domain endpoint is added at NS1, or the release uses the bucket's
-  `*.r2.dev` public URL. Every path is parameterized for that: set
-  `ML_DASH_PUBLIC_URL` when publishing and `ML_DASH_BASE_URL` (or `--base-url`)
-  when installing, and update the URLs in README.md to match.
+- **Bucket: done.** `dash-downloads` was created in the same account
+  (`wrangler r2 bucket create`), public access enabled
+  (`wrangler r2 bucket dev-url enable`), and the URL confirmed live: a GET of
+  `https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/ml-dash-cli/releases/latest`
+  returns 404, which is the correct answer for an empty bucket and the signal
+  the publish script reads as "not published yet". Nothing has been uploaded.
+  Existing buckets (`dreamlake-downloads`, `lakeshore-releases`) were left
+  alone. (One `r2 bucket list` failed with `fetch failed` and a retry
+  succeeded — a single connectivity error is worth one retry, but an upload's
+  exit code is still never proof, which is what the read-back gate is for.)
+- **`dl.dash.ml` is deliberately not used** (see above). Moving the zone or
+  adding a CNAME at NS1 is a separate decision; nothing here depends on it.
 - **License: resolved.** `LICENSE` is the MIT text copied verbatim from the
   upstream Python `ml-dash` repository (`Copyright (c) 2025 Ge Yang, Tom Tao`),
   whose `pyproject.toml` declares the same MIT terms for the same project name.

@@ -175,15 +175,35 @@ check_local
 # version someone already installed must not be possible. The published
 # manifest decides which case this is.
 existing="$TMP/remote-manifest.json"
-if curl -fsSL --retry 2 -o "$existing" "$PUBLIC/$PREFIX/$VERSION/manifest.json?v=$(date +%s)" 2>/dev/null; then
-    if cmp -s "$existing" "$REL/manifest.json"; then
-        echo "Version $VERSION is already published with these exact artifacts — resuming."
-    else
-        echo "Version $VERSION is already published with DIFFERENT artifacts." >&2
-        echo "Versioned objects are immutable and installs pin them. Bump the version." >&2
-        exit 1
-    fi
-fi
+# Only a definite 404 means "not published yet". A connectivity error, a 403 or
+# a 5xx tells us nothing about what is in the bucket, and treating those as
+# absence is exactly how an immutable version gets silently rewritten — so they
+# stop the run instead.
+# curl exits non-zero and prints "000" when it never got a response; the
+# `|| true` keeps `set -e` out of it, and anything that is not three digits is
+# normalised to 000 rather than concatenated onto the status.
+code="$(curl -s -o "$existing" -w '%{http_code}' "$PUBLIC/$PREFIX/$VERSION/manifest.json?v=$(date +%s)" || true)"
+case "$code" in [0-9][0-9][0-9]) ;; *) code=000 ;; esac
+case "$code" in
+    404)
+        : ;;   # first publish of this version
+    200)
+        if cmp -s "$existing" "$REL/manifest.json"; then
+            echo "Version $VERSION is already published with these exact artifacts — resuming."
+        else
+            echo "Version $VERSION is already published with DIFFERENT artifacts." >&2
+            echo "Versioned objects are immutable and installs pin them. Bump the version." >&2
+            exit 1
+        fi ;;
+    000)
+        echo "Cannot reach $PUBLIC to check whether $VERSION is already published." >&2
+        echo "Refusing to upload: an unreachable host is not an empty one." >&2
+        exit 1 ;;
+    *)
+        echo "Checking $PUBLIC/$PREFIX/$VERSION/manifest.json returned HTTP $code." >&2
+        echo "Only 404 means 'not published'. Resolve this before uploading." >&2
+        exit 1 ;;
+esac
 
 IMMUTABLE="public, max-age=31536000, immutable"   # versioned objects never change
 POINTER="public, max-age=60, must-revalidate"     # pointers decide new installs
@@ -225,11 +245,14 @@ publish_npm() {
     echo ""
     echo "Publishing ml-dash@$VERSION to npm"
     local local_integrity registry_integrity
-    # npm's own integrity of the exact file we would upload, so a version
-    # already on the registry can be compared byte-for-byte instead of being
-    # skipped on a version-string match that proves nothing about its contents.
-    local_integrity="$(npm pack --dry-run --json "$REL/$TARBALL" 2>/dev/null |
-        python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["integrity"])')"
+    # The registry's dist.integrity is sha512-<base64> of the published tarball,
+    # so compute it straight from the bytes on disk. Asking `npm pack` for it
+    # would route the answer back through the packing code path this script
+    # exists to stay out of.
+    local_integrity="$(python3 -c '
+import base64, hashlib, sys
+print("sha512-" + base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode())
+' "$REL/$TARBALL")"
     registry_integrity="$(npm view "ml-dash@$VERSION" dist.integrity 2>/dev/null || true)"
 
     if [ -n "$registry_integrity" ]; then

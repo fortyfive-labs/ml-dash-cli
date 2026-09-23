@@ -50,7 +50,12 @@ const TARGETS: Record<string, string> = {
   "windows-arm64": "bun-windows-arm64",
 };
 
-const DEFAULT_PUBLIC_URL = "https://dl.dash.ml";
+// The bucket's public r2.dev URL, which is what dash-downloads actually
+// serves today: dash.ml is on NS1 nameservers, and an R2 custom domain needs
+// the zone in Cloudflare, so dl.dash.ml cannot be pointed here without moving
+// DNS. Pass --public-url=https://dl.dash.ml once that changes; the value is
+// baked into the installers and recorded in the manifest either way.
+const DEFAULT_PUBLIC_URL = "https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev";
 
 interface Digest {
   checksum: string;

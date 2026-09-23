@@ -1,14 +1,15 @@
 #!/bin/sh
 # ml-dash installer for macOS and Linux.
 #
-#   curl -fsSL https://dl.dash.ml/install.sh | sh
-#   curl -fsSL https://dl.dash.ml/install.sh | sh -s -- --version 0.1.0
+#   curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh
+#   curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.1.0
 #
 # Options (flags or environment):
 #   --version <v>       ML_DASH_VERSION       exact version, default: channel pointer
 #   --channel <name>    ML_DASH_CHANNEL       latest (default) or stable
 #   --install-dir <d>   ML_DASH_INSTALL_DIR   default: ~/.local/bin
-#   --base-url <url>    ML_DASH_BASE_URL      default: https://dl.dash.ml
+#   --base-url <url>    ML_DASH_BASE_URL      default: the host this installer
+#                                             was published on
 #   --force                                   take over an install dir entry
 #                                             this installer does not own
 #
@@ -18,7 +19,10 @@
 # and a pinned --version installs the identical bytes on every machine.
 set -eu
 
-BASE_URL="${ML_DASH_BASE_URL:-https://dl.dash.ml}"
+# Rewritten by scripts/build-release.ts to the host the release is served from,
+# so an installer never fetches binaries from a different origin than the one
+# it came from.
+BASE_URL="${ML_DASH_BASE_URL:-https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev}"
 PREFIX="ml-dash-cli/releases"
 CHANNEL="${ML_DASH_CHANNEL:-latest}"
 VERSION="${ML_DASH_VERSION:-}"

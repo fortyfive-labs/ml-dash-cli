@@ -10,17 +10,17 @@
     identical bytes everywhere.
 
 .EXAMPLE
-    irm https://dl.dash.ml/install.ps1 | iex
+    irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1 | iex
 
 .EXAMPLE
-    & ([scriptblock]::Create((irm https://dl.dash.ml/install.ps1))) -Version 0.1.0
+    & ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.1.0
 #>
 [CmdletBinding()]
 param(
     [string]$Version    = $env:ML_DASH_VERSION,
     [string]$Channel    = $(if ($env:ML_DASH_CHANNEL) { $env:ML_DASH_CHANNEL } else { 'latest' }),
     [string]$InstallDir = $(if ($env:ML_DASH_INSTALL_DIR) { $env:ML_DASH_INSTALL_DIR } else { Join-Path $env:LOCALAPPDATA 'ml-dash\bin' }),
-    [string]$BaseUrl    = $(if ($env:ML_DASH_BASE_URL) { $env:ML_DASH_BASE_URL } else { 'https://dl.dash.ml' }),
+    [string]$BaseUrl    = $(if ($env:ML_DASH_BASE_URL) { $env:ML_DASH_BASE_URL } else { 'https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev' }),
     # Take over an install-directory entry this installer does not own.
     [switch]$Force
 )
