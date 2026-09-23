@@ -39,9 +39,13 @@ on:
     # bytes are identical and fails loudly when they are not. A second run of
     # the same commit is therefore a no-op; a second run of a *different*
     # commit under the same version is refused rather than silently winning.
+    # Deliberately a wide glob. Actions tag filters are globs, not regular
+    # expressions — `v[0-9]+.[0-9]+.[0-9]+` matches a literal `+`, so it would
+    # have fired for nothing at all. The narrowing happens in `Resolve version`
+    # below, where a real semver regex can run and can report *why* a tag was
+    # rejected instead of silently never triggering.
     tags:
-      - "v[0-9]+.[0-9]+.[0-9]+"
-      - "v[0-9]+.[0-9]+.[0-9]+-*"
+      - "v*"
 
 # Serialised per version, never cancelled: interrupting a run between the R2
 # upload and the npm publish is exactly the half-finished state that takes a
@@ -80,10 +84,13 @@ jobs:
             # expression — GitHub's expression language has no substring().
             version="${GITHUB_REF_NAME#v}"
           fi
-          case "$version" in
-            [0-9]*) ;;
-            *) echo "::error::Could not resolve a version from inputs or ${GITHUB_REF_NAME}" >&2; exit 1 ;;
-          esac
+          # Strict semver, because the tag trigger is a wide glob: `v1.2`,
+          # `v1.2.3.4`, `vlatest` and `v01.2.3` all reach here and all must be
+          # refused loudly rather than published as something surprising.
+          if ! printf '%s' "$version" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$'; then
+            echo "::error::'$version' (from ${GITHUB_REF_NAME}) is not a valid semver version" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Publishing version $version (dry_run=$DRY_RUN)"
 
@@ -160,13 +167,32 @@ jobs:
             console.log(`${want.length} platforms, ${m.npm.tarball}, bun ${m.bun}, commit ${m.commit}`);
           '
 
-      # Fails here rather than halfway through a publish. A missing R2 token
-      # after the binaries are on npm is the worst place to find out.
-      - name: Check publish credentials are present
+      # Everything that can be known before a byte is written goes here. The
+      # publish order is R2 first, npm second — a pointer must not move to
+      # binaries nobody can fetch — which means an npm failure would otherwise
+      # land *after* the bucket is written. That is the half-published state
+      # this pipeline exists to avoid, so npm is interrogated first.
+      #
+      # `--precheck-npm` reads the registry over plain HTTP (a definite 404 is
+      # the only thing treated as "no such package") and decides:
+      #   * version already published, same bytes  → safe, the publish resumes
+      #   * version already published, other bytes → stop
+      #   * package exists, version is new         → needs NPM_TOKEN, or an
+      #     explicit ML_DASH_NPM_TRUSTED=1 from someone who has read the
+      #     package's settings page, because no endpoint reports whether a
+      #     trusted publisher is configured
+      #   * package does not exist                 → NPM_TOKEN required, no
+      #     override: trusted publishing cannot be configured for a name that
+      #     has never been published
+      #   * new unscoped name whose punctuation-stripped form is taken → stop,
+      #     npm would answer E403 "too similar"
+      - name: Check R2 credentials and npm feasibility, before anything is uploaded
         if: env.DRY_RUN != 'true'
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          ML_DASH_NPM_TRUSTED: ${{ vars.ML_DASH_NPM_TRUSTED }}
         run: |
           set -euo pipefail
           missing=""
@@ -177,6 +203,7 @@ jobs:
             exit 1
           fi
           echo "R2 credentials present."
+          ./scripts/publish-release.sh "${{ steps.v.outputs.version }}" --precheck-npm
 
       # npm authentication, in the order of preference the registry supports:
       #
@@ -198,6 +225,7 @@ jobs:
           # Unset when NPM_TOKEN is absent, which is how npm decides to fall
           # back to the OIDC handshake.
           ML_DASH_NPM_PROVENANCE: ${{ secrets.NPM_TOKEN != '' && '1' || '' }}
+          ML_DASH_NPM_TRUSTED: ${{ vars.ML_DASH_NPM_TRUSTED }}
         run: |
           set -euo pipefail
           if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
@@ -227,36 +255,48 @@ jobs:
           set -euo pipefail
           rel="release/$V"
           staged="$(mktemp -d)"
-          trap 'rm -rf "$staged" "${notes:-}"' EXIT
-          cp "$rel/manifest.json" "$rel/install.sh" "$rel/install.ps1" "$staged/"
-          cp "$rel"/ml-dash-"$V".tgz "$staged/"
-          for dir in "$rel"/*/; do
-            platform="$(basename "$dir")"
-            if [ -f "$dir/ml-dash.exe" ]; then
-              cp "$dir/ml-dash.exe" "$staged/ml-dash-$V-$platform.exe"
-            elif [ -f "$dir/ml-dash" ]; then
-              cp "$dir/ml-dash" "$staged/ml-dash-$V-$platform"
-            fi
-          done
-          # Re-runnable: a Release left behind by a failed earlier attempt gets
-          # its assets replaced rather than blocking the run.
-          #
-          # Notes go through a file: a quoted multi-line argument inside an
-          # indented YAML block carries that indentation into the rendered
-          # Markdown, which turns the install commands into code blocks.
           notes="$(mktemp)"
+          trap 'rm -rf "$staged" "$notes"' EXIT
+
+          # Every name comes out of the manifest. The npm name is expected to
+          # change to a scoped one (`ml-dash` is not claimable unscoped), and a
+          # literal here would then label the assets after a package that is
+          # not the one being published.
+          eval "$(node -e '
+            const m = require(`./release/${process.env.V}/manifest.json`);
+            const base = m.name.replace(/^@[^/]+\//, "");
+            const bins = Object.entries(m.platforms)
+              .map(([p, e]) => `${p}:${e.binary}`).join(" ");
+            console.log(`PKG_NAME=${JSON.stringify(m.name)}`);
+            console.log(`PKG_BASE=${JSON.stringify(base)}`);
+            console.log(`TARBALL=${JSON.stringify(m.npm.tarball)}`);
+            console.log(`BINS=${JSON.stringify(bins)}`);
+          ')"
+
+          cp "$rel/manifest.json" "$rel/install.sh" "$rel/install.ps1" "$rel/$TARBALL" "$staged/"
+          for entry in $BINS; do
+            platform="${entry%%:*}"; binary="${entry#*:}"
+            case "$binary" in
+              *.exe) cp "$rel/$platform/$binary" "$staged/$PKG_BASE-$V-$platform.exe" ;;
+              *)     cp "$rel/$platform/$binary" "$staged/$PKG_BASE-$V-$platform" ;;
+            esac
+          done
+
           {
-            echo "ml-dash $V"
+            echo "$PKG_NAME $V"
             echo
             echo "Install:"
             echo '```sh'
             echo "curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh"
-            echo "npm install -g ml-dash@$V"
+            echo "npm install -g $PKG_NAME@$V"
             echo '```'
             echo
             echo "Every asset here is byte-identical to the one served from R2 and to the"
             echo "sha256 recorded in \`manifest.json\`."
           } > "$notes"
+
+          # Re-runnable: a Release left behind by a failed earlier attempt gets
+          # its assets replaced rather than blocking the run.
           if gh release view "v$V" >/dev/null 2>&1; then
             gh release upload "v$V" "$staged"/* --clobber
           else
@@ -269,9 +309,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ml-dash-${{ steps.v.outputs.version }}-manifest
+          name: release-${{ steps.v.outputs.version }}-manifest
+          # The tarball rides along at 55 KB: it is the exact npm payload, and
+          # having it attached to the run is what lets a packed artifact be
+          # compared against another build without re-running the pipeline.
+          # The 700 MB of binaries deliberately do not — they go to R2 and to
+          # the Release.
           path: |
             release/${{ steps.v.outputs.version }}/manifest.json
             release/${{ steps.v.outputs.version }}/install.sh
             release/${{ steps.v.outputs.version }}/install.ps1
+            release/${{ steps.v.outputs.version }}/*.tgz
           if-no-files-found: warn

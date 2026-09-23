@@ -45,22 +45,59 @@ What a successful run has done, in order:
    last on purpose: a Release is an announcement, and announcing a publish that
    did not happen is the failure this pipeline is shaped against.
 
+### The npm name is blocked, and that is the first thing to fix
+
+`ml-dash` **cannot be published as an unscoped name.** A publish was attempted
+and the registry answered:
+
+```
+E403  Package name too similar to existing package mldash
+```
+
+`mldash@0.0.1` exists, and npm refuses a new unscoped name that differs from an
+existing one only by punctuation. A 404 on `npm view ml-dash` means the name is
+*unused*, which is not the same as *available* — this pipeline previously said
+it was, and that was wrong.
+
+Scoped names are exempt from the similarity rule, so the fix is a scope. What a
+read-only look at the registry says about the options:
+
+| Scope | State |
+| --- | --- |
+| `@fortyfive-labs` | **does not exist** — `registry.npmjs.org/-/org/fortyfive-labs` is 404. Someone must create the org on npmjs.com (free for public packages) before `@fortyfive-labs/ml-dash` can be published. The name itself is unused. |
+| `@fortyfive`, `@fortyfive-ai` | also 404, same situation |
+| `@dreamlake` | exists; owner `episodeyang`, and the account that would publish (`tomtao57`) is a **developer** in it. `@dreamlake/ml-dash` is unused. |
+
+What the CLI cannot settle: whether a `developer` in `@dreamlake` may create a
+*new* package in that scope depends on org settings the registry does not
+expose to a non-admin, and there is no read-only call that answers it —
+publishing is the only test, and this has not published anything. Nor can the
+CLI create or claim `@fortyfive-labs`; `npm org create` does not exist.
+
+**The package name in `package.json` has deliberately not been changed** — that
+is a product decision, not a mechanical one. Nothing in the pipeline hard-codes
+it: the workflow and `publish-release.sh` read the name from `package.json` and
+from the manifest, and the manifest is checked against `package.json` before
+anything is published. Set a scoped name and everything — registry queries,
+error messages, npm precheck, Release asset names, install instructions —
+follows it.
+
 ### Secrets the workflow needs
 
 | Name | Where it comes from | Used for |
 | --- | --- | --- |
 | `CLOUDFLARE_ACCOUNT_ID` | the account owning `dash-downloads` | wrangler target account — **set** |
 | `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard → My Profile → API Tokens, a **custom token** scoped to that account with `Workers R2 Storage: Edit` and nothing else | uploading and pointer moves — **not set** |
-| `NPM_TOKEN` | npmjs.com → Access Tokens → **Granular access token**, read+write on the `ml-dash` package, no org scope | the first publish only — **not set** |
+| `NPM_TOKEN` | npmjs.com → Access Tokens → **Granular access token**, read+write on the package named in `package.json` (once that name is publishable), no org scope | the first publish only — **not set** |
 
-The npm token is genuinely required for `0.1.0` and genuinely avoidable after
-it. npm trusted publishing (OIDC) can only be configured on a package that
-already exists — the registry's settings page is the only place to enable it,
-and `ml-dash` is an unclaimed name — so the name has to be claimed once with a
-token ([npm/cli#8544](https://github.com/npm/cli/issues/8544)). The workflow is
+The npm token is genuinely required for the first publish and genuinely
+avoidable after it. npm trusted publishing (OIDC) can only be configured on a
+package that already exists — the registry's settings page is the only place to
+enable it — so a new name has to be claimed once with a token
+([npm/cli#8544](https://github.com/npm/cli/issues/8544)). The workflow is
 written for both: with `NPM_TOKEN` present it publishes with `--provenance`;
 with it absent it performs the OIDC handshake and publishes nothing else
-differently. So once `0.1.0` is out, configure the trusted publisher on
+differently. So once the first version is out, configure the trusted publisher on
 npmjs.com (org `fortyfive-labs`, repo `ml-dash-cli`, workflow `release.yml`),
 **delete the `NPM_TOKEN` secret and revoke the token**, and later releases need
 no npm credential at all. Skipping that last step is the whole point of the
@@ -77,14 +114,49 @@ installers and manifest built in a single run, and the manifest check passed.
 The three publish steps were skipped, as the dry run intends — **nothing has
 been published to npm, R2 or Releases by CI or by anyone else.**
 
-Worth recording, because it was not assumed: the eight binaries CI produced are
-**byte-identical** to the ones built on a macOS arm64 laptop from a different
-commit — `bun build --compile` is reproducible across host and source commit
-here, so the R2 artifacts do not depend on which machine builds them. The npm
-tarball is *not* byte-identical (55193 vs 55094 bytes; `npm pack` metadata).
-Nothing claims it is — the pipeline publishes the tarball CI packed and checks
-the registry's `dist.integrity` against those exact bytes — but "reproducible"
-applies to the binaries, not to the `.tgz`.
+Worth recording, because it was not assumed: the eight binaries CI produced on
+`ubuntu-latest` are **byte-identical** to the ones built on a macOS arm64
+laptop. The two commits differ (`9d5ee25` vs `7637326`), but only in
+`docs/RELEASE.md`, `scripts/publish-release.sh` and `.github/` — **no file
+under `src/` changed**, so this is a cross-host result for one CLI source tree
+and nothing more. It does not show that source changes leave the output alone,
+and it is not a general reproducibility claim: it says the R2 binaries do not
+depend on which of these two machines builds them.
+
+### Nothing is uploaded until npm is known to be publishable
+
+R2 is written before npm, because a channel pointer must not move to binaries
+nobody can fetch. The cost of that order is that an npm failure would land
+*after* the bucket is written — a half-published release. So the run settles
+npm first, with `publish-release.sh <version> --precheck-npm`, which uploads,
+publishes and moves nothing:
+
+| Registry state | Result |
+| --- | --- |
+| version published, same bytes | proceed — the npm step will verify and skip |
+| version published, different bytes | **stop** (versions are immutable) |
+| package exists, version is new, `NPM_TOKEN` set | proceed |
+| package exists, version is new, no token | **stop** unless `ML_DASH_NPM_TRUSTED=1` |
+| package does not exist, no token | **stop**, no override |
+| new unscoped name whose punctuation-stripped form is taken | **stop** — npm would answer E403 |
+| registry unreachable / any non-404 error | **stop** |
+
+The registry is read over plain HTTP rather than through `npm view`, for the
+same reason the R2 probe is: `npm view` exits non-zero for "no such package"
+and for "the registry is down" alike, and treating the second as the first is
+how a first publish gets attempted blind.
+
+Two limits worth stating plainly. **Whether a trusted publisher is configured
+is not readable** — the registry exposes no such field — so the no-token case
+stops by default and `ML_DASH_NPM_TRUSTED=1` is a human asserting they have
+read the package's settings page, not a verified fact. And **the similarity
+check is an approximation**: npm's rule runs server-side with no API, so this
+only catches the exact-collision case (strip `-`, `_`, `.` and look the result
+up), which is the case that actually bit here. A subtler collision would still
+surface as an E403 from npm.
+
+For `0.1.0` as it stands, this gate stops the run twice over before any upload:
+no `NPM_TOKEN`, and an unscoped name npm will not accept.
 
 ### Re-running a failed release
 
@@ -307,9 +379,12 @@ can reach, which is the way to do that.
   whose `pyproject.toml` declares the same MIT terms for the same project name.
   Nothing was invented and `package.json`'s `"license": "MIT"` already matched,
   so it was left untouched.
-- **npm:** the name `ml-dash` is unregistered on the registry, so the first
-  publish claims it. A local login exists on one machine and is deliberately
-  not wired into CI. Publishing has not been attempted from anywhere.
+- **npm: blocked on the name, not on credentials.** A publish *was* attempted
+  from a laptop and the registry refused it — `E403 Package name too similar to
+  existing package mldash`. `ml-dash` is unused but not claimable; see "The npm
+  name is blocked" above for the scope options. Nothing was published by that
+  attempt or since. A local login exists on one machine and is deliberately not
+  wired into CI.
 - **`CLOUDFLARE_API_TOKEN` and `NPM_TOKEN` are not set on the repository**, so
   no release has been published by CI either. `CLOUDFLARE_ACCOUNT_ID` is set.
   Until both are added the workflow stops at its credential check — after the
