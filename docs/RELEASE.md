@@ -4,6 +4,86 @@ Two channels, one source tree: `src/index.ts` is compiled ahead of time into
 per-platform binaries for the R2 channel, and to `dist/` by `tsc` for the npm
 channel. There is no second implementation to drift.
 
+## How a release is published
+
+**From CI, not from a laptop.** `.github/workflows/release.yml` is the only
+path that is supposed to produce a published `ml-dash`. It checks out a commit
+that is already on GitHub, installs a pinned toolchain (Node 24, npm 11.12.1,
+Bun 1.3.14 — the Bun the 0.1.0 artifacts were built with), runs `npm test`,
+builds all eight targets plus the npm tarball, installers and manifest in one
+run, and only then touches a credential. A developer machine cannot be asked to
+vouch for bytes nobody else can reproduce.
+
+```sh
+gh workflow run release.yml -f version=0.1.0                 # publish 0.1.0
+gh workflow run release.yml -f version=0.1.0 -f dry_run=true # build + check, publish nothing
+git tag v0.1.0 && git push origin v0.1.0                     # same thing, tag-triggered
+```
+
+`-f ref=<sha>` builds an exact commit rather than the dispatched branch. The run
+fails before building if `package.json` disagrees with the requested version,
+and `build-release.ts` fails before compiling if `src/version.ts` disagrees with
+`package.json`.
+
+What a successful run has done, in order:
+
+1. `npm test` passed. (The Python interop suites *skip* on a runner without the
+   `ml-dash` virtualenv — they report skipped, not passed.)
+2. Eight binaries, `ml-dash-<version>.tgz`, both installers and `manifest.json`
+   were built, and the manifest was checked to contain all eight platforms and
+   a non-dirty commit.
+3. Every artifact was uploaded to R2 and then **read back over the public URL**
+   and compared byte-for-byte against the manifest, including both installer
+   URLs.
+4. `ml-dash@<version>` was published to npm from the tarball packed in step 2 —
+   by path, never from the working directory — and the registry's
+   `dist.integrity` was compared against sha512 computed from those same bytes.
+5. `releases/latest` was moved and read back. **`stable` is not moved**; a
+   pinned `--version` install is how a platform gets its first real run.
+6. A GitHub Release `v<version>` was created with the manifest, both
+   installers, the tarball and all eight binaries, named per platform. It is
+   last on purpose: a Release is an announcement, and announcing a publish that
+   did not happen is the failure this pipeline is shaped against.
+
+### Secrets the workflow needs
+
+| Name | Where it comes from | Used for |
+| --- | --- | --- |
+| `CLOUDFLARE_ACCOUNT_ID` | the account owning `dash-downloads` | wrangler target account — **set** |
+| `CLOUDFLARE_API_TOKEN` | Cloudflare dashboard → My Profile → API Tokens, a **custom token** scoped to that account with `Workers R2 Storage: Edit` and nothing else | uploading and pointer moves — **not set** |
+| `NPM_TOKEN` | npmjs.com → Access Tokens → **Granular access token**, read+write on the `ml-dash` package, no org scope | the first publish only — **not set** |
+
+The npm token is genuinely required for `0.1.0` and genuinely avoidable after
+it. npm trusted publishing (OIDC) can only be configured on a package that
+already exists — the registry's settings page is the only place to enable it,
+and `ml-dash` is an unclaimed name — so the name has to be claimed once with a
+token ([npm/cli#8544](https://github.com/npm/cli/issues/8544)). The workflow is
+written for both: with `NPM_TOKEN` present it publishes with `--provenance`;
+with it absent it performs the OIDC handshake and publishes nothing else
+differently. So once `0.1.0` is out, configure the trusted publisher on
+npmjs.com (org `fortyfive-labs`, repo `ml-dash-cli`, workflow `release.yml`),
+**delete the `NPM_TOKEN` secret and revoke the token**, and later releases need
+no npm credential at all. Skipping that last step is the whole point of the
+exercise thrown away.
+
+A local `npm login` is deliberately not a dependency of any of this.
+
+### Re-running a failed release
+
+Safe, and by design. R2 objects and npm versions are immutable, so a re-run of
+the *same commit* re-uploads identical bytes (the published manifest is fetched
+first; identical means resume, and only a definite 404 means "not published"),
+finds `dist.integrity` already equal and skips the npm publish, and re-uploads
+the GitHub Release assets with `--clobber`. A re-run of a *different* commit
+under the same version is refused at the first check rather than silently
+winning. The concurrency group is keyed on the version and does **not**
+cancel in progress: interrupting a run between the R2 upload and the npm
+publish is the one state that takes a human to untangle.
+
+The scripts below still work by hand, and `--verify-only` is the right way to
+re-check a published release from anywhere. They are no longer the way a
+release gets published.
+
 ## Commands
 
 ```sh
@@ -209,5 +289,12 @@ can reach, which is the way to do that.
   whose `pyproject.toml` declares the same MIT terms for the same project name.
   Nothing was invented and `package.json`'s `"license": "MIT"` already matched,
   so it was left untouched.
-- **npm:** logged in as `tomtao57`; the name `ml-dash` is unregistered on the
-  registry, so the first publish claims it. Publishing has not been attempted.
+- **npm:** the name `ml-dash` is unregistered on the registry, so the first
+  publish claims it. A local login exists on one machine and is deliberately
+  not wired into CI. Publishing has not been attempted from anywhere.
+- **`CLOUDFLARE_API_TOKEN` and `NPM_TOKEN` are not set on the repository**, so
+  no release has been published by CI either. `CLOUDFLARE_ACCOUNT_ID` is set.
+  Until both are added the workflow stops at its credential check — after the
+  tests and the build, before a single byte is uploaded — so a missing secret
+  costs a red run, never a half-published version. `-f dry_run=true` exercises
+  the same path deliberately.

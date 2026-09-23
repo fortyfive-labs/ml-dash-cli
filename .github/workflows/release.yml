@@ -1,0 +1,277 @@
+# Publish a release of ml-dash from CI, not from a laptop.
+#
+# Everything that ships is built here, in one run, from a commit that is
+# already on GitHub: eight compiled binaries, the npm tarball, both
+# installers and the manifest that hashes all of them. The publish step then
+# uploads exactly those bytes. That is the same contract scripts/
+# build-release.ts and scripts/publish-release.sh already enforce locally —
+# this workflow is the place it actually runs, so that no artifact anyone
+# installs has to be taken on trust from a developer machine.
+#
+# One job on purpose. A build job handing ~700 MB of binaries to a publish
+# job through the artifact store adds a large, slow moving part between the
+# hash and the upload, and the hash check at the far end is what makes the
+# split worth anything in the first place — publish-release.sh re-verifies
+# every file against the manifest either way. So the credentials are simply
+# never touched until `npm test` and the build have both passed.
+name: release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.1.0 (must equal package.json)"
+        required: true
+        type: string
+      ref:
+        description: "Commit SHA, tag or branch to build (default: the ref this was dispatched on)"
+        required: false
+        type: string
+      dry_run:
+        description: "Build and check only — publish nothing, move no pointer"
+        required: false
+        default: false
+        type: boolean
+  push:
+    # A `v0.1.0` tag publishes 0.1.0. This cannot double-publish alongside a
+    # manual dispatch of the same version: R2 objects and npm versions are
+    # immutable, and publish-release.sh resumes only when the already-published
+    # bytes are identical and fails loudly when they are not. A second run of
+    # the same commit is therefore a no-op; a second run of a *different*
+    # commit under the same version is refused rather than silently winning.
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-*"
+
+# Serialised per version, never cancelled: interrupting a run between the R2
+# upload and the npm publish is exactly the half-finished state that takes a
+# human to untangle.
+concurrency:
+  group: release-${{ inputs.version || github.ref_name }}
+  cancel-in-progress: false
+
+# Read-only by default; the job below asks for the two extra scopes it needs
+# and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: build · verify · publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write      # create the GitHub Release and upload its assets
+      id-token: write      # npm provenance / trusted publishing via OIDC
+    env:
+      # Resolved once so every later step agrees, including the failure paths.
+      VERSION: ${{ inputs.version || '' }}
+      DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+      # Pinned: `npx wrangler` unpinned would let a wrangler release change how
+      # a publish behaves without a commit here.
+      ML_DASH_WRANGLER: wrangler@4.136.3
+    steps:
+      - name: Resolve version
+        id: v
+        run: |
+          set -euo pipefail
+          version="$VERSION"
+          if [ -z "$version" ]; then
+            # Tag push: the `v` prefix is peeled here rather than in an
+            # expression — GitHub's expression language has no substring().
+            version="${GITHUB_REF_NAME#v}"
+          fi
+          case "$version" in
+            [0-9]*) ;;
+            *) echo "::error::Could not resolve a version from inputs or ${GITHUB_REF_NAME}" >&2; exit 1 ;;
+          esac
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing version $version (dry_run=$DRY_RUN)"
+
+      - uses: actions/checkout@v4
+        with:
+          # A dispatch may name an exact commit; a tag push builds the tag.
+          # Either way the tree that ships is one that is already on GitHub and
+          # can be reviewed after the fact — never a local working copy.
+          ref: ${{ inputs.ref || github.sha }}
+          # build-release.ts records `git rev-parse HEAD` in the manifest, so
+          # the checkout must be a real repository, not a detached export.
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          # Writes the .npmrc that `npm publish` reads NODE_AUTH_TOKEN from,
+          # and is also what setup-node needs for the OIDC handshake.
+          registry-url: "https://registry.npmjs.org"
+
+      # Trusted publishing needs npm >= 11.5.1, which Node 24 does not
+      # necessarily ship yet. Pinned rather than `@latest` so the publish path
+      # cannot change under us between two runs of the same commit.
+      - name: Pin npm
+        run: npm install -g npm@11.12.1
+
+      # The exact Bun the 0.1.0 artifacts were built with. `latest` would mean
+      # a rebuild of the same commit produces different binaries, which makes
+      # the immutability check in publish-release.sh fire on a re-run that
+      # should have been a no-op.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.14"
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Before anything is built, let alone published. The Python interop
+      # suites skip on a machine without the ml-dash virtualenv — they report
+      # "skipped", not "passed", so this gate never turns unverified into green.
+      - name: Test
+        run: npm test
+
+      - name: Check the version being published is the one in the tree
+        run: |
+          set -euo pipefail
+          pkg="$(node -p 'require("./package.json").version')"
+          if [ "$pkg" != "${{ steps.v.outputs.version }}" ]; then
+            echo "::error::package.json is $pkg but this run was asked to publish ${{ steps.v.outputs.version }}" >&2
+            exit 1
+          fi
+          # build-release.ts additionally refuses to start when src/version.ts
+          # disagrees with package.json, so the compiled binary cannot
+          # misreport itself.
+
+      - name: Build all eight targets, the npm tarball and the installers
+        run: bun run scripts/build-release.ts
+
+      # `bun build` exiting 0 is not proof eight files landed. The manifest is
+      # what the publish step trusts, so it is what gets counted.
+      - name: Check the manifest describes a complete release
+        run: |
+          set -euo pipefail
+          node -e '
+            const m = require("./release/${{ steps.v.outputs.version }}/manifest.json");
+            const want = ["darwin-arm64","darwin-x64","linux-x64","linux-arm64",
+                          "linux-x64-musl","linux-arm64-musl","windows-x64","windows-arm64"];
+            const missing = want.filter((p) => !m.platforms[p]);
+            if (missing.length) throw new Error("manifest is missing: " + missing.join(", "));
+            if (Object.keys(m.platforms).length !== want.length) throw new Error("unexpected extra platforms");
+            if (!m.npm?.tarball) throw new Error("manifest has no npm tarball");
+            for (const n of ["install.sh", "install.ps1"]) if (!m.installers?.[n]) throw new Error("manifest has no " + n);
+            if (m.commit.endsWith("-dirty")) throw new Error("built from a dirty tree in CI — that should be impossible");
+            console.log(`${want.length} platforms, ${m.npm.tarball}, bun ${m.bun}, commit ${m.commit}`);
+          '
+
+      # Fails here rather than halfway through a publish. A missing R2 token
+      # after the binaries are on npm is the worst place to find out.
+      - name: Check publish credentials are present
+        if: env.DRY_RUN != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          set -euo pipefail
+          missing=""
+          [ -n "${CLOUDFLARE_API_TOKEN:-}" ]  || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] || missing="$missing CLOUDFLARE_ACCOUNT_ID"
+          if [ -n "$missing" ]; then
+            echo "::error::Missing repository secret(s):$missing — see docs/RELEASE.md" >&2
+            exit 1
+          fi
+          echo "R2 credentials present."
+
+      # npm authentication, in the order of preference the registry supports:
+      #
+      #  * Trusted publishing (OIDC). No secret at all — the registry verifies
+      #    this workflow's identity. It can only be configured on a package
+      #    that already exists, so it is unavailable for the first publish of
+      #    a name (npm/cli#8544).
+      #  * NPM_TOKEN, with --provenance so the published tarball still carries
+      #    a signed statement of which commit and workflow produced it.
+      #
+      # Whichever is in play, the *tarball* is the one built above and hashed
+      # into the manifest; publish-release.sh publishes it by path.
+      - name: Publish to R2 and npm
+        if: env.DRY_RUN != 'true'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          # Unset when NPM_TOKEN is absent, which is how npm decides to fall
+          # back to the OIDC handshake.
+          ML_DASH_NPM_PROVENANCE: ${{ secrets.NPM_TOKEN != '' && '1' || '' }}
+        run: |
+          set -euo pipefail
+          if [ -n "${NODE_AUTH_TOKEN:-}" ]; then
+            echo "npm auth: NPM_TOKEN + --provenance"
+          else
+            echo "npm auth: trusted publishing (OIDC)"
+          fi
+          # `latest` moves; `stable` deliberately does not. A first release of
+          # a platform matrix this machine cannot fully execute should be
+          # reachable by a pinned install before it becomes the default.
+          ./scripts/publish-release.sh "${{ steps.v.outputs.version }}"
+
+      # Only after R2 read back clean and npm accepted the tarball. A Release
+      # is an announcement; announcing a publish that did not happen is the
+      # failure mode this whole pipeline is shaped against.
+      #
+      # Same bytes as R2, under names that say what they are — `ml-dash` eight
+      # times over would be unusable as release assets. manifest.json ships
+      # too, so an asset downloaded from here can be checked against the same
+      # sha256 an installer would check.
+      - name: Publish the GitHub Release
+        if: env.DRY_RUN != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          V: ${{ steps.v.outputs.version }}
+        run: |
+          set -euo pipefail
+          rel="release/$V"
+          staged="$(mktemp -d)"
+          trap 'rm -rf "$staged" "${notes:-}"' EXIT
+          cp "$rel/manifest.json" "$rel/install.sh" "$rel/install.ps1" "$staged/"
+          cp "$rel"/ml-dash-"$V".tgz "$staged/"
+          for dir in "$rel"/*/; do
+            platform="$(basename "$dir")"
+            if [ -f "$dir/ml-dash.exe" ]; then
+              cp "$dir/ml-dash.exe" "$staged/ml-dash-$V-$platform.exe"
+            elif [ -f "$dir/ml-dash" ]; then
+              cp "$dir/ml-dash" "$staged/ml-dash-$V-$platform"
+            fi
+          done
+          # Re-runnable: a Release left behind by a failed earlier attempt gets
+          # its assets replaced rather than blocking the run.
+          #
+          # Notes go through a file: a quoted multi-line argument inside an
+          # indented YAML block carries that indentation into the rendered
+          # Markdown, which turns the install commands into code blocks.
+          notes="$(mktemp)"
+          {
+            echo "ml-dash $V"
+            echo
+            echo "Install:"
+            echo '```sh'
+            echo "curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh"
+            echo "npm install -g ml-dash@$V"
+            echo '```'
+            echo
+            echo "Every asset here is byte-identical to the one served from R2 and to the"
+            echo "sha256 recorded in \`manifest.json\`."
+          } > "$notes"
+          if gh release view "v$V" >/dev/null 2>&1; then
+            gh release upload "v$V" "$staged"/* --clobber
+          else
+            gh release create "v$V" "$staged"/* --title "v$V" --notes-file "$notes"
+          fi
+
+      # Small enough to keep on every run, dry or not: the manifest is the
+      # record of what a run produced, and on a dry run it is the only output.
+      - name: Keep the manifest and installers with the run
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ml-dash-${{ steps.v.outputs.version }}-manifest
+          path: |
+            release/${{ steps.v.outputs.version }}/manifest.json
+            release/${{ steps.v.outputs.version }}/install.sh
+            release/${{ steps.v.outputs.version }}/install.ps1
+          if-no-files-found: warn

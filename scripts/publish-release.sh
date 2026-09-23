@@ -208,7 +208,11 @@ esac
 IMMUTABLE="public, max-age=31536000, immutable"   # versioned objects never change
 POINTER="public, max-age=60, must-revalidate"     # pointers decide new installs
 
-wr() { npx --yes wrangler "$@"; }
+# Pinnable so CI cannot have a publish change behaviour because wrangler
+# shipped a release; unpinned by default, which is what a local run has always
+# used. CI sets ML_DASH_WRANGLER to an exact version.
+WRANGLER="${ML_DASH_WRANGLER:-wrangler}"
+wr() { npx --yes "$WRANGLER" "$@"; }
 put() {  # put <key> <file> <content-type> <cache-control>
     wr r2 object put "$BUCKET/$1" --file="$2" --content-type="$3" --cache-control="$4" --remote
 }
@@ -273,7 +277,16 @@ print("sha512-" + base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()
     #
     # One submission only. An error can follow an accepted upload, and the
     # version is immutable, so a retry cannot help: reconcile by hand.
-    npm publish --access public "$REL/$TARBALL" ||
+    # --provenance only when a token is what authenticated us: trusted
+    # publishing attaches provenance on its own, and passing the flag without
+    # an OIDC-capable context is an error rather than a downgrade. CI sets
+    # ML_DASH_NPM_PROVENANCE=1 exactly when it supplied NODE_AUTH_TOKEN; a
+    # local run leaves it unset and publishes without an attestation, which is
+    # the honest outcome for a laptop that cannot produce one.
+    local provenance=()
+    if [ -n "${ML_DASH_NPM_PROVENANCE:-}" ]; then provenance=(--provenance); fi
+
+    npm publish --access public "${provenance[@]+"${provenance[@]}"}" "$REL/$TARBALL" ||
         { echo "  ✗ ml-dash@$VERSION outcome unresolved; check the registry before retrying. No retry here." >&2; exit 1; }
 
     registry_integrity="$(npm view "ml-dash@$VERSION" dist.integrity 2>/dev/null || true)"
