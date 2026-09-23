@@ -271,6 +271,7 @@ jobs:
             console.log(`PKG_BASE=${JSON.stringify(base)}`);
             console.log(`TARBALL=${JSON.stringify(m.npm.tarball)}`);
             console.log(`BINS=${JSON.stringify(bins)}`);
+            console.log(`SRC_COMMIT=${JSON.stringify(m.commit)}`);
           ')"
 
           cp "$rel/manifest.json" "$rel/install.sh" "$rel/install.ps1" "$rel/$TARBALL" "$staged/"
@@ -293,14 +294,27 @@ jobs:
             echo
             echo "Every asset here is byte-identical to the one served from R2 and to the"
             echo "sha256 recorded in \`manifest.json\`."
+            echo
+            echo "Built from \`$SRC_COMMIT\`, which is the commit \`manifest.json\` records"
+            echo "and the commit \`v$V\` tags."
           } > "$notes"
 
           # Re-runnable: a Release left behind by a failed earlier attempt gets
           # its assets replaced rather than blocking the run.
+          #
+          # --target is not optional here. Without it `gh release create` tags
+          # the default branch's current head, and that is not necessarily the
+          # commit the artifacts came from: a release that fails after R2 and
+          # npm are written is resumed by a *later* main, which adopts the
+          # published manifest and its original commit. Run 35839242613 would
+          # have tagged v0.1.1 at 98ec567 while every published byte was built
+          # from 41ece18. The manifest is the record of what shipped, so the
+          # tag comes from the manifest.
           if gh release view "v$V" >/dev/null 2>&1; then
             gh release upload "v$V" "$staged"/* --clobber
           else
-            gh release create "v$V" "$staged"/* --title "v$V" --notes-file "$notes"
+            gh release create "v$V" "$staged"/* \
+              --target "$SRC_COMMIT" --title "v$V" --notes-file "$notes"
           fi
 
       # Small enough to keep on every run, dry or not: the manifest is the
