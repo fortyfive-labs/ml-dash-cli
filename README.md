@@ -74,6 +74,19 @@ Run `ml-dash <command> --help` for the flags of any command.
 
 macOS (arm64, x64), Linux (x64, arm64; glibc and musl), Windows (x64, arm64).
 
+The binaries bundle their own runtime, so no Node and no Python is needed.
+They are not statically linked, though: the musl builds link against
+`libstdc++.so.6` and `libgcc_s.so.1`, which a bare Alpine image does not
+ship. On Alpine, install them once:
+
+```sh
+apk add --no-cache libstdc++
+```
+
+`install.sh` runs the downloaded binary before installing it, so a missing
+system library is reported at install time with nothing written, rather
+than at your next `ml-dash` command.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Same terms and copyright as the Python `ml-dash`

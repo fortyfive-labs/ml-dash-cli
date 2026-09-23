@@ -154,14 +154,37 @@ This is a macOS arm64 machine, so what has actually been exercised here is:
   an unreachable host and against a server returning 500: both stop, neither
   is mistaken for an unpublished version. Shell/bash syntax checks on all three
   scripts; the build script parses and resolves under Bun.
-- **Not done here:** no build of any kind has been run — no binaries, no
-  tarball, no manifest exists yet; the fixtures above were hand-made to the
-  manifest's shape. No full eight-platform build (deferred until the source
-  tree settles), and no binary has been executed on Linux glibc, Linux musl,
-  Windows x64 or Windows ARM64. Cross-compiled output and the three non-macOS
-  platforms are unproven by execution on real hardware — Windows ARM64 most of
-  all, since nothing here can run it. `install.ps1` has not been parsed or run:
-  no PowerShell on this machine.
+- **The 0.1.0 build, run for real.** All eight targets compiled under Bun
+  1.3.14 from commit `f1a9144` on a clean tree — including `bun-windows-arm64`,
+  which is a genuine target and not an x64 alias. The npm tarball, both
+  installers and `manifest.json` were produced in the same run.
+- **Executed, not merely built:**
+  - `darwin-arm64`, copied out of the release and run from a directory outside
+    the source tree: `version`, `--help` (all ten commands listed), and a real
+    device-flow `login` + `list` against the project's fake server — five HTTP
+    requests reached it and the projects rendered from its response.
+  - The npm tarball installed into an empty prefix from the `.tgz` itself:
+    same three checks, same results.
+  - `install.sh` served over local HTTP from this exact release: it resolved
+    the `latest` channel, parsed the manifest, verified the sha256, installed,
+    and wrote its receipt. The installed binary runs with `node` absent from
+    `PATH` and links only macOS system libraries.
+  - `linux-arm64` under `debian:stable-slim` (no node, no python3 in the
+    image): `version` and `--help` both fine.
+- **What that build exposed.** `linux-arm64-musl` does *not* start on a bare
+  `alpine:3.20` — `scanelf` shows it needs `libstdc++.so.6` and
+  `libgcc_s.so.1`, which Bun's musl target links dynamically and Alpine does
+  not ship. `apk add --no-cache libstdc++` fixes it; the binary then runs. This
+  is a property of `bun build --compile --target=bun-linux-*-musl`, not of this
+  source. `install.sh` now execs the verified binary before installing it and
+  reports this case with the `apk` line, installing nothing; the README says so
+  too.
+- **Still unproven by execution:** the x64 builds of every platform, both
+  Windows builds, and `linux-*-musl` on a *real* Alpine host rather than a
+  container — this machine is arm64, so the x64 artifacts were compiled but
+  never run. Windows ARM64 most of all, since nothing here can run it.
+  `install.ps1` has still not been parsed or run: no PowerShell on this
+  machine.
 
 Treat a first release as needing one real run per platform before `stable`
 moves. `--no-pointer` publishes a version that only a pinned `--version` install

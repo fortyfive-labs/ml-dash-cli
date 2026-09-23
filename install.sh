@@ -147,6 +147,26 @@ fi
 echo "  sha256 ok"
 chmod +x "$TMP/$BINARY"
 
+# The verified bytes are not yet a working install: Bun's musl builds link
+# against libstdc++.so.6 and libgcc_s.so.1, which a bare Alpine image does not
+# ship, and a glibc image can be too old. Exec the staged binary now so that
+# failure is reported here — installing first and letting `ml-dash` die on the
+# user's next command is the exact "fails at first run, not at install time"
+# outcome the platform probe above exists to prevent.
+if ! smoke="$("$TMP/$BINARY" version 2>&1)"; then
+    echo "ml-dash install: the downloaded binary does not run on this system:" >&2
+    echo "$smoke" | sed 's/^/    /' >&2
+    case "$PLATFORM" in
+        *-musl)
+            echo "" >&2
+            echo "  This build needs libstdc++ and libgcc, which Alpine does not" >&2
+            echo "  install by default:" >&2
+            echo "      apk add --no-cache libstdc++" >&2
+            ;;
+    esac
+    die "nothing was installed"
+fi
+
 # ── install ──────────────────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR" || die "cannot create $INSTALL_DIR"
 TARGET="$INSTALL_DIR/ml-dash"
