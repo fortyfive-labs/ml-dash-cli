@@ -24,6 +24,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -31,7 +32,7 @@ import {
 } from "node:fs";
 import { copyFile } from "node:fs/promises";
 import path from "node:path";
-import { resolveWithin, safeSegment } from "./safe-path.js";
+import { literal, resolveUnderRoot, type PathPart } from "./safe-path.js";
 
 export const FILES_METADATA_FILENAME = ".files_metadata.json";
 
@@ -82,19 +83,43 @@ export class LocalStorage {
   readonly rootPath: string;
 
   constructor(rootPath: string) {
-    this.rootPath = path.resolve(rootPath);
-    mkdirSync(this.rootPath, { recursive: true });
+    const resolved = path.resolve(rootPath);
+    mkdirSync(resolved, { recursive: true });
+    // The root is the one path the user picked deliberately, so following its
+    // own links is what they asked for; everything below it is checked
+    // against this canonical form.
+    this.rootPath = realpathSync(resolved);
   }
+
+  /**
+   * The single boundary: every path this class touches is built here, from
+   * the root down, with the server-supplied parts and the literal ones
+   * checked alike. A derived directory is never treated as a new root.
+   */
+  private target(parts: PathPart[], mode: "read" | "write" = "write"): string {
+    return resolveUnderRoot(this.rootPath, parts, mode);
+  }
+
+  private static prefixPart = (prefix: string): PathPart => ({
+    label: "experiment prefix",
+    value: prefix,
+    nested: true,
+  });
 
   /**
    * Experiment directory for a prefix of the form owner/project/folders…/name.
    *
-   * The prefix is server metadata, and every other path in this class is built
-   * from the directory it returns, so this is the choke point where a prefix
-   * that would leave the root is rejected rather than written.
+   * Read mode: callers outside this class use it to look, and `upload` has to
+   * keep working on a tree where the user symlinked their own data. Every
+   * write below goes through `target(…, "write")` instead.
    */
   experimentDir(prefix: string): string {
-    return resolveWithin(this.rootPath, prefix, "experiment prefix");
+    return this.target([LocalStorage.prefixPart(prefix)], "read");
+  }
+
+  /** Same directory, as a write target. */
+  private experimentWriteDir(prefix: string): string {
+    return this.target([LocalStorage.prefixPart(prefix)]);
   }
 
   // ── experiment metadata ────────────────────────────────────────────────────
@@ -113,14 +138,14 @@ export class LocalStorage {
     metadata?: Record<string, unknown> | null;
   }): string {
     const prefixClean = args.prefix.replace(/\/+$/, "");
-    const dir = this.experimentDir(prefixClean);
+    const dir = this.experimentWriteDir(prefixClean);
     mkdirSync(dir, { recursive: true });
     for (const sub of ["logs", "metrics", "files"]) {
-      mkdirSync(path.join(dir, sub), { recursive: true });
+      mkdirSync(this.target([LocalStorage.prefixPart(prefixClean), literal(sub)]), { recursive: true });
     }
 
     const name = prefixClean.split("/").pop()!;
-    const file = path.join(dir, "experiment.json");
+    const file = this.target([LocalStorage.prefixPart(prefixClean), literal("experiment.json")]);
 
     if (!existsSync(file)) {
       writeFileSync(
@@ -173,7 +198,7 @@ export class LocalStorage {
   }
 
   readExperiment(prefix: string): Record<string, any> | null {
-    const file = path.join(this.experimentDir(prefix), "experiment.json");
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("experiment.json")], "read");
     if (!existsSync(file)) return null;
     try {
       return JSON.parse(readFileSync(file, "utf8"));
@@ -186,9 +211,8 @@ export class LocalStorage {
 
   /** Merge into parameters.json, bumping `version` the way the SDK does. */
   writeParameters(prefix: string, data: Record<string, unknown>): void {
-    const dir = this.experimentDir(prefix);
-    mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, "parameters.json");
+    mkdirSync(this.experimentWriteDir(prefix), { recursive: true });
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("parameters.json")]);
 
     let merged: Record<string, unknown> = {};
     let version = 1;
@@ -211,7 +235,7 @@ export class LocalStorage {
 
   /** Read parameters, accepting both the versioned and the bare-dict shapes. */
   readParameters(prefix: string): Record<string, unknown> | null {
-    const file = path.join(this.experimentDir(prefix), "parameters.json");
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("parameters.json")], "read");
     if (!existsSync(file)) return null;
     try {
       const doc = JSON.parse(readFileSync(file, "utf8"));
@@ -236,10 +260,10 @@ export class LocalStorage {
     entries: { message: string; level?: string; timestamp?: string; metadata?: unknown }[],
   ): number {
     if (entries.length === 0) return 0;
-    const logsDir = path.join(this.experimentDir(prefix), "logs");
+    const logsDir = this.target([LocalStorage.prefixPart(prefix), literal("logs")]);
     mkdirSync(logsDir, { recursive: true });
-    const logsFile = path.join(logsDir, "logs.jsonl");
-    const seqFile = path.join(logsDir, ".log_sequence");
+    const logsFile = this.target([LocalStorage.prefixPart(prefix), literal("logs"), literal("logs.jsonl")]);
+    const seqFile = this.target([LocalStorage.prefixPart(prefix), literal("logs"), literal(".log_sequence")]);
 
     let sequence = 0;
     if (existsSync(seqFile)) {
@@ -264,7 +288,7 @@ export class LocalStorage {
   }
 
   readLogs(prefix: string): Record<string, any>[] {
-    const file = path.join(this.experimentDir(prefix), "logs", "logs.jsonl");
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("logs"), literal("logs.jsonl")], "read");
     if (!existsSync(file)) return [];
     const out: Record<string, any>[] = [];
     for (const line of readFileSync(file, "utf8").split("\n")) {
@@ -287,7 +311,7 @@ export class LocalStorage {
    * is the one the current SDK writes and the one that carries an index.
    */
   listMetrics(prefix: string): LocalMetric[] {
-    const metricsDir = path.join(this.experimentDir(prefix), "metrics");
+    const metricsDir = this.target([LocalStorage.prefixPart(prefix), literal("metrics")], "read");
     if (!existsSync(metricsDir)) return [];
 
     const found = new Map<string, LocalMetric>();
@@ -342,14 +366,21 @@ export class LocalStorage {
 
   /** Append points in the directory layout, maintaining index and counts. */
   appendBatchToMetric(prefix: string, metricName: string | null, dataPoints: unknown[]): void {
-    const metricsDir = path.join(this.experimentDir(prefix), "metrics");
     const dirName = metricName === null ? "None" : String(metricName);
-    // A nested name ('train/loss') keeps nesting; '..' in one does not.
-    const metricDir = resolveWithin(metricsDir, dirName, "metric name");
+    // A nested name ('train/loss') keeps nesting; '..' in one does not. Every
+    // part, including 'metrics' and the two filenames, is checked from the
+    // root — `metrics` being a link out of the tree is the case a check
+    // anchored at the metrics directory could not see.
+    const metricParts: PathPart[] = [
+      LocalStorage.prefixPart(prefix),
+      literal("metrics"),
+      { label: "metric name", value: dirName, nested: true },
+    ];
+    const metricDir = this.target(metricParts);
     mkdirSync(metricDir, { recursive: true });
 
-    const dataFile = path.join(metricDir, "data.jsonl");
-    const metadataFile = path.join(metricDir, "metadata.json");
+    const dataFile = this.target([...metricParts, literal("data.jsonl")]);
+    const metadataFile = this.target([...metricParts, literal("metadata.json")]);
 
     let meta: Record<string, any> = {
       metricId: `local-metric-${metricName}`,
@@ -385,12 +416,22 @@ export class LocalStorage {
 
   // ── files ──────────────────────────────────────────────────────────────────
 
-  private filesDir(prefix: string): string {
-    return path.join(this.experimentDir(prefix), "files");
+  private filesDir(prefix: string, mode: "read" | "write" = "write"): string {
+    return this.target([LocalStorage.prefixPart(prefix), literal("files")], mode);
+  }
+
+  /** The parts of a stored file's path, from the root down. */
+  private fileParts(prefix: string, sub: string, ...rest: PathPart[]): PathPart[] {
+    const parts: PathPart[] = [LocalStorage.prefixPart(prefix), literal("files")];
+    // Python's storage lstrips a leading separator here; anything else in the
+    // path is checked rather than repaired.
+    const normalized = (sub ?? "").replace(/^\/+/, "");
+    if (normalized) parts.push({ label: "file path", value: normalized, nested: true });
+    return [...parts, ...rest];
   }
 
   loadFilesMetadata(prefix: string): { files: LocalFileRecord[] } {
-    const file = path.join(this.filesDir(prefix), FILES_METADATA_FILENAME);
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("files"), literal(FILES_METADATA_FILENAME)], "read");
     if (!existsSync(file)) return { files: [] };
     try {
       const parsed = JSON.parse(readFileSync(file, "utf8"));
@@ -401,12 +442,16 @@ export class LocalStorage {
   }
 
   private saveFilesMetadata(prefix: string, data: { files: LocalFileRecord[] }): void {
-    const dir = this.filesDir(prefix);
-    mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, FILES_METADATA_FILENAME);
+    mkdirSync(this.filesDir(prefix), { recursive: true });
+    const file = this.target([LocalStorage.prefixPart(prefix), literal("files"), literal(FILES_METADATA_FILENAME)]);
     // Write-then-rename: a crash mid-write would otherwise leave the manifest
-    // unparseable and orphan every file it listed.
-    const tmp = `${file}.tmp-${process.pid}`;
+    // unparseable and orphan every file it listed. The temporary name is a
+    // target of its own, so a planted link cannot catch the write either.
+    const tmp = this.target([
+      LocalStorage.prefixPart(prefix),
+      literal("files"),
+      literal(`${FILES_METADATA_FILENAME}.tmp-${process.pid}`),
+    ]);
     writeFileSync(tmp, JSON.stringify(data));
     renameSync(tmp, file);
   }
@@ -424,13 +469,14 @@ export class LocalStorage {
 
   /** Absolute on-disk path of a recorded file. */
   filePath(prefix: string, record: Pick<LocalFileRecord, "id" | "path" | "filename">): string {
-    const filesDir = this.filesDir(prefix);
-    const sub = (record.path ?? "").replace(/^\/+/, "");
-    const dir = sub ? resolveWithin(filesDir, sub, "file path") : filesDir;
-    return path.join(
-      dir,
-      safeSegment("file id", String(record.id)),
-      safeSegment("filename", record.filename),
+    return this.target(
+      this.fileParts(
+        prefix,
+        record.path ?? "",
+        { label: "file id", value: String(record.id) },
+        { label: "filename", value: record.filename },
+      ),
+      "read",
     );
   }
 
@@ -449,14 +495,14 @@ export class LocalStorage {
     contentType?: string;
     sizeBytes?: number;
   }): Promise<LocalFileRecord> {
-    const filesDir = this.filesDir(args.prefix);
     const fileId = generateSnowflakeId();
-    const filename = safeSegment("filename", args.filename);
-    const normalized = (args.path ?? "").replace(/^\/+/, "");
-    const storageDir = normalized ? resolveWithin(filesDir, normalized, "file path") : filesDir;
-    const fileDir = path.join(storageDir, fileId);
+    const idPart: PathPart = { label: "file id", value: fileId };
+    const namePart: PathPart = { label: "filename", value: args.filename };
+    const fileDir = this.target(this.fileParts(args.prefix, args.path ?? "", idPart));
+    const destination = this.target(this.fileParts(args.prefix, args.path ?? "", idPart, namePart));
+    const filename = args.filename;
     mkdirSync(fileDir, { recursive: true });
-    await copyFile(args.sourcePath, path.join(fileDir, filename));
+    await copyFile(args.sourcePath, destination);
 
     const now = utcNowIso();
     const record: LocalFileRecord = {
@@ -468,7 +514,7 @@ export class LocalStorage {
       tags: args.tags ?? [],
       bindrs: args.bindrs ?? [],
       contentType: args.contentType ?? "",
-      sizeBytes: args.sizeBytes ?? statSync(path.join(fileDir, filename)).size,
+      sizeBytes: args.sizeBytes ?? statSync(destination).size,
       checksum: args.checksum ?? "",
       metadata: args.metadata ?? null,
       uploadedAt: now,
@@ -482,14 +528,15 @@ export class LocalStorage {
     );
     if (existingIndex >= 0) {
       const old = meta.files[existingIndex];
-      const oldSub = (old.path ?? "").replace(/^\/+/, "");
-      const oldDir = oldSub ? resolveWithin(filesDir, oldSub, "file path") : filesDir;
-      // Only the directory this manifest created for that record, never a path
-      // the record could point at outside the tree.
-      rmSync(path.join(oldDir, safeSegment("file id", String(old.id))), {
-        recursive: true,
-        force: true,
-      });
+      // Only the directory this manifest created for that record, and only
+      // if every component of it is a real directory under the root: never a
+      // link the record could point at something else through.
+      rmSync(
+        this.target(
+          this.fileParts(args.prefix, old.path ?? "", { label: "file id", value: String(old.id) }),
+        ),
+        { recursive: true, force: true },
+      );
       meta.files[existingIndex] = record;
     } else {
       meta.files.push(record);

@@ -711,8 +711,16 @@ export async function run(args: ParsedArgs): Promise<number> {
       console.log(dim(`  Skipping ${key} (already completed)`));
       continue;
     }
-    const expJson = path.join(storage.experimentDir(localPrefixFor(exp)), "experiment.json");
-    if (existsSync(expJson) && !args.overwrite) {
+    // A prefix that cannot be resolved under the root is not "already here":
+    // it is queued so the per-experiment path reports it as the failure it is,
+    // rather than aborting the whole run from inside a skip check.
+    let expJson: string | null = null;
+    try {
+      expJson = path.join(storage.experimentDir(localPrefixFor(exp)), "experiment.json");
+    } catch {
+      expJson = null;
+    }
+    if (expJson && existsSync(expJson) && !args.overwrite) {
       console.log(yellow(`  Skipping ${key} (already exists locally)`));
       continue;
     }

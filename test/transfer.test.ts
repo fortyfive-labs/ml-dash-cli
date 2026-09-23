@@ -13,7 +13,15 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import path from "node:path";
 import { describe, test } from "node:test";
 import { defaultState, type FakeState } from "./fake-server.js";
@@ -680,6 +688,42 @@ describe("download refuses server paths that leave the tree", () => {
     assert.match(r.out, /unsafe/i);
     // Refused, not quietly rewritten into some other path inside the tree.
     assert.ok(!existsSync(path.join(root, "escaped")), "the prefix was rewritten into the tree");
+  });
+
+  test("a file directory that is already a link out of the root is refused", async (t) => {
+    // The server's metadata is ordinary here. What is hostile is the tree:
+    // the experiment's `files` directory is a symlink to somewhere outside
+    // the download root, so every lexically-fine path written through it
+    // lands out of the tree. A check anchored at that directory, or one that
+    // only resolves the deepest existing ancestor, accepts this.
+    const h = await harness(t, stateWithRemoteData());
+    await h.login();
+    const { root, file, unchanged } = sentinel(h);
+    const outside = path.join(path.dirname(root), "outside");
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(path.join(root, "test-user", "alpha", "exp-one"), { recursive: true });
+    symlinkSync(outside, path.join(root, "test-user", "alpha", "exp-one", "files"));
+
+    const r = await h.cli([
+      "download", root, "--dash-url", h.server.url,
+      "-p", "test-user/alpha", "--experiment", "exp-one",
+    ]);
+
+    assert.deepEqual(readdirSync(outside), [], "a file was written through the link, outside the root");
+    assert.deepEqual(
+      readdirSync(path.dirname(root)).sort(),
+      ["dash", "outside", "sentinel.txt"],
+      "something was created beside the download root",
+    );
+    unchanged();
+    assert.equal(r.code, 1, r.out);
+    assert.match(r.out, /symbolic link/i);
+    // The link itself is the user's; it is refused, not replaced or removed.
+    assert.ok(
+      lstatSync(path.join(root, "test-user", "alpha", "exp-one", "files")).isSymbolicLink(),
+      "the user's link was removed or replaced",
+    );
+    assert.ok(existsSync(file));
   });
 });
 
