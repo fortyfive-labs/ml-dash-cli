@@ -68,6 +68,24 @@ exercise thrown away.
 
 A local `npm login` is deliberately not a dependency of any of this.
 
+### What CI has actually proven so far
+
+One `dry_run=true` run on `ubuntu-latest`
+([35813302906](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35813302906),
+commit `7637326`): `npm test` passed, all eight targets plus the tarball,
+installers and manifest built in a single run, and the manifest check passed.
+The three publish steps were skipped, as the dry run intends — **nothing has
+been published to npm, R2 or Releases by CI or by anyone else.**
+
+Worth recording, because it was not assumed: the eight binaries CI produced are
+**byte-identical** to the ones built on a macOS arm64 laptop from a different
+commit — `bun build --compile` is reproducible across host and source commit
+here, so the R2 artifacts do not depend on which machine builds them. The npm
+tarball is *not* byte-identical (55193 vs 55094 bytes; `npm pack` metadata).
+Nothing claims it is — the pipeline publishes the tarball CI packed and checks
+the registry's `dist.integrity` against those exact bytes — but "reproducible"
+applies to the binaries, not to the `.tgz`.
+
 ### Re-running a failed release
 
 Safe, and by design. R2 objects and npm versions are immutable, so a re-run of
