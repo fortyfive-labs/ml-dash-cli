@@ -1,5 +1,5 @@
 {
-  "name": "ml-dash",
+  "name": "@dreamlake/ml-dash",
   "version": "0.1.0",
   "description": "ml-dash \u2014 ML experiment tracking CLI. Authenticate, inspect projects and experiments, and move experiment data to and from an ML-Dash server.",
   "type": "module",

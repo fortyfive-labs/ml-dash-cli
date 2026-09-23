@@ -9,7 +9,7 @@
  * Output — the only thing scripts/publish-release.sh is allowed to publish:
  *
  *   release/<version>/<platform>/ml-dash[.exe]   compiled binaries
- *   release/<version>/ml-dash-<version>.tgz      the npm package, packed here
+ *   release/<version>/<pkg>-<version>.tgz        the npm package, packed here
  *   release/<version>/install.sh, install.ps1    installers, base URL baked in
  *   release/<version>/manifest.json              sha256 + size of all of them
  *
@@ -164,6 +164,10 @@ async function main(): Promise<number> {
     return 1;
   }
   await run(["npm", "pack", "--pack-destination", outRoot]);
+  // Found by extension rather than by a composed name: npm flattens a scoped
+  // package to `<scope>-<name>-<version>.tgz`, so `@dreamlake/ml-dash` packs as
+  // `dreamlake-ml-dash-0.1.0.tgz`. The directory was emptied above, so there is
+  // exactly one candidate and the manifest records whatever npm actually wrote.
   const packed = (await readdir(outRoot)).find((f) => f.endsWith(".tgz"));
   if (!packed) {
     console.log("failed");

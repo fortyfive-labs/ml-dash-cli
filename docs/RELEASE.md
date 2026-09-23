@@ -29,7 +29,7 @@ What a successful run has done, in order:
 
 1. `npm test` passed. (The Python interop suites *skip* on a runner without the
    `ml-dash` virtualenv — they report skipped, not passed.)
-2. Eight binaries, `ml-dash-<version>.tgz`, both installers and `manifest.json`
+2. Eight binaries, `dreamlake-ml-dash-<version>.tgz`, both installers and `manifest.json`
    were built, and the manifest was checked to contain all eight platforms and
    a non-dirty commit.
 3. Every artifact was uploaded to R2 and then **read back over the public URL**
@@ -45,42 +45,47 @@ What a successful run has done, in order:
    last on purpose: a Release is an announcement, and announcing a publish that
    did not happen is the failure this pipeline is shaped against.
 
-### The npm name is blocked, and that is the first thing to fix
+### The npm package is `@dreamlake/ml-dash`
 
-`ml-dash` **cannot be published as an unscoped name.** A publish was attempted
-and the registry answered:
+The unscoped name is not available. A publish was attempted from a laptop and
+the registry refused it:
 
 ```
 E403  Package name too similar to existing package mldash
 ```
 
-`mldash@0.0.1` exists, and npm refuses a new unscoped name that differs from an
+`mldash@0.0.1` exists, and npm rejects a new unscoped name that differs from an
 existing one only by punctuation. A 404 on `npm view ml-dash` means the name is
-*unused*, which is not the same as *available* — this pipeline previously said
-it was, and that was wrong.
+*unused*, which is not the same as *available*.
 
-Scoped names are exempt from the similarity rule, so the fix is a scope. What a
-read-only look at the registry says about the options:
+Scoped names are exempt from that rule, and `@dreamlake` is an existing org
+(owner `episodeyang`) that the publishing account is a member of, so
+**`@dreamlake/ml-dash`** is the name. `@fortyfive-labs` was the other candidate
+and would have needed the org created first — `registry.npmjs.org/-/org/
+fortyfive-labs` is 404.
 
-| Scope | State |
-| --- | --- |
-| `@fortyfive-labs` | **does not exist** — `registry.npmjs.org/-/org/fortyfive-labs` is 404. Someone must create the org on npmjs.com (free for public packages) before `@fortyfive-labs/ml-dash` can be published. The name itself is unused. |
-| `@fortyfive`, `@fortyfive-ai` | also 404, same situation |
-| `@dreamlake` | exists; owner `episodeyang`, and the account that would publish (`tomtao57`) is a **developer** in it. `@dreamlake/ml-dash` is unused. |
+What this changes and what it does not:
 
-What the CLI cannot settle: whether a `developer` in `@dreamlake` may create a
-*new* package in that scope depends on org settings the registry does not
-expose to a non-admin, and there is no read-only call that answers it —
-publishing is the only test, and this has not published anything. Nor can the
-CLI create or claim `@fortyfive-labs`; `npm org create` does not exist.
+- The command is still `ml-dash` — `bin` is unchanged, and so are the compiled
+  binary filenames, the R2 prefix `ml-dash-cli/releases/` and the installer
+  URLs. Nothing about the R2 channel moves.
+- `npm pack` flattens the scope, so the tarball is `dreamlake-ml-dash-0.1.0.tgz`
+  rather than `ml-dash-0.1.0.tgz`. `build-release.ts` finds it by extension and
+  records whatever npm wrote, so the manifest, the R2 object key and the
+  Release asset all follow automatically.
+- Nothing hard-codes the name. `publish-release.sh` reads it from
+  `package.json`, checks it against the manifest, and percent-encodes it for
+  the registry query (verified: `@dreamlake/dreamlake-cli` resolves, so the
+  encoding is right rather than uniformly 404). The workflow derives Release
+  asset names and install instructions from the manifest.
+- The similarity precheck is skipped for scoped names, because npm's rule does
+  not apply to them.
 
-**The package name in `package.json` has deliberately not been changed** — that
-is a product decision, not a mechanical one. Nothing in the pipeline hard-codes
-it: the workflow and `publish-release.sh` read the name from `package.json` and
-from the manifest, and the manifest is checked against `package.json` before
-anything is published. Set a scoped name and everything — registry queries,
-error messages, npm precheck, Release asset names, install instructions —
-follows it.
+One consequence worth knowing: `release/0.1.0/` on a developer machine was
+built under the old name, so its manifest says `ml-dash` and
+`publish-release.sh` now refuses it — `manifest was built for package 'ml-dash'
+but package.json says '@dreamlake/ml-dash'`. That is the guard working. CI
+rebuilds from source on every run, so nothing needs rescuing.
 
 ### Secrets the workflow needs
 
@@ -172,8 +177,10 @@ only catches the exact-collision case (strip `-`, `_`, `.` and look the result
 up), which is the case that actually bit here. A subtler collision would still
 surface as an E403 from npm.
 
-For `0.1.0` as it stands, this gate stops the run twice over before any upload:
-no `NPM_TOKEN`, and an unscoped name npm will not accept.
+For `0.1.0` as it stands, this gate stops the run before any upload: the
+package does not exist yet, which makes it a first publish, and no `NPM_TOKEN`
+is set. The name is no longer a problem — `@dreamlake/ml-dash` is scoped and
+unused.
 
 ### Re-running a failed release
 
@@ -207,7 +214,7 @@ produces none:
 
 ```
 release/<version>/<platform>/ml-dash[.exe]   compiled binaries
-release/<version>/ml-dash-<version>.tgz      npm package, packed at build time
+release/<version>/<pkg>-<version>.tgz        npm package, packed at build time
 release/<version>/install.sh, install.ps1    installers, base URL baked in
 release/<version>/manifest.json              sha256 + size of all of the above,
                                              plus source commit, bun version
@@ -396,12 +403,12 @@ can reach, which is the way to do that.
   whose `pyproject.toml` declares the same MIT terms for the same project name.
   Nothing was invented and `package.json`'s `"license": "MIT"` already matched,
   so it was left untouched.
-- **npm: blocked on the name, not on credentials.** A publish *was* attempted
-  from a laptop and the registry refused it — `E403 Package name too similar to
-  existing package mldash`. `ml-dash` is unused but not claimable; see "The npm
-  name is blocked" above for the scope options. Nothing was published by that
-  attempt or since. A local login exists on one machine and is deliberately not
-  wired into CI.
+- **npm: the name is settled, the credential is not.** The package is
+  `@dreamlake/ml-dash` (the unscoped name was refused — see above). The name is
+  unused on the registry, so `0.1.0` is a first publish and needs `NPM_TOKEN`;
+  trusted publishing cannot be configured for a package that does not exist
+  yet. Nothing has been published. A local npm login exists on one machine and
+  is deliberately not wired into CI.
 - **`CLOUDFLARE_API_TOKEN` and `NPM_TOKEN` are not set on the repository**, so
   no release has been published by CI either. `CLOUDFLARE_ACCOUNT_ID` is set.
   Until both are added the workflow stops at its credential check — after the

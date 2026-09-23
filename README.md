@@ -17,11 +17,19 @@ curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh
 irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1 | iex
 ```
 
-**With Node ≥ 20.19 already installed:** not yet. The npm channel is built and
-tested on every release run but is **not published**: `ml-dash` is not
-claimable as an unscoped name — npm refuses it as too similar to the existing
-`mldash` — so the package needs a scope before this line can name something
-real. `docs/RELEASE.md` has the options. Until then, use the installers above.
+**With Node ≥ 20.19 already installed:**
+
+```sh
+npm install -g @dreamlake/ml-dash
+```
+
+The command is still `ml-dash`. The package is scoped because the unscoped
+name is not claimable — npm refuses `ml-dash` as too similar to the existing
+`mldash`.
+
+*Not published yet:* the npm channel is built and tested on every release run,
+but no version has reached the registry. Until one does, use the installers
+above. `docs/RELEASE.md` tracks what is outstanding.
 
 Both channels run the same code — the binaries are `src/index.ts` compiled
 ahead of time, the npm package is the same source compiled to `dist/`.
