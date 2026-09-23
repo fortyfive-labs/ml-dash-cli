@@ -123,6 +123,23 @@ and nothing more. It does not show that source changes leave the output alone,
 and it is not a general reproducibility claim: it says the R2 binaries do not
 depend on which of these two machines builds them.
 
+The npm tarball differs in size between hosts, and the reason is mundane. A
+second dry run
+([35813991008](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35813991008))
+now keeps the `.tgz` with the run, so it could be opened rather than guessed
+at: unpacked, **every packed file is byte-identical except `README.md`**, which
+genuinely changed in that commit. `package.json` is identical across the two
+commits — `npm pack` adds no `gitHead` here — and the packed file list is the
+same. `npm pack` was also run twice on one tree and produced byte-identical
+output. So the packed *content* is host-independent and `npm pack` is not
+non-deterministic; the size moved because a packed file moved.
+
+The earlier 99-byte delta (run `35813302906`, where `README.md` had *not*
+changed) cannot be attributed with the same confidence — that run did not
+retain its tarball, and it no longer exists. Given the above, gzip output
+differing between Node 26/macOS and Node 24/linux is the remaining
+explanation, but that is inference, not something checked.
+
 ### Nothing is uploaded until npm is known to be publishable
 
 R2 is written before npm, because a channel pointer must not move to binaries
