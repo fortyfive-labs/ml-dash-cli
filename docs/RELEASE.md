@@ -337,6 +337,93 @@ picks AVX paths at runtime, so a baseline build would be a duplicate.
 | Upload that is not fetchable | `remote bytes differ` / `download failed`, pointers never move |
 | `src/version.ts` ≠ `package.json` | build refuses to start |
 
+## `ml-dash update`, and what a release owes it
+
+From 0.1.1 the CLI updates itself, which makes two things the release process
+has to keep true.
+
+**A binary must look for its own updates where it ships.** `src/update/release.ts`
+holds the bucket URL as a constant compiled into every binary — deliberately
+not read from the receipt, the config file or a user's environment, because an
+update that can be redirected is an update that can be substituted.
+`scripts/build-release.ts` therefore refuses to build when that constant does
+not equal the `--public-url` the release is being published to, the same way it
+already refuses when `src/version.ts` disagrees with `package.json`. Changing
+the serving host now means changing one more line, and the build says so rather
+than shipping binaries that look for updates at an address the release does not
+occupy.
+
+**The `latest` pointer is the update channel.** `--no-pointer` publishes a
+version reachable only by a pinned install — that is still the right way to
+land a platform matrix nobody has run — but until `latest` moves, no installed
+binary will offer the update. `stable` is not read by `update` at all.
+
+`ML_DASH_UPDATE_BASE_URL` and `ML_DASH_UPDATE_REGISTRY` mirror the `--base-url`
+override the installers have always had, for testing against a staging bucket.
+They are narrow: HTTPS only, except for a loopback address, and an override is
+announced on stderr so a redirected update is never silent.
+
+### What has been exercised, and what has not
+
+Verified by execution on this macOS arm64 host (`test/update.test.ts`, 35 tests
+in the suite, part of `npm test`):
+
+- **A real compiled binary updating itself.** Two `bun build --compile` binaries
+  of this working tree, differing only in `src/version.ts`, and a local HTTP
+  server serving a build-shaped `latest` pointer, `manifest.json` and binary.
+  The 0.1.0 binary updates itself to 0.1.1, and the *installed file* is then run
+  and reports the new version — the claim is checked by execution, not by the
+  command's own output. Its 0700 mode is preserved, the install receipt is
+  rewritten in `install.sh`'s format, the install directory is left holding
+  exactly the binary and the receipt, and a second run reports "already latest".
+- **Failures leave the working binary alone.** A download with the right length
+  and wrong bytes (checksum mismatch), a body 4 KB longer than the manifest
+  declares, a release with no build for this platform, and an unreachable
+  source: each exits 1, and each is followed by running the still-installed
+  binary to confirm it is the old version, with no temporary file left behind.
+- **Refusals.** A source checkout (so `npm run cli -- update` cannot rewrite the
+  `ml-dash` on `PATH`), a symlinked install path, an install path inside another
+  package manager's store, an unwritable install directory, a pointer that moves
+  backwards, a non-semver `--version`, and a non-loopback `http://` override —
+  the last one refused by the compiled binary itself, not only by the library.
+- **An oversized metadata body** is cut off mid-stream, proven against a server
+  that answers a 1 KB-capped read with an endless one.
+
+One thing measuring this changed. The obvious guard against updating another
+tool's install — refuse when the target is a symlink — turns out not to fire:
+`process.execPath` is symlink-resolved by the OS, confirmed on this host by
+running a compiled binary through a symlink and watching it report the link's
+target. So a `~/.local/bin/ml-dash` pointing into a Homebrew cellar would have
+handed `update` the cellar's real file, and the lstat check would have seen an
+ordinary file and allowed it. The path-based store check above is what actually
+closes that, and the symlink check is kept as the secondary guard it really is.
+- **The npm channel, through a real `node_modules` tree.** The package copied
+  into `node_modules/@dreamlake/ml-dash` with its dependencies beside it is
+  detected as the npm channel — the same `package.json` in a checkout is not —
+  and `--check` against a fixture registry reports the newer version without
+  invoking npm at all. `findNpm()` is proven by spawning what it returns and
+  reading a version out of it, with `shell: false`.
+
+Not exercised, and not claimed:
+
+- **The Windows post-exit swap.** No Windows and no PowerShell on this host, so
+  what is tested is the contract of the script that gets written — it waits on
+  this exact PID, moves the staged file onto the target, refreshes the receipt
+  in `install.ps1`'s format, removes the download if the move throws, and
+  deletes itself last — plus the quoting, which is asserted by parsing the
+  literals back out and requiring them to equal the paths that went in. Whether
+  PowerShell then does the right thing is unproven here, exactly as
+  `install.ps1` and the `windows-arm64` build are.
+- **`npm install -g` actually running.** The tests stop at `--check` and at the
+  argument vector; a test that installed a global package would mutate the
+  machine running it. What is checked is that the version is a single strict-
+  semver-validated argv entry, that npm is reached without a shell, and that the
+  command re-reads what npm left installed and fails when it is not the version
+  that was asked for.
+- **A downloaded binary of a *different* platform.** The smoke test that catches
+  a musl/glibc mismatch runs the staged binary before installing it, and that
+  path is exercised — but only with a binary this host can run.
+
 ## Verification limits on this host
 
 This is a macOS arm64 machine, so what has actually been exercised here is:
@@ -362,7 +449,7 @@ This is a macOS arm64 machine, so what has actually been exercised here is:
   installers and `manifest.json` were produced in the same run.
 - **Executed, not merely built:**
   - `darwin-arm64`, copied out of the release and run from a directory outside
-    the source tree: `version`, `--help` (all ten commands listed), and a real
+    the source tree: `version`, `--help` (all ten commands of that release listed), and a real
     device-flow `login` + `list` against the project's fake server — five HTTP
     requests reached it and the projects rendered from its response.
   - The npm tarball installed into an empty prefix from the `.tgz` itself:
@@ -398,8 +485,10 @@ can reach, which is the way to do that.
   (`wrangler r2 bucket create`), public access enabled
   (`wrangler r2 bucket dev-url enable`), and the URL confirmed live: a GET of
   `https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/ml-dash-cli/releases/latest`
-  returns 404, which is the correct answer for an empty bucket and the signal
-  the publish script reads as "not published yet". Nothing has been uploaded.
+  returned 404, which is the correct answer for an empty bucket and the signal
+  the publish script reads as "not published yet". The bucket is no longer
+  empty — 0.1.0's artifacts and the installers are in it — but that key is
+  still 404, because no run has moved a pointer.
   Existing buckets (`dreamlake-downloads`, `lakeshore-releases`) were left
   alone. (One `r2 bucket list` failed with `fetch failed` and a retry
   succeeded — a single connectivity error is worth one retry, but an upload's
@@ -411,12 +500,21 @@ can reach, which is the way to do that.
   whose `pyproject.toml` declares the same MIT terms for the same project name.
   Nothing was invented and `package.json`'s `"license": "MIT"` already matched,
   so it was left untouched.
-- **npm: the name is settled, the credential is not.** The package is
-  `@dreamlake/ml-dash` (the unscoped name was refused — see above). The name is
-  unused on the registry, so `0.1.0` is a first publish and needs `NPM_TOKEN`;
-  trusted publishing cannot be configured for a package that does not exist
-  yet. Nothing has been published. A local npm login exists on one machine and
-  is deliberately not wired into CI.
+- **npm: `0.1.0` is published; CI still cannot publish.** `@dreamlake/ml-dash`
+  (the unscoped name was refused — see above) was published to the registry by
+  hand from a machine holding an npm login, because trusted publishing cannot
+  be configured for a package that does not exist yet. That first publish is
+  what unblocks it: the package now has a settings page, so a **GitHub trusted
+  publisher can and should be configured** — owner `fortyfive-labs`, repository
+  `ml-dash-cli`, workflow `release.yml` — after which `NPM_TOKEN` should be
+  deleted rather than left in the repository. Until that is done, CI has no way
+  to publish to npm and `0.1.1` cannot be released.
+- **R2: `0.1.0` is published but no pointer names it.** The versioned objects
+  under `ml-dash-cli/releases/0.1.0/` and both installers are live and readable;
+  `ml-dash-cli/releases/latest` and `stable` are still 404. So
+  `curl … install.sh | sh` fails at channel resolution today, and
+  `ml-dash update` on a standalone install has nothing to read. Both need
+  `--version 0.1.0` until a release run moves `latest`.
 - **`CLOUDFLARE_API_TOKEN` and `NPM_TOKEN` are not set on the repository**, so
   no release has been published by CI either. `CLOUDFLARE_ACCOUNT_ID` is set.
   Until both are added the workflow stops at its credential check — after the

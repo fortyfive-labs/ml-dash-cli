@@ -113,6 +113,23 @@ async function main(): Promise<number> {
   // publish-release.sh refuses to upload to a different one.
   const publicUrl = (flag("public-url") ?? process.env.ML_DASH_PUBLIC_URL ?? DEFAULT_PUBLIC_URL).replace(/\/+$/, "");
 
+  // `ml-dash update` fetches its own replacement from a constant compiled into
+  // the binary. If that constant is not the host this release is published to,
+  // an installed binary would look for updates somewhere the release does not
+  // exist — or, worse, somewhere else entirely. The installers already have
+  // their URL substituted in below; source cannot be rewritten the same way
+  // without editing a tracked file on every build, so it is checked instead.
+  const updateUrl = /DEFAULT_PUBLIC_URL\s*=\s*"([^"]+)"/.exec(
+    await readFile(join(ROOT, "src/update/release.ts"), "utf8"),
+  )?.[1];
+  if (updateUrl !== publicUrl) {
+    console.error(
+      `src/update/release.ts fetches updates from ${updateUrl ?? "<unparseable>"} but this release ` +
+        `publishes to ${publicUrl}.\nMake them match — a binary must look for its own updates where it ships.`,
+    );
+    return 1;
+  }
+
   const outRoot = resolve(ROOT, flag("out") ?? "release", version);
   // A leftover file from an earlier attempt would otherwise be published as if
   // it belonged to this build.

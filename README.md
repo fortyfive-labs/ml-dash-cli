@@ -27,9 +27,11 @@ The command is still `ml-dash`. The package is scoped because the unscoped
 name is not claimable — npm refuses `ml-dash` as too similar to the existing
 `mldash`.
 
-*Not published yet:* the npm channel is built and tested on every release run,
-but no version has reached the registry. Until one does, use the installers
-above. `docs/RELEASE.md` tracks what is outstanding.
+*Current state:* `@dreamlake/ml-dash@0.1.0` is on the registry. On R2 the
+0.1.0 artifacts and both installers are published, but the `latest` and
+`stable` channel pointers have not been written yet — so the two install
+commands above need an explicit `--version 0.1.0` until a release run moves
+them. `docs/RELEASE.md` tracks what is outstanding.
 
 Both channels run the same code — the binaries are `src/index.ts` compiled
 ahead of time, the npm package is the same source compiled to `dist/`.
@@ -58,6 +60,46 @@ reported and left for you to resolve with the tool that owns it. If the
 install path is already occupied by a file this installer did not write — a
 symlink, a pipx shim, anything without its receipt — it stops instead of
 overwriting; `--force` / `-Force` takes over deliberately.
+
+## Updating
+
+```sh
+ml-dash update           # update to the latest release
+ml-dash update --check   # report whether one exists; change nothing
+```
+
+`update` uses the channel this copy was installed from, and works it out from
+the running process rather than guessing: an npm install runs
+`npm install -g @dreamlake/ml-dash@<version>`, a standalone binary replaces
+itself. Run from a source checkout it refuses outright, so `npm run cli --
+update` in this repository cannot quietly rewrite the `ml-dash` on your PATH.
+
+For a standalone binary, an update is only written after it has been proven:
+
+- the version comes from the `latest` pointer in the same bucket the binary was
+  installed from — the URL is compiled in, not configurable by a user;
+- the download is checked against the sha256 **and** the byte count in that
+  release's `manifest.json`, and is cut off the moment it runs past the
+  declared length;
+- the downloaded binary is run once (`ml-dash version`) and has to report the
+  version that was asked for — the same gate `install.sh` applies, which is
+  what catches a correct build for the wrong libc;
+- only then is it renamed over the running binary, keeping its permissions, and
+  the install receipt is refreshed so `install.sh` still recognises the install.
+
+Any failure leaves the working binary exactly as it was and removes the
+download. `update` never downgrades: if the pointer moves backwards it stops
+and tells you to use `install.sh --version` if that is really what you want.
+
+It will refuse, rather than force, an install it does not own. A binary sitting
+in a Homebrew cellar, a Nix store, a pipx venv or a `node_modules` tree is left
+alone with a pointer to that tool's own upgrade command, and so is a directory
+it cannot write to.
+
+`--version <x.y.z>` installs an exact release. `--json` prints the report for
+scripts. On Windows the running `.exe` cannot be replaced while it is open, so
+the verified file is swapped in as the command exits; `ml-dash update` tells
+you that and your next `ml-dash` is the new one.
 
 ## Usage
 

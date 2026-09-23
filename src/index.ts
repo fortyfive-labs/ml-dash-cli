@@ -24,6 +24,7 @@ const loaders: Record<string, () => Promise<CommandModule>> = {
   list: () => import("./commands/list.js") as Promise<CommandModule>,
   upload: () => import("./commands/upload.js") as Promise<CommandModule>,
   download: () => import("./commands/download.js") as Promise<CommandModule>,
+  update: () => import("./commands/update.js") as Promise<CommandModule>,
 };
 
 export async function main(argv: string[]): Promise<number> {
