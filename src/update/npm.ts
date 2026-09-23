@@ -157,26 +157,53 @@ export const installArgs = (version: string): string[] => [
 ];
 
 /**
+ * Where npm's own stdout should go.
+ *
+ * `inherit` is right for an interactive run: npm's progress, prompts and
+ * errors reach the terminal unmediated. It is wrong under `--json`, where
+ * this command's stdout is a machine-readable document and npm writing its
+ * own lines into it produces something no parser can read. Passed in
+ * explicitly rather than read off a global, so the one caller that knows
+ * which mode it is in is the one that decides.
+ */
+export type NpmOutput = "inherit" | "stderr";
+
+/**
  * Run `npm install -g <pkg>@<exact>` and return its exit code.
  *
  * Arguments go across as an array with `shell: false`, so the version string
- * is an argument rather than something a shell re-parses; stdio is inherited
- * so npm's own progress, prompts and errors reach the user unmediated.
+ * is an argument rather than something a shell re-parses. npm's stderr is
+ * always inherited — a failing install has to be able to say why — and only
+ * its stdout is diverted, onto this process's stderr rather than discarded,
+ * so `--json` loses none of the diagnosis it would otherwise print.
  */
-export function runNpmInstall(npm: NpmInvocation, version: string): Promise<number> {
+export function runNpmInstall(
+  npm: NpmInvocation,
+  version: string,
+  output: NpmOutput = "inherit",
+): Promise<number> {
   if (!isStrictSemver(version)) {
     // Belt and braces: nothing should reach here with an unvalidated version.
     throw new UpdateSourceError(`refusing to install '${version}': not a version`);
   }
   return new Promise((resolve, reject) => {
     const child = spawn(npm.command, [...npm.prefix, ...installArgs(version)], {
-      stdio: "inherit",
+      stdio: npmStdio(output),
       shell: false,
     });
+    // "pipe" only ever means "send it to stderr instead": nothing is dropped.
+    child.stdout?.pipe(process.stderr);
     child.on("error", reject);
     child.on("close", (code) => resolve(code ?? 1));
   });
 }
+
+/** stdin, stdout, stderr — separated out so the contract can be asserted. */
+export const npmStdio = (output: NpmOutput): ("inherit" | "pipe" | "ignore")[] => [
+  "inherit",
+  output === "stderr" ? "pipe" : "inherit",
+  "inherit",
+];
 
 /**
  * What is globally installed now, asked of npm rather than inferred.

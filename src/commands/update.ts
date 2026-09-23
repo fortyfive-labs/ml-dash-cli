@@ -181,7 +181,9 @@ async function updateNpm(channel: Extract<Channel, { kind: "npm" }>, opts: Optio
 
   const npm = findNpm();
   if (!opts.json) console.log(`Updating ml-dash ${VERSION} → ${cyan(target)} via npm`);
-  const code = await runNpmInstall(npm, target);
+  // Under --json this process's stdout carries one document and nothing else,
+  // so npm's own output is moved to stderr rather than interleaved into it.
+  const code = await runNpmInstall(npm, target, opts.json ? "stderr" : "inherit");
   if (code !== 0) {
     throw new UpdateSourceError(
       `npm install exited ${code}. Nothing here changed the install; npm's own output above says why.\n` +

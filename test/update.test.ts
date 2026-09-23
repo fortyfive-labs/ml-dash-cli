@@ -42,7 +42,7 @@ import {
   requireSafeOrigin,
   resolveBaseUrl,
 } from "../src/update/release.js";
-import { DEFAULT_REGISTRY, installArgs, findNpm, resolveRegistry } from "../src/update/npm.js";
+import { DEFAULT_REGISTRY, installArgs, findNpm, npmStdio, resolveRegistry } from "../src/update/npm.js";
 import {
   checkReplaceable,
   receiptContents,
@@ -64,7 +64,7 @@ function exec(
   command: string,
   args: string[],
   env: Record<string, string> = {},
-): Promise<{ code: number; out: string }> {
+): Promise<{ code: number; out: string; stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, {
       env: { ...process.env, NO_COLOR: "1", ...env },
@@ -72,11 +72,15 @@ function exec(
       // A CLI that never exits should fail a test, not wedge the whole run.
       timeout: 60_000,
     });
-    let out = "";
-    child.stdout.on("data", (c) => (out += c));
-    child.stderr.on("data", (c) => (out += c));
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (c) => (stdout += c));
+    child.stderr.on("data", (c) => (stderr += c));
     child.on("error", reject);
-    child.on("close", (code) => resolve({ code: code ?? -1, out }));
+    // `out` is both streams, for the assertions that do not care which.
+    child.on("close", (code) =>
+      resolve({ code: code ?? -1, out: stdout + stderr, stdout, stderr }),
+    );
   });
 }
 
@@ -402,6 +406,24 @@ describe("update: the Windows post-exit swap", () => {
 // ── npm channel, through a real installed tree ───────────────────────────────
 
 describe("update: the npm channel", () => {
+  /**
+   * A genuine global-style layout: the package under node_modules, with the
+   * dependencies it resolves at runtime beside it. This is what makes the
+   * channel detection answer "npm" — the same package.json in a checkout does
+   * not — so it has to be a real tree rather than a stub.
+   */
+  function installedTree(root: string): { pkgDir: string; entryPoint: string } {
+    const pkgDir = path.join(root, "node_modules", PACKAGE_NAME);
+    mkdirSync(pkgDir, { recursive: true });
+    for (const entry of ["bin", "dist", "package.json"]) {
+      cpSync(path.join(REPO, entry), path.join(pkgDir, entry), { recursive: true });
+    }
+    for (const dep of ["semver", "qrcode"]) {
+      symlinkSync(path.join(REPO, "node_modules", dep), path.join(root, "node_modules", dep));
+    }
+    return { pkgDir, entryPoint: path.join(pkgDir, "bin", "ml-dash.js") };
+  }
+
   test("installs an exact version, as an argument array, never a command string", () => {
     assert.deepEqual(installArgs("0.1.2"), ["install", "--global", `${PACKAGE_NAME}@0.1.2`]);
     // No shell metacharacter can be introduced, because the version is a
@@ -416,23 +438,82 @@ describe("update: the npm channel", () => {
     assert.match(r.stdout.trim(), /^\d+\.\d+\.\d+/);
   });
 
+  test("npm's stdout is inherited normally and diverted to stderr under --json", () => {
+    assert.deepEqual(npmStdio("inherit"), ["inherit", "inherit", "inherit"]);
+    // stdin and stderr stay inherited either way: a prompt still works and a
+    // failing install can still say why. Only stdout moves.
+    assert.deepEqual(npmStdio("stderr"), ["inherit", "pipe", "inherit"]);
+  });
+
+  test("--json output stays one parseable document while npm is talking", async (t) => {
+    const root = mkdtempSync(path.join(tmpdir(), "ml-dash-npmio-"));
+    t.after(() => rmSync(root, { recursive: true, force: true }));
+    const fixture = await startReleaseFixture();
+    t.after(() => fixture.close());
+
+    const { pkgDir, entryPoint } = installedTree(root);
+
+    // A stand-in npm, first on PATH, so the real spawn/stdio path runs without
+    // this test installing anything globally. It is chatty on both streams —
+    // which is what a real `npm install -g` is — and answers `ls` so the
+    // command's post-install verification sees the version it asked for.
+    const binDir = path.join(root, "stub-bin");
+    mkdirSync(binDir, { recursive: true });
+    const stub = path.join(binDir, "npm");
+    writeFileSync(
+      stub,
+      [
+        "#!/bin/sh",
+        'if [ "$1" = "ls" ]; then',
+        `  printf '{"dependencies":{"${PACKAGE_NAME}":{"version":"9.9.9"}}}'`,
+        "  exit 0",
+        "fi",
+        'echo "NPM-ON-STDOUT added 1 package"',
+        'echo "NPM-ON-STDERR npm warn deprecated" >&2',
+        "exit 0",
+      ].join("\n"),
+    );
+    chmodSync(stub, 0o755);
+
+    fixture.npmLatest = "9.9.9";
+    fixture.npmVersions.push(PKG.version, "9.9.9");
+    const env = {
+      ML_DASH_UPDATE_REGISTRY: fixture.url,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    };
+
+    const json = await exec(process.execPath, [entryPoint, "update", "--json"], env);
+    assert.equal(json.code, 0, json.out);
+
+    // The actual claim: stdout is exactly one JSON document.
+    assert.deepEqual(JSON.parse(json.stdout), {
+      channel: "npm",
+      current: PKG.version,
+      target: "9.9.9",
+      update_available: true,
+      action: "updated",
+    });
+    assert.ok(!json.stdout.includes("NPM-ON-STDOUT"), "npm's stdout leaked into the JSON");
+
+    // Diverted, not discarded — both of npm's streams are still readable.
+    assert.match(json.stderr, /NPM-ON-STDOUT added 1 package/);
+    assert.match(json.stderr, /NPM-ON-STDERR npm warn deprecated/);
+
+    // Without --json, npm's own output is the point and stays on stdout.
+    const human = await exec(process.execPath, [entryPoint, "update"], env);
+    assert.equal(human.code, 0, human.out);
+    assert.match(human.stdout, /NPM-ON-STDOUT added 1 package/);
+    assert.match(human.stdout, /Updated to ml-dash 9\.9\.9/);
+    assert.equal(pkgDir.length > 0, true);
+  });
+
   test("a real node_modules install reports the npm channel and checks the registry", async (t) => {
     const root = mkdtempSync(path.join(tmpdir(), "ml-dash-npm-"));
     t.after(() => rmSync(root, { recursive: true, force: true }));
     const fixture = await startReleaseFixture();
     t.after(() => fixture.close());
 
-    // A genuine global-style layout: the package under node_modules, with the
-    // dependencies it resolves at runtime beside it.
-    const pkgDir = path.join(root, "node_modules", PACKAGE_NAME);
-    mkdirSync(pkgDir, { recursive: true });
-    for (const entry of ["bin", "dist", "package.json"]) {
-      cpSync(path.join(REPO, entry), path.join(pkgDir, entry), { recursive: true });
-    }
-    for (const dep of ["semver", "qrcode"]) {
-      symlinkSync(path.join(REPO, "node_modules", dep), path.join(root, "node_modules", dep));
-    }
-    const entryPoint = path.join(pkgDir, "bin", "ml-dash.js");
+    const { entryPoint } = installedTree(root);
 
     // The channel is npm, not "source", even though the package.json is the
     // same file the checkout has.
@@ -442,7 +523,9 @@ describe("update: the npm channel", () => {
       ML_DASH_UPDATE_REGISTRY: fixture.url,
     });
     assert.equal(available.code, 0, available.out);
-    const report = JSON.parse(available.out.slice(available.out.indexOf("{")));
+    // stdout alone, and all of it: the registry-override note goes to stderr,
+    // so a --json run's stdout is the document and nothing else.
+    const report = JSON.parse(available.stdout);
     assert.deepEqual(report, {
       channel: "npm",
       current: PKG.version,
@@ -543,7 +626,7 @@ describe("update: a standalone binary updating itself", { skip: bunAvailable ? f
 
     const r = await exec(target, ["update", "--check", "--json"], { ML_DASH_UPDATE_BASE_URL: fixture.url });
     assert.equal(r.code, 0, r.out);
-    const report = JSON.parse(r.out.slice(r.out.indexOf("{")));
+    const report = JSON.parse(r.stdout);
     assert.deepEqual(report, {
       channel: "standalone",
       current: OLD,
