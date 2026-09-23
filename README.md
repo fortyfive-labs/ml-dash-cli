@@ -5,13 +5,6 @@ and experiments, and move experiment data to and from an ML-Dash server.
 
 ## Install
 
-> No release is published yet, so these commands do not work today — the
-> bucket they point at is live but empty. They are the exact commands the
-> first release makes work. `dl.dash.ml` is not used: `dash.ml` runs on NS1
-> nameservers and an R2 custom domain needs the zone in Cloudflare, so the
-> download host is the bucket's public URL below. See
-> [docs/RELEASE.md](docs/RELEASE.md).
-
 **macOS / Linux** — one self-contained binary, no Node or Python needed:
 
 ```sh
