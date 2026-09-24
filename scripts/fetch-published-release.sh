@@ -31,12 +31,19 @@ BASE_URL="${BASE_URL%/}"
 
 VERSION="${1:-}"
 [ -n "$VERSION" ] || { echo "Usage: $0 <version>" >&2; exit 1; }
+# release/<version>/ is a path, so the version has to be a plain component.
+# Leading digit rather than a full semver: this only has to exclude `..` and
+# anything with a separator in it, and the workflow already checks semver.
+printf '%s' "$VERSION" | grep -Eq '^[0-9][0-9A-Za-z.+-]*$' ||
+    { echo "'$VERSION' is not a plain version string." >&2; exit 1; }
 
 REL="$ROOT/release/$VERSION"
 
 sha_of()  { python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"; }
 size_of() { wc -c < "$1" | tr -d ' '; }
-mget()    { python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$REL/manifest.json" "$1"; }
+# Reads $MANIFEST, which is the temp copy until it has been checked and the
+# release directory afterwards — same bytes either way.
+mget()    { python3 -c 'import json,sys; m=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$MANIFEST" "$1"; }
 
 # `?v=` busts any edge-cached 404 from before the object existed, the same way
 # publish-release.sh's read-back does.
@@ -70,8 +77,7 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/ml-dash-fetch.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 fetch "$BASE_URL/$PREFIX/$VERSION/manifest.json" "$TMP/manifest.json" ||
     { echo "No published manifest for $VERSION — nothing to recover." >&2; exit 1; }
-mkdir -p "$REL"
-cp "$TMP/manifest.json" "$REL/manifest.json"
+MANIFEST="$TMP/manifest.json"
 
 # The manifest is the only file with nothing to check it against, so what can
 # be checked about it is checked here: that it describes this version, that it
@@ -89,11 +95,78 @@ printf '%s' "$SRC_COMMIT" | grep -Eq '^[0-9a-f]{40}$' ||
     { echo "Manifest commit '$SRC_COMMIT' is not a plain commit sha." >&2; exit 1; }
 echo "  ✓ manifest.json — $VERSION, built from $SRC_COMMIT"
 
+# Every output path below this line is built from strings in a manifest that
+# was just fetched over the network — the platform keys, the binary names and
+# the tarball name. `fetch_verified` does `mkdir -p` on the dirname it is
+# given, so a manifest naming a platform `../..` or a binary
+# `../../../../etc/cron.d/x` would write outside release/<version>/ before any
+# checksum could object. The workflow's completeness check catches a wrong
+# *set* of platforms, but it runs after the download, which is too late to
+# matter here.
+#
+# So the names are pinned before the first write, to exactly what this project
+# produces: the eight platform keys, the binary each implies, and the tarball
+# name npm derives from the package name and version (`npm pack` strips the
+# `@` and turns the `/` into `-`). Checksums and sizes are still verified
+# afterwards exactly as before — this only decides *where* bytes may be
+# written, not whether they are the right bytes. The installer names are
+# literals in the loop below and are not manifest-controlled.
+validate_manifest_names() {
+    python3 - "$MANIFEST" "$VERSION" <<'PY'
+import json, re, sys
+
+manifest, version = json.load(open(sys.argv[1])), sys.argv[2]
+WANT = {"darwin-arm64", "darwin-x64", "linux-x64", "linux-arm64",
+        "linux-x64-musl", "linux-arm64-musl", "windows-x64", "windows-arm64"}
+bad = []
+
+# Belt and braces. Exact-matching the whitelists below already excludes every
+# one of these, but this is the property that actually matters, and it keeps
+# holding if someone widens a whitelist later.
+def unsafe(value):
+    return ("/" in value or "\\" in value or value.startswith(".")
+            or value in ("", ".", ".."))
+
+platforms = manifest.get("platforms", {})
+if set(platforms) != WANT:
+    bad.append("platform keys are %s, not the eight this project builds"
+               % sorted(platforms))
+for platform, entry in sorted(platforms.items()):
+    binary = entry.get("binary", "")
+    expected = "ml-dash.exe" if platform.startswith("windows-") else "ml-dash"
+    if binary != expected:
+        bad.append("%s: binary is %r, expected %r" % (platform, binary, expected))
+    if unsafe(platform) or unsafe(binary):
+        bad.append("%s/%s: not a plain path component" % (platform, binary))
+
+tarball = manifest.get("npm", {}).get("tarball", "")
+expected = re.sub(r"^@", "", manifest.get("name", "")).replace("/", "-") + "-" + version + ".tgz"
+if tarball != expected:
+    bad.append("npm.tarball is %r, expected %r" % (tarball, expected))
+if unsafe(tarball):
+    bad.append("npm.tarball %r is not a plain filename" % tarball)
+
+if bad:
+    print("Published manifest names artifacts this script will not write:", file=sys.stderr)
+    for line in bad:
+        print("  - " + line, file=sys.stderr)
+    sys.exit(1)
+PY
+}
+validate_manifest_names || exit 1
+echo "  ✓ 8 platform keys, binary names and tarball name are the expected ones"
+
+# Nothing is written until the manifest has passed every check above, so a
+# rejected manifest leaves no half-made release/<version>/ behind.
+mkdir -p "$REL"
+cp "$MANIFEST" "$REL/manifest.json"
+MANIFEST="$REL/manifest.json"
+
 python3 -c '
 import json, sys
 for platform, e in json.load(open(sys.argv[1]))["platforms"].items():
     print(platform, e["binary"], e["checksum"], e["size"])
-' "$REL/manifest.json" | while read -r platform binary checksum size; do
+' "$MANIFEST" | while read -r platform binary checksum size; do
     fetch_verified "$BASE_URL/$PREFIX/$VERSION/$platform/$binary" \
                    "$REL/$platform/$binary" "$checksum" "$size"
 done || exit 1

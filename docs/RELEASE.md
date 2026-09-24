@@ -413,7 +413,11 @@ npm nor R2 — the two publish steps are skipped outright. Instead
 the public URL into `release/<version>/` and re-hashes every byte against that
 release's own manifest: all eight binaries, the tarball, and both published
 copies of each installer (the short URL and the prefixed one), by sha256 *and*
-size. It also checks that the manifest describes the version asked for, that
+size. The artifact *names* come from that same fetched manifest and decide
+where files are written, so they are pinned before the first write — the eight
+platform keys, `ml-dash` or `ml-dash.exe` per platform, and the tarball name
+npm derives from the package name and version — rather than trusted and
+checksum-tested afterwards, which would be a write that already happened. It also checks that the manifest describes the version asked for, that
 it was built for the host it was just fetched from, that its commit is a plain
 sha, and that npm's `dist.integrity` for that version is the sha512 of the
 very tarball R2 serves — so the Release cannot attach one artifact while
