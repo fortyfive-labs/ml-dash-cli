@@ -247,11 +247,38 @@ enabled with `allowed_actions: all`, and there are no rulesets at any level
 **The fix is to stop asking the releases API to resolve a commit.** The tag is
 now created with git first, pointing at the manifest's commit, and
 `gh release create` is called on the tag that already exists, with no
-`--target`. Creating a tag over git introduces no workflow content and points
-at a commit GitHub already has, so the rule above does not apply; and with the
-tag present the API has no `target_commitish` to resolve. The whole change
-lives in one step and needs nothing beyond the `contents: write` the job
-already has.
+`--target`: with the tag already present, the API has no `target_commitish`
+to resolve.
+
+**That fix is half-right, and the half that was wrong is now measured.** It
+assumed creating the tag over git escapes the rule, on the reasoning that a
+tag adds no workflow content and points at a commit GitHub already has. It
+does not escape it. Run
+[35958137533](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35958137533)
+got as far as the tag and was refused:
+
+```
+! [remote rejected] v0.1.1 -> v0.1.1 (refusing to allow a GitHub App to
+  create or update workflow `.github/workflows/release.yml` without
+  `workflows` permission)
+```
+
+So the restriction is on the *ref being created*, not on the API used to
+create it: because `v0.1.1` points at `41ece18`, whose `release.yml` differs
+from the default branch's, pushing that tag reads as changing a workflow file,
+and `GITHUB_TOKEN` may not. The same wall as before, reached by a different
+road. `contents: write` is still not the missing piece and still no
+organization setting is.
+
+What this leaves is narrow and worth stating plainly: **CI cannot create a tag
+at a commit whose `.github/workflows/` differs from the default branch's.** A
+release tagged at the commit it ships from — the normal case, where the run
+builds the commit it is dispatched on — is unaffected, because that commit is
+the default branch head. Only a *resumed* release across a workflow edit hits
+this. For 0.1.1 the tag therefore has to come from a credential that can carry
+the `workflow` scope, which is a human's, after which the run finishes on its
+own: the step sees the tag already at the manifest's commit and proceeds to
+create the Release from it.
 
 The step is idempotent in the way a resumed release needs. It reads the remote
 tag first — the peeled ref, so an annotated tag compares as its commit — and

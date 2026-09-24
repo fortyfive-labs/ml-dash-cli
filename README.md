@@ -35,10 +35,12 @@ provenance attestation; on R2 all eight platform binaries, the tarball, the
 manifest and both installers are published and were read back byte-for-byte;
 and `latest` now reads `0.1.1`, so no `--version` is needed. `stable` is
 deliberately still unwritten. The **GitHub Release `v0.1.1` does not exist
-yet** — it is the one step that has not run, and the reason is a `--target`
-rule in the releases API rather than anything about the artifacts or about
-repository permissions; see `docs/RELEASE.md`. Both channels were installed
-from their public URLs and run on 0.1.1.
+yet** — it is the one step that has not run. GitHub will not let CI create the
+tag, because `v0.1.1` points at the commit 0.1.1 was built from and that
+commit's `.github/workflows/` differs from the default branch's; the reason is
+that rule, not the artifacts and not repository permissions. See
+`docs/RELEASE.md`. Both channels were installed from their public URLs and run
+on 0.1.1.
 
 Both channels run the same code — the binaries are `src/index.ts` compiled
 ahead of time, the npm package is the same source compiled to `dist/`.
