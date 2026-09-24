@@ -119,8 +119,8 @@ A local `npm login` is deliberately not a dependency of any of this.
 
 ### What has actually been published
 
-**0.1.1 is released on npm and on R2, from CI, from commit `41ece18`.** The
-GitHub Release is not created — see "What is still outstanding" below.
+**0.1.1 is released — npm, R2 and the GitHub Release — all from CI, all from
+commit `41ece18`.**
 
 | | |
 | --- | --- |
@@ -134,6 +134,7 @@ GitHub Release is not created — see "What is still outstanding" below.
 | `install.ps1` sha256 | `9a4edececf52283bf0c74b3e572645e5c13df9ca51d7c8c019d8b0406379bf08` |
 | `latest` | `0.1.1` — moved and read back |
 | `stable` | **still 404, deliberately untouched** |
+| GitHub Release | [`v0.1.1`](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.1.1) — 12 assets, tag resolves to `41ece18` |
 
 All eight platform binaries were uploaded and read back over the public URL
 against the manifest's sha256 and size, as were the tarball, the manifest and
@@ -183,79 +184,12 @@ tagged `v0.1.1` at `98ec567` while every published byte was built from
 turned out to be unusable for the reason below; the tag is made with git
 instead.
 
-#### What is still outstanding
+#### How the Release was finally created
 
-**The GitHub Release `v0.1.1` has not been created yet.** `gh release create`
-answered:
+It took a third mode and one action CI is not allowed to perform.
 
-```
-HTTP 403: Resource not accessible by integration
-```
-
-The first reading of that was wrong and is worth correcting in place, because
-it pointed at the wrong fix: it was recorded here as an organization policy
-capping `GITHUB_TOKEN`, on the strength of this refusal —
-
-```
-PUT /repos/fortyfive-labs/ml-dash-cli/actions/permissions/workflow
-409  Write permissions for workflows are disabled by the organization
-```
-
-That refusal is real, and it is why the repository's "Read and write
-permissions" radio is greyed out. It is also **not the cause of the 403**, and
-no organization setting needs to change. An organization default is a
-*default*: this job's `permissions:` block overrides it, and the job log of
-every run — including `35837574886`, where OIDC trusted publishing then worked
-— shows the override taking effect:
-
-```
-##[group]GITHUB_TOKEN Permissions
-Contents: write
-Metadata: read
-```
-
-The real cause is `--target`, and it is documented. [Create a
-release](https://docs.github.com/en/rest/releases/releases#create-a-release)
-says that when the commit resolved from `target_commitish` "adds or modifies
-any file under .github/workflows/ relative to the repository's default
-branch", the token must be allowed to change workflows — and that "The
-GITHUB_TOKEN available to GitHub Actions cannot be authorized for this". The
-documented failure is a 404, with some authentication paths surfacing "403
-Resource not accessible by integration" instead.
-
-0.1.1 meets that condition exactly. Its artifacts were built from `41ece18`,
-and the one commit added to `main` after it, `4f45e92`, edited
-`.github/workflows/release.yml`:
-
-```
-git diff --stat 41ece18 4f45e92 -- .github/workflows/
- .github/workflows/release.yml | 16 +++++++++++++++-
-```
-
-So tagging `41ece18` through the releases API reads as changing a workflow
-file, which `GITHUB_TOKEN` may never do. `contents: write` cannot fix it and
-neither can `write-all`. The tell was there from the start: the 403 appeared
-only once `--target` was introduced in `4f45e92`, and the pre-`--target`
-Release step was never actually observed failing — run `35839242613` was
-cancelled before reaching it.
-
-Also ruled out, rather than assumed: the repository is not a fork, Actions is
-enabled with `allowed_actions: all`, and there are no rulesets at any level
-(`rulesets?includes_parents=true` and the tag rules endpoint both return
-`[]`), so nothing is protecting `v*`.
-
-**The fix is to stop asking the releases API to resolve a commit.** The tag is
-now created with git first, pointing at the manifest's commit, and
-`gh release create` is called on the tag that already exists, with no
-`--target`: with the tag already present, the API has no `target_commitish`
-to resolve.
-
-**That fix is half-right, and the half that was wrong is now measured.** It
-assumed creating the tag over git escapes the rule, on the reasoning that a
-tag adds no workflow content and points at a commit GitHub already has. It
-does not escape it. Run
-[35958137533](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35958137533)
-got as far as the tag and was refused:
+`gh release create --target <sha>` was refused with `403 Resource not
+accessible by integration`, and so, later, was pushing the tag:
 
 ```
 ! [remote rejected] v0.1.1 -> v0.1.1 (refusing to allow a GitHub App to
@@ -263,36 +197,46 @@ got as far as the tag and was refused:
   `workflows` permission)
 ```
 
-So the restriction is on the *ref being created*, not on the API used to
-create it: because `v0.1.1` points at `41ece18`, whose `release.yml` differs
-from the default branch's, pushing that tag reads as changing a workflow file,
-and `GITHUB_TOKEN` may not. The same wall as before, reached by a different
-road. `contents: write` is still not the missing piece and still no
-organization setting is.
+Both are the same rule, reached by two different roads, and neither is about
+`contents: write` — the job log shows that granted throughout — nor about any
+organization setting. **A release tagged at a commit whose
+`.github/workflows/` differs from the default branch's cannot be created by
+`GITHUB_TOKEN` at all**, because doing so reads as changing a workflow file.
+0.1.1 was built from `41ece18`; the only later commit touching that directory
+was `4f45e92`, which is the fix that started tagging the built commit in the
+first place.
 
-What this leaves is narrow and worth stating plainly: **CI cannot create a tag
-at a commit whose `.github/workflows/` differs from the default branch's.** A
-release tagged at the commit it ships from — the normal case, where the run
-builds the commit it is dispatched on — is unaffected, because that commit is
-the default branch head. Only a *resumed* release across a workflow edit hits
-this. For 0.1.1 the tag therefore has to come from a credential that can carry
-the `workflow` scope, which is a human's, after which the run finishes on its
-own: the step sees the tag already at the manifest's commit and proceeds to
-create the Release from it.
+Normal releases never meet this: they tag the commit they were dispatched on,
+which is the default branch head. Only a release *resumed across a workflow
+edit* does.
 
-The step is idempotent in the way a resumed release needs. It reads the remote
-tag first — the peeled ref, so an annotated tag compares as its commit — and
-then: no tag, create it; a tag already at the manifest's commit, say so and
-carry on; a tag at any other commit, stop. That last case is a genuine
-conflict, because installs and release notes point at that tag, so this
-pipeline will not move it.
+So the tag was pushed by a maintainer, with a credential carrying the
+`workflow` scope — a lightweight tag at exactly `41ece18`, and nothing else.
+That push is a ref action, not a publish: no artifact was uploaded by hand,
+and the Release itself was still made by CI, from bytes CI had verified.
 
-**Next action.** Re-dispatch `release.yml` with `version=0.1.1`,
-`dry_run=false`. npm and R2 are found already published with identical bytes
-and skipped; the run tags `v0.1.1` at `41ece18` and creates the Release.
-Nothing should be uploaded to a Release by hand: the assets have to be the
-same bytes as R2, and the run that has them is the one that should attach
-them.
+Pushing a `v*` tag also fires this workflow, so a redundant full release run
+([35958488040](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35958488040))
+started from `41ece18` and was cancelled. It had already answered a useful
+question before it stopped, at its own immutability gate:
+
+```
+✓ @dreamlake/ml-dash@0.1.1 is already on the registry with these exact bytes
+Version 0.1.1 is already published with DIFFERENT artifacts.
+```
+
+The first line is the tarball rebuilt at `41ece18` matching npm exactly — the
+README drift diagnosis, confirmed from the other direction. The second is the
+old `cmp`-on-`built` refusal, from before `98ec567`. It uploaded nothing.
+
+Then [35958609065](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/35958609065)
+ran `release_only=true` from `main`: build and test steps skipped, both
+publish steps skipped, the published release fetched back and re-hashed, and
+the Release created on the tag that now existed. Verified afterwards: the tag
+ref resolves to `41ece18`, all **12 assets** match the manifest's sizes, the
+attached `manifest.json` is byte-identical to R2's, the attached tarball's
+sha256 matches the manifest and its sha512 matches npm's `dist.integrity`, and
+npm, `latest` and the R2 manifest are unchanged with `stable` still 404.
 
 #### Verified by installing what was published
 
@@ -770,10 +714,10 @@ can reach, which is the way to do that.
   credential check still runs after the tests and the build and before a single
   byte is uploaded, so a missing secret costs a red run, never a half-published
   version. `-f dry_run=true` exercises the same path deliberately.
-- **The GitHub Release is not created yet, and no setting needs to change.**
-  `gh release create --target 41ece18` answered `403 Resource not accessible
-  by integration` because the releases API refuses to resolve a commit whose
-  `.github/workflows/` differs from the default branch's, which `GITHUB_TOKEN`
-  may never do. The job had `contents: write` throughout. The tag is now made
-  with git before the Release, and `gh release create` is called on the
-  existing tag with no `--target`. See "What is still outstanding".
+- **The GitHub Release `v0.1.1` exists, with 12 assets, tagged at `41ece18`.**
+  Creating it needed one thing CI cannot do: a tag at a commit whose
+  `.github/workflows/` differs from the default branch's. Both the releases
+  API and a tag push refuse that for `GITHUB_TOKEN` regardless of
+  `contents: write`, and no organization setting changes it. A maintainer
+  pushed the tag; CI made the Release from bytes it had fetched and re-hashed.
+  See "How the Release was finally created".
