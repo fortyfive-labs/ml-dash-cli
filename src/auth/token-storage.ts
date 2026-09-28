@@ -11,7 +11,8 @@
  * keychain is reached through the platform's own tool: `security` on macOS,
  * `secret-tool` on Linux. Both are read WITHOUT putting the secret on a
  * command line — reads print to stdout, and the macOS write feeds the value
- * over stdin — so the token never appears in `ps` output.
+ * over stdin as a `security -i` command — so the token never appears in `ps`
+ * output.
  *
  * Windows Credential Manager has no comparable tool that ships with the OS.
  * Rather than pretend, `unreadableKeychainReason` reports it and the caller
@@ -41,37 +42,94 @@ const has = (cmd: string): boolean =>
 
 // ── OS keychain ──────────────────────────────────────────────────────────────
 
-interface Keychain {
+export interface Keychain {
   load(key: string): string | null;
   store(key: string, value: string): void;
   delete(key: string): void;
+  /** A failed store must fail the caller instead of falling back to a file. */
+  readonly storeFailureIsFatal?: boolean;
 }
 
-const macKeychain: Keychain = {
-  load(key) {
-    const r = spawnSync("security", ["find-generic-password", "-s", SERVICE_NAME, "-a", key, "-w"], {
-      encoding: "utf8",
-    });
-    // 44 is `security`'s "item not found". Anything else non-zero is a real
-    // failure (a denied keychain prompt, a locked keychain) and must not be
-    // flattened into "no token".
-    if (r.status === 0) return r.stdout.replace(/\n$/, "");
-    if (r.status === 44) return null;
-    throw new Error(`macOS keychain read failed (exit ${r.status}): ${(r.stderr || "").trim()}`);
-  },
-  store(key, value) {
-    // `-w` with no value makes `security` read the password from stdin twice,
-    // which keeps it out of argv.
-    const r = spawnSync("security", ["add-generic-password", "-U", "-s", SERVICE_NAME, "-a", key, "-w"], {
-      input: `${value}\n${value}\n`,
-      encoding: "utf8",
-    });
-    if (r.status !== 0) throw new Error(`macOS keychain write failed: ${(r.stderr || "").trim()}`);
-  },
-  delete(key) {
-    spawnSync("security", ["delete-generic-password", "-s", SERVICE_NAME, "-a", key], { stdio: "ignore" });
-  },
-};
+// `security -i` reads one command per line and splits lines past roughly 4 KiB
+// (measured: a ~4,060-byte line stores intact, ~6,060 bytes does not). With the
+// default service and account this caps a token at about 1,970 bytes. Longer
+// ones are refused, not stored: a known limit until the write has another path.
+const MAX_SECURITY_LINE = 4000;
+const SECURITY_TIMEOUT_MS = 15_000;
+const SAFE_NAME = /^[A-Za-z0-9._-]+$/;
+
+/**
+ * The stdin line that stores `value` via `security -i`.
+ *
+ * A trailing `-w` makes `security` prompt through getpass(3), which keeps only
+ * the first 128 characters (_PASSWORD_LEN) — a JWT is truncated with exit 0 —
+ * and reads the controlling terminal instead of stdin when there is one. `-X`
+ * takes the value as hex on the command line, and `-i` reads that command from
+ * stdin: off argv, no prompt, and hex needs no quoting.
+ */
+export function macAddPasswordCommand(service: string, account: string, value: string): string {
+  if (!SAFE_NAME.test(service) || !SAFE_NAME.test(account)) {
+    throw new Error("macOS keychain write refused: unsafe service or account name");
+  }
+  if (!value) throw new Error("macOS keychain write refused: empty value");
+  const line = `add-generic-password -U -s ${service} -a ${account} -X ${Buffer.from(value, "utf8").toString("hex")}\n`;
+  if (line.length > MAX_SECURITY_LINE) {
+    throw new Error(
+      `macOS keychain write refused: value too long (${Buffer.byteLength(value, "utf8")} bytes; ` +
+        `the write command is limited to ${MAX_SECURITY_LINE} bytes)`,
+    );
+  }
+  return line;
+}
+
+export function macKeychain(service: string = SERVICE_NAME): Keychain {
+  const kc: Keychain = {
+    // Fail closed. This CLI and the Python SDK both read the Keychain before
+    // the encrypted file, so a token that fell back to the file would sit
+    // behind any older Keychain item and silently lose to it.
+    storeFailureIsFatal: true,
+    load(key) {
+      const r = spawnSync("security", ["find-generic-password", "-s", service, "-a", key, "-w"], {
+        encoding: "utf8",
+      });
+      // 44 is `security`'s "item not found". Anything else non-zero is a real
+      // failure (a denied keychain prompt, a locked keychain) and must not be
+      // flattened into "no token".
+      if (r.status === 0) return r.stdout.replace(/\n$/, "");
+      if (r.status === 44) return null;
+      // No stderr in the message, as for the write below.
+      throw new Error(`macOS keychain read failed (exit ${r.status ?? r.signal})`);
+    },
+    store(key, value) {
+      // Built first: a refused value never reaches `security`.
+      const input = macAddPasswordCommand(service, key, value);
+      const r = spawnSync("security", ["-q", "-i"], {
+        input,
+        encoding: "utf8",
+        timeout: SECURITY_TIMEOUT_MS,
+      });
+      // No stderr in the message: it is not worth the risk of echoing the command line.
+      if (r.status !== 0) throw new Error(`macOS keychain write failed (exit ${r.status ?? r.signal})`);
+      // Exit 0 is not proof: the old prompt path truncated silently with exit 0.
+      // Nothing is deleted on a failed check: `-U` may have updated an item the
+      // user already had, and removing it is not this write's call to make.
+      const back = spawnSync("security", ["find-generic-password", "-s", service, "-a", key, "-w"], {
+        encoding: "utf8",
+        timeout: SECURITY_TIMEOUT_MS,
+      });
+      if (back.status !== 0) {
+        throw new Error(`macOS keychain write could not be verified (read-back exit ${back.status ?? back.signal})`);
+      }
+      if (back.stdout.replace(/\n$/, "") !== value) {
+        throw new Error("macOS keychain write failed: stored value did not read back intact");
+      }
+    },
+    delete(key) {
+      spawnSync("security", ["delete-generic-password", "-s", service, "-a", key], { stdio: "ignore" });
+    },
+  };
+  return kc;
+}
 
 const secretToolKeychain: Keychain = {
   load(key) {
@@ -96,7 +154,7 @@ const secretToolKeychain: Keychain = {
 
 function keychain(): Keychain | null {
   if (process.env.ML_DASH_NO_KEYCHAIN === "1") return null;
-  if (process.platform === "darwin" && has("security")) return macKeychain;
+  if (process.platform === "darwin" && has("security")) return macKeychain();
   if (process.platform === "linux" && has("secret-tool")) return secretToolKeychain;
   return null;
 }
@@ -194,10 +252,17 @@ export class TokenStore {
     return { token: null, source: null, unreadableReason: unreadableKeychainReason() ?? undefined };
   }
 
-  /** Write to the keychain when one is reachable, otherwise the encrypted file. */
+  /**
+   * Write to the keychain when one is reachable, otherwise the encrypted file.
+   * A failed macOS Keychain write throws rather than falling back.
+   */
   store(value: string, key: string = TOKEN_KEY): StorageSource {
     const kc = keychain();
     if (kc) {
+      if (kc.storeFailureIsFatal) {
+        kc.store(key, value);
+        return "keychain";
+      }
       try {
         kc.store(key, value);
         return "keychain";
