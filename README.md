@@ -147,12 +147,14 @@ package this CLI talks to.
 
 See [docs/RELEASE.md](docs/RELEASE.md).
 
-## Managed Experiments management (0.2.0 candidate)
+## Managed Experiments management (0.2.0)
 
 The `auth`, `instance`, `orgs`, `projects`, `setup`, `credentials`, `runs`,
 `metrics`, `logs`, `files`, `health`, `diagnostics`, `connections`, `workspaces`
 and `adoption` commands add a typed management surface for the companion
-DreamLake managed Experiments backend. Version 0.2.0 is prepared locally and is not yet published. Existing
+DreamLake managed Experiments backend. Version 0.2.0 is published on npm and in
+the [GitHub Release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.2.0).
+Matching server capabilities must be deployed and enabled. Existing
 standalone `login`, `list`, `create`, `remove`, `upload`, `download`, and Python
 SDK behavior remain available.
 

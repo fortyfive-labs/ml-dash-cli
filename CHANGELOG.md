@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.0 — Managed Experiments administration (unreleased candidate)
+## 0.2.0 — Managed Experiments administration (2026-10-16)
 
 - Add typed auth, instance, organization/membership, project/effective-access,
   setup plan/apply/status/resume, scoped workload credential lifecycle,

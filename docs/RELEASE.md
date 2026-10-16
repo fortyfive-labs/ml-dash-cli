@@ -722,16 +722,23 @@ can reach, which is the way to do that.
   pushed the tag; CI made the Release from bytes it had fetched and re-hashed.
   See "How the Release was finally created".
 
-## 0.2.0 managed candidate preparation
+## 0.2.0 managed release
 
 The management commands are additive; existing standalone commands and the
-Python logging SDK remain compatible, so this preparation uses minor version
+Python logging SDK remain compatible, so this release uses minor version
 0.2.0. Package manifest, lockfile root version and `src/version.ts` must agree.
 The owning procedure is `docs/MANAGED.md` and is included in the npm package.
 
-Before invoking the existing CI-only publisher, merge and verify the matching
-DreamLake/Dash control/consumption routes, standalone pagination/identity API,
-scoped workload/delete capabilities, and hardened standalone empty-org deletion.
+Version 0.2.0 was published by the existing CI-only publisher on 2026-10-16:
+[release run 38942745013](https://github.com/fortyfive-labs/ml-dash-cli/actions/runs/38942745013),
+tag `v0.2.0`, commit `1781c7fe8a00cb9e37991b3721720b212be11bd3`.
+The run built and published eight native targets, npm, installers and manifest.
+Public npm installation, all 30 managed HTTP fixtures against that installed
+package, and Mac ARM64 native checksum/version/help readback were verified.
+
+Using these commands still requires matching DreamLake/Dash control/consumption
+routes, standalone pagination/identity API, scoped workload/delete capabilities,
+and hardened standalone empty-org deletion to be deployed and enabled.
 Do not deploy the CLI as proof that these server capabilities are enabled.
 Adoption apply/recover additionally requires an implemented operator fence,
 backup and drain proof; its safe default rejection is not a completed migration.
@@ -742,7 +749,9 @@ verify immutable native/npm bytes and default pointers, install the public
 package in an isolated directory with scripts disabled, then check version,
 command help, login status and the authorized project's setup/readback. Never
 publish this version twice or substitute a local publish for the reviewed CI
-workflow. No release workflow was dispatched during local preparation.
+workflow. The published release does not constitute authenticated production
+setup/readback acceptance for a particular environment or project. The original
+release procedure moved `latest` and deliberately left `stable` unchanged.
 
 Pull requests and main pushes also run `.github/workflows/ci.yml`: the full
 existing suite, typed management/doc checks, fresh local tarball HTTP fixtures,

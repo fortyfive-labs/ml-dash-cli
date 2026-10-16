@@ -1,9 +1,16 @@
 # Managed Experiments CLI
 
-This is an unreleased **0.2.0 candidate** in **`@dreamlake/ml-dash`**, invoked
-as **`ml-dash`**. It is not a replacement for the Python logging SDK and is not a
-claim of publication or production readiness. Matching DreamLake BFF and Dash
-managed routes are required. Source-backed storage is excluded.
+These commands are published in **`@dreamlake/ml-dash` 0.2.0**, invoked as
+**`ml-dash`**. Install with `npm install -g @dreamlake/ml-dash@0.2.0`; see the
+[0.2.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.2.0)
+for native binaries and installers. The CLI complements the Python logging SDK.
+
+Managed operations require matching DreamLake BFF control/consumption routes and
+Dash managed routes with scoped workload capabilities enabled. Standalone
+pagination and safe organization deletion require the companion server APIs;
+inspect instance capabilities before using them. Installing the CLI does not
+enable these services. Adoption apply/recover still requires operator fencing,
+backup and drain proof. Source-backed storage is excluded.
 
 ## Login, identity and discovery
 
