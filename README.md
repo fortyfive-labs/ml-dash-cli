@@ -147,12 +147,12 @@ package this CLI talks to.
 
 See [docs/RELEASE.md](docs/RELEASE.md).
 
-## Managed Experiments management (local development)
+## Managed Experiments management (0.2.0 candidate)
 
 The `auth`, `instance`, `orgs`, `projects`, `setup`, `credentials`, `runs`,
 `metrics`, `logs`, `files`, `health`, `diagnostics`, `connections`, `workspaces`
 and `adoption` commands add a typed management surface for the companion
-DreamLake managed Experiments backend. They are not yet published. Existing
+DreamLake managed Experiments backend. Version 0.2.0 is prepared locally and is not yet published. Existing
 standalone `login`, `list`, `create`, `remove`, `upload`, `download`, and Python
 SDK behavior remain available.
 

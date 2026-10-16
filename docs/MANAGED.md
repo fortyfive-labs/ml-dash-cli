@@ -1,6 +1,6 @@
 # Managed Experiments CLI
 
-This is a local development implementation in **`@dreamlake/ml-dash`**, invoked
+This is an unreleased **0.2.0 candidate** in **`@dreamlake/ml-dash`**, invoked
 as **`ml-dash`**. It is not a replacement for the Python logging SDK and is not a
 claim of publication or production readiness. Matching DreamLake BFF and Dash
 managed routes are required. Source-backed storage is excluded.
