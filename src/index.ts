@@ -7,27 +7,9 @@
  */
 import { ParseError, parseArgs, renderCommandHelp, renderRootHelp, usageError, type CommandSpec } from "./cli/parser.js";
 import { managementLoaders } from "./managed/commands.js";
+import { commandLoaders as loaders } from "./cli/loaders.js";
 import { red, yellow } from "./util/ansi.js";
 
-interface CommandModule {
-  spec: CommandSpec;
-  run: (args: Record<string, string | boolean | undefined>) => number | Promise<number>;
-}
-
-const loaders: Record<string, () => Promise<CommandModule>> = {
-  ...managementLoaders,
-  version: () => import("./commands/version.js") as Promise<CommandModule>,
-  login: () => import("./commands/login.js") as Promise<CommandModule>,
-  logout: () => import("./commands/logout.js") as Promise<CommandModule>,
-  profile: () => import("./commands/profile.js") as Promise<CommandModule>,
-  api: () => import("./commands/api.js") as Promise<CommandModule>,
-  create: () => import("./commands/create.js") as Promise<CommandModule>,
-  remove: () => import("./commands/remove.js") as Promise<CommandModule>,
-  list: () => import("./commands/list.js") as Promise<CommandModule>,
-  upload: () => import("./commands/upload.js") as Promise<CommandModule>,
-  download: () => import("./commands/download.js") as Promise<CommandModule>,
-  update: () => import("./commands/update.js") as Promise<CommandModule>,
-};
 
 export async function main(argv: string[]): Promise<number> {
   const [command, ...rest] = argv;
@@ -54,7 +36,7 @@ export async function main(argv: string[]): Promise<number> {
     args = parseArgs(mod.spec, rest);
   } catch (e) {
     if (e instanceof ParseError) {
-      if (command in managementLoaders && rest.includes('--json')) { console.log(JSON.stringify({ok:false,error:{code:'MANAGED_USAGE_ERROR',message:'Invalid command arguments.',remediation:`Run ml-dash ${command} --help.`,retryable:false}})); return 2; }
+      if ((command in managementLoaders || command === 'schema') && rest.includes('--json')) { console.log(JSON.stringify({ok:false,error:{code:'MANAGED_USAGE_ERROR',message:'Invalid command arguments.',remediation:`Run ml-dash ${command} --help.`,retryable:false}})); return 2; }
       console.error(usageError(command, e.message));
       return 2;
     }

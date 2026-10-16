@@ -8,22 +8,24 @@ import { standaloneCommand, standaloneContext } from './standalone.js';
 import { adoptionCommand } from './adoption.js';
 import { connectionCommand } from './connections.js';
 import { login, standaloneLogin } from './auth.js';
+import { organizationInspection, organizationPaging, allOrganizationMembers } from './organizationInspection.js';
 
 const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams'] as const;
-const actions: Record<string,string[]> = {
+export const managementActions: Record<string,string[]> = {
  teams:['list','members'],
  adoption:['inventory','plan','apply','reconcile','recover'],
  connections:['list'],workspaces:['list','status','plan','apply','detach'],
- auth:['status','login'],instance:['show','capabilities'],orgs:['list','create','update','delete','members','teams','member-add','member-role','member-remove'],projects:['list','access'],
+ auth:['status','login'],instance:['show','capabilities','schema'],orgs:['list','create','update','delete','members','teams','member-add','member-role','member-remove'],projects:['list','access'],
  setup:['plan','apply','status','resume'],credentials:['list','inspect','create','rotate','retire'],runs:['list','show','create','status','parameters','delete'],
  metrics:['list','read','append'],logs:['read','append'],files:['list','inspect','upload','download'],health:['check'],diagnostics:['check'],
 };
 const help: Record<string,string>={teams:'Inspect standalone teams and membership for access diagnostics',adoption:'Inventory and explicitly adopt a legacy project with operator safeguards',connections:'List operator-approved external connections (advanced)',workspaces:'Explicit external workspace discovery, binding and detachment (advanced)',auth:'Shared DreamLake login and live status',instance:'Managed instance identity, version and capabilities',orgs:'Discover organizations and current membership',projects:'Discover projects and inspect effective access',setup:'Review exact resources and resume idempotent setup',credentials:'Inspect or revoke scoped credentials without exporting tokens',runs:'Inspect and create experiment runs',metrics:'Read cursor pages and append metric points',logs:'Read cursor pages and append logs',files:'Inspect and transfer experiment files',health:'Read instance health',diagnostics:'Check identity, capabilities, setup and access'};
 export function managementCommand(name: typeof names[number]) {
- const spec: CommandSpec={name,help:help[name],description:`Managed Experiments: ${help[name]}. Existing standalone login/list/upload remain available.`,positionals:[{dest:'action',metavar:'ACTION',help:actions[name].join(' | '),default:actions[name][0]}],options:[
+ const spec: CommandSpec={name,help:help[name],description:`Managed Experiments: ${help[name]}. Existing standalone login/list/upload remain available.`,positionals:[{dest:'action',metavar:'ACTION',help:managementActions[name].join(' | '),default:managementActions[name][0]}],options:[
+  {flags:['--schema-version'],dest:'schema_version',choices:['1'],help:'Supported machine schema version (default 1; instance schema only)'},
   {flags:['--standalone'],dest:'standalone',boolean:true,help:'Explicitly use standalone Dash identity and APIs, never the DreamLake login'},
   {flags:['--dash-url','--api-url'],dest:'dash_url',help:'Standalone Dash server matching its existing login'},
-  {flags:['--offset'],dest:'offset',help:'Standalone list nextOffset (metric/log rows use cursor instead)'},
+  {flags:['--offset'],dest:'offset',help:'Server nextOffset for organization members/teams and standalone lists'},
   {flags:['--team'],dest:'team',help:'Explicit standalone team ID for membership inspection'},
   {flags:['--remote-project'],dest:'remote_project',help:'Explicit legacy Dash project ID for adoption'},
   {flags:['--expected-revision'],dest:'expected_revision',help:'Reviewed authority revision for adoption plan/recovery'},
@@ -77,7 +79,7 @@ function fail(a:ParsedArgs,e:unknown) {
 function load(file:string): any { try{return JSON.parse(readFileSync(file==='-'?0:file,'utf8'));}catch{throw new ManagementError('MANAGED_INVALID_INPUT','Input must be valid JSON.','Provide a UTF-8 JSON file or --data - on stdin.');} }
 function save(file:string|undefined,data:unknown) {if(file)writeFileSync(file,JSON.stringify(data,null,2)+'\n',{mode:0o600,flag:'wx'});}
 function digest(v:unknown){return createHash('sha256').update(JSON.stringify(v)).digest('hex');}
-function action(a:ParsedArgs,name:string){const v=arg(a,'action')||actions[name][0];if(!actions[name].includes(v))throw new ManagementError('MANAGED_UNKNOWN_ACTION',`Unknown ${name} action.`,'Use the actions listed in command help.');return v;}
+function action(a:ParsedArgs,name:string){const v=arg(a,'action')||managementActions[name][0];if(!managementActions[name].includes(v))throw new ManagementError('MANAGED_UNKNOWN_ACTION',`Unknown ${name} action.`,'Use the actions listed in command help.');return v;}
 function runPath(a:ParsedArgs){return `/runs/${encodeURIComponent(required(a,'run'))}`;}
 function page(value:unknown,key:string):unknown{
  const v=record(value);if(!Array.isArray(v[key]))throw invalidResponse();
@@ -115,19 +117,22 @@ export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
   else if(name==='auth'){
    if(act==='login')result=a.standalone?await standaloneLogin(a):await login(a);
    else {const me=identity(await request(c,'/auth/me'));result={authenticated:true,server:c.url,user:me,credentialSource:'DreamLake shared login'};}
-  }else if(name==='instance')result=await request(c,'/managed-experiments/capabilities');
+  }else if(name==='instance'){
+   const schemas=await import('../cli/schema.js');
+   result=act==='schema'?{cli:await schemas.cliInspectionSchema(),server:schemas.validateManagedServiceSchema(await request(c,'/managed-experiments/schema?version=1'))}:schemas.validateManagedCapabilities(await request(c,'/managed-experiments/capabilities'));
+  }
   else if(name==='orgs'){
    if(act==='list')result=page(await request(c,`/managed-experiments/namespaces${query(a)}`),'namespaces');
    else {
     const resolved=await graphql(c,'query ManagedCliOrganization($slug: String!) { organizationBySlug(slug: $slug) { id slug myRole } }',{slug:required(a,'namespace')});
     const org=record(resolved.organizationBySlug);const orgId=text(org.id);
-    const members=await graphql(c,'query ManagedCliMembers($orgId: ID!) { organizationMembers(orgId: $orgId) { id userId role } }',{orgId});
-    if(!Array.isArray(members.organizationMembers))throw invalidResponse();
-    if(act==='members')result={organizationId:orgId,members:members.organizationMembers,pagination:{kind:'unpaginated-server-array',complete:true}};
+    if(act==='members'||act==='teams') result=await organizationInspection(c,orgId,act,organizationPaging(a));
     else {
      if(org.myRole!=='OWNER')throw new ManagementError('MANAGED_OWNER_REQUIRED','Organization membership changes require current OWNER access.','Ask an organization owner to review this exact membership change.');
+     if(arg(a,'cursor')!==undefined||arg(a,'offset')!==undefined)throw new ManagementError('MANAGED_PAGING_KIND','Membership changes require a complete current inventory.','Omit cursor/offset; the CLI traverses all server pages for the exact review.');
+     const members=await allOrganizationMembers(c,orgId);
      const userId=required(a,'user');const role=act==='member-remove'?undefined:required(a,'role');
-     const preview={kind:'organization-membership-review-v1',organizationId:orgId,action:act,userId,...(role?{role}:{}),currentMembersHash:digest(members.organizationMembers),authorityEffect:act==='member-remove'?'Removes organization membership; existing short-lived capabilities may retain their TTL.':'Organization membership grants organization access according to current project policy; no Dash membership is copied.'};
+     const preview={kind:'organization-membership-review-v1',organizationId:orgId,action:act,userId,...(role?{role}:{}),currentMembersHash:digest(members),authorityEffect:act==='member-remove'?'Removes organization membership; existing short-lived capabilities may retain their TTL.':'Organization membership grants organization access according to current project policy; no Dash membership is copied.'};
      if(!a.apply){save(arg(a,'out'),preview);result={status:'preview',review:preview};}
      else {const prior=record(load(required(a,'review')));if(digest(prior)!==digest(preview))throw new ManagementError('MANAGED_REVIEW_CHANGED','Organization membership or intent changed.','Refresh and review the exact member change again.');
       const op=act==='member-add'?'organizationMemberAdd':act==='member-role'?'organizationMemberUpdateRole':'organizationMemberRemove';
@@ -199,9 +204,9 @@ export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
     const temp=path.join(path.dirname(output),`.ml-dash-download-${process.pid}-${Date.now()}`);try{writeFileSync(temp,bytes,{mode:0o600,flag:'wx'});/* User chose the output path; remote filename is never used as a path. */linkSync(temp,output);unlinkSync(temp);}catch(e){try{unlinkSync(temp);}catch{}throw e;}
     result={fileId:required(a,'file'),path:output,sizeBytes:bytes.length,checksum:value.checksum,verified:true};
    }
-  }else if(name==='health')result={status:'healthy',capabilities:await request(c,'/managed-experiments/capabilities'),authenticated:!!identity(await request(c,'/auth/me'))};
+  }else if(name==='health')result={status:'healthy',capabilities:(await import('../cli/schema.js')).validateManagedCapabilities(await request(c,'/managed-experiments/capabilities')),authenticated:!!identity(await request(c,'/auth/me'))};
   else {
-   const capabilities=await request(c,'/managed-experiments/capabilities');const me=identity(await request(c,'/auth/me'));
+   const capabilities=(await import('../cli/schema.js')).validateManagedCapabilities(await request(c,'/managed-experiments/capabilities'));const me=identity(await request(c,'/auth/me'));
    result={status:'healthy',identityValidated:!!me,capabilities,...(arg(a,'namespace')&&arg(a,'project')?{setup:await request(c,`${projectRoot(a)}/status`)}:{})};
   }
   emit(a,safe(result,[c.token||'']));return 0;
