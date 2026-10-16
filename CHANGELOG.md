@@ -1,11 +1,12 @@
 # Changelog
 
-## 0.3.0 — Release candidate
+## 0.3.0 — Managed inspection and schemas
 
 - Complete managed organization member/team and external connection/workspace pagination.
 - Fix `orgs teams` routing and preserve DreamLake VISIBLE/SECRET semantics.
 - Add offline command schema and versioned authenticated operation JSON Schema discovery. Reject unsupported protocol/schema versions.
-- Requires the matching BFF release. Not yet published; 0.2.0 remains the public version until release succeeds.
+- Managed pagination and authenticated service schemas require the matching BFF routes; the offline command schema needs no login or server. Installing this version does not activate backend services or grant access.
+- Publication availability is recorded by the versioned GitHub Release and npm registry, separately from source merges. Existing standalone commands and Python SDK behavior remain compatible; Source-backed storage remains excluded.
 
 ## 0.2.0 — Managed Experiments administration (2026-10-16)
 

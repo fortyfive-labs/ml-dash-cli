@@ -1,13 +1,16 @@
 # Managed Experiments CLI
 
-These commands are published in **`@dreamlake/ml-dash` 0.2.0**, invoked as
-**`ml-dash`**. Install with `npm install -g @dreamlake/ml-dash@0.2.0`; see the
-[0.2.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.2.0)
-for native binaries and installers. The CLI complements the Python logging SDK.
+This guide describes **`@dreamlake/ml-dash` 0.3.0**, invoked as **`ml-dash`**.
+The version-pinned installation command is
+`npm install -g @dreamlake/ml-dash@0.3.0`; native binaries and installers belong to
+the [0.3.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.3.0).
+Check that release and the npm registry for publication availability: merging
+source does not publish a package. The CLI complements the Python logging SDK.
 
-The server-paged managed member/team lists, complete external cursor traversal
-and machine-readable schema commands documented below are an **unreleased
-follow-up**, not features already shipped in the 0.2.0 package.
+Version 0.3.0 adds server-paged managed member/team inspection, complete external
+workspace cursor traversal and machine-readable command/service schemas. These
+features are part of this version's contract; the earlier 0.2.0 package does not
+contain them. Their live use still requires the matching server capabilities.
 
 Managed operations require matching DreamLake BFF control/consumption routes and
 Dash managed routes with scoped workload capabilities enabled. Standalone
@@ -79,11 +82,12 @@ ml-dash orgs member-add --namespace fortyfive --user USER_ID --role MEMBER --out
 ml-dash orgs member-add --namespace fortyfive --user USER_ID --role MEMBER --apply --review member-review.json --json
 ```
 
-## Machine-readable inspection (unreleased follow-up)
+## Machine-readable inspection (0.3.0)
 
-These inspection improvements require the matching new BFF pagination/schema
-routes; their presence in source does not mean published 0.2.0 contains them.
-No package version or remote deployment is changed by this follow-up.
+Managed member/team pagination and authenticated service-schema discovery require
+the matching BFF pagination/schema routes. The offline `schema` command describes
+the installed CLI without a server or login. Installing 0.3.0 does not deploy or
+enable backend routes, and the schemas do not imply access to a project.
 
 ```sh
 ml-dash schema --json
@@ -246,14 +250,19 @@ No CLI flag enables server fencing or bypasses these safeguards.
 
 ## Output and backend mapping
 
-All commands offer `--json`: success is `{ok:true,data}`, failure is
+The management commands in this guide offer `--json`: success is `{ok:true,data}`, failure is
 `{ok:false,error:{code,message,remediation,retryable}}` with nonzero exit status.
 Human output contains the same non-secret data, plus a concise status. Upstream
 raw error bodies, login tokens, scoped tokens and file base64 are excluded.
+Offline `schema` also uses the success envelope. Existing standalone commands
+retain their command-specific output and flag support; consult their help or the
+offline schema instead of assuming they implement this managed JSON contract.
 
 | Surface | Actual API |
 |---|---|
 | Login/status | Vuer device start/poll; DreamLake `/auth/exchange`, `/auth/me` |
+| Offline schema | Installed CLI command registry; no network or login |
+| Service schema | BFF `/managed-experiments/schema?version=1`; authenticated managed protocol/operation contracts |
 | Instance/discovery | BFF `/managed-experiments/capabilities`, `/namespaces`, `/ns/:ns/projects` |
 | Organization membership | Fixed typed DreamLake GraphQL operations; no user-supplied query |
 | Setup/status | BFF project `/setup`, `/status` with durable CAS/intent receipt |

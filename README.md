@@ -147,13 +147,17 @@ package this CLI talks to.
 
 See [docs/RELEASE.md](docs/RELEASE.md).
 
-## Managed Experiments management (0.2.0)
+## Managed Experiments management (0.3.0)
 
 The `auth`, `instance`, `orgs`, `projects`, `setup`, `credentials`, `runs`,
 `metrics`, `logs`, `files`, `health`, `diagnostics`, `connections`, `workspaces`
-and `adoption` commands add a typed management surface for the companion
-DreamLake managed Experiments backend. Version 0.2.0 is published on npm and in
-the [GitHub Release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.2.0).
+and `adoption` commands provide typed management for the companion DreamLake
+managed Experiments backend. Version 0.3.0 adds server-paged member/team
+inspection, complete external workspace cursor traversal, offline `schema`, and
+authenticated `instance schema` discovery. Use
+`npm install -g @dreamlake/ml-dash@0.3.0` when that version is available; the
+[0.3.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.3.0)
+records native artifacts and publication. A source merge alone does not publish.
 Matching server capabilities must be deployed and enabled. Existing
 standalone `login`, `list`, `create`, `remove`, `upload`, `download`, and Python
 SDK behavior remain available.
