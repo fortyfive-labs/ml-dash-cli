@@ -250,14 +250,19 @@ No CLI flag enables server fencing or bypasses these safeguards.
 
 ## Output and backend mapping
 
-All commands offer `--json`: success is `{ok:true,data}`, failure is
+The management commands in this guide offer `--json`: success is `{ok:true,data}`, failure is
 `{ok:false,error:{code,message,remediation,retryable}}` with nonzero exit status.
 Human output contains the same non-secret data, plus a concise status. Upstream
 raw error bodies, login tokens, scoped tokens and file base64 are excluded.
+Offline `schema` also uses the success envelope. Existing standalone commands
+retain their command-specific output and flag support; consult their help or the
+offline schema instead of assuming they implement this managed JSON contract.
 
 | Surface | Actual API |
 |---|---|
 | Login/status | Vuer device start/poll; DreamLake `/auth/exchange`, `/auth/me` |
+| Offline schema | Installed CLI command registry; no network or login |
+| Service schema | BFF `/managed-experiments/schema?version=1`; authenticated managed protocol/operation contracts |
 | Instance/discovery | BFF `/managed-experiments/capabilities`, `/namespaces`, `/ns/:ns/projects` |
 | Organization membership | Fixed typed DreamLake GraphQL operations; no user-supplied query |
 | Setup/status | BFF project `/setup`, `/status` with durable CAS/intent receipt |
