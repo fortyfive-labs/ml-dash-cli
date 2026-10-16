@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.3.0 — Release candidate
+
+- Complete managed organization member/team and external connection/workspace pagination.
+- Fix `orgs teams` routing and preserve DreamLake VISIBLE/SECRET semantics.
+- Add offline command schema and versioned authenticated operation JSON Schema discovery. Reject unsupported protocol/schema versions.
+- Requires the matching BFF release. Not yet published; 0.2.0 remains the public version until release succeeds.
+
 ## 0.2.0 — Managed Experiments administration (2026-10-16)
 
 - Add typed auth, instance, organization/membership, project/effective-access,
