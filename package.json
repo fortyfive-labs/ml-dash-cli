@@ -10,6 +10,7 @@
   "files": [
     "bin",
     "dist",
+    "docs/MANAGED.md",
     "!dist/**/*.map"
   ],
   "engines": {

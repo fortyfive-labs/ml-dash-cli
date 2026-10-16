@@ -146,3 +146,20 @@ package this CLI talks to.
 ## Releasing
 
 See [docs/RELEASE.md](docs/RELEASE.md).
+
+## Managed Experiments management (local development)
+
+The `auth`, `instance`, `orgs`, `projects`, `setup`, `credentials`, `runs`,
+`metrics`, `logs`, `files`, `health`, `diagnostics`, `connections`, `workspaces`
+and `adoption` commands add a typed management surface for the companion
+DreamLake managed Experiments backend. They are not yet published. Existing
+standalone `login`, `list`, `create`, `remove`, `upload`, `download`, and Python
+SDK behavior remain available.
+
+Start with `ml-dash auth status --json`, `ml-dash instance show --json`, and
+`ml-dash orgs list --json`. Use explicit `--namespace` and `--project` targets.
+Setup and workload mutations default to read-only preview and require a saved
+review before `--apply`. Credentials are scoped and short lived; commands never
+print or export their tokens. See [the managed command guide](docs/MANAGED.md)
+for exact setup, retry, permissions, file limits, and advanced external/adoption
+procedures. Source-backed storage remains outside this increment.
