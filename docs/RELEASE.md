@@ -743,3 +743,9 @@ package in an isolated directory with scripts disabled, then check version,
 command help, login status and the authorized project's setup/readback. Never
 publish this version twice or substitute a local publish for the reviewed CI
 workflow. No release workflow was dispatched during local preparation.
+
+Pull requests and main pushes also run `.github/workflows/ci.yml`: the full
+existing suite, typed management/doc checks, fresh local tarball HTTP fixtures,
+and a native host build/read-only smoke. This job has read-only repository
+permissions and no publisher credentials. Its success does not dispatch the
+separate tag/manual production release workflow or prove public publication.

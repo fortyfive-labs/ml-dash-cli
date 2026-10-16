@@ -1,0 +1,44 @@
+name: cli
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: cli-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    name: typecheck · tests · installed CLI
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.14'
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+      - name: Fresh local package management HTTP fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          CLI_VERIFY_DIR="$RUNNER_TEMP/ml-dash-installed"
+          npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP" --json > "$RUNNER_TEMP/ml-dash-pack.json"
+          CLI_TARBALL=$(node -e 'const fs=require("fs");process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1],"utf8"))[0].filename)' "$RUNNER_TEMP/ml-dash-pack.json")
+          npm install --prefix "$CLI_VERIFY_DIR" --ignore-scripts --no-audit --no-fund "$RUNNER_TEMP/$CLI_TARBALL"
+          ML_DASH_TEST_ENTRY="$CLI_VERIFY_DIR/node_modules/@dreamlake/ml-dash/dist/index.js" node --import tsx --test --test-timeout=180000 test/managed.test.ts
+          "$CLI_VERIFY_DIR/node_modules/.bin/ml-dash" version
+          "$CLI_VERIFY_DIR/node_modules/.bin/ml-dash" setup --help
+      - name: Native host build and read-only smoke
+        shell: bash
+        run: |
+          set -euo pipefail
+          bun run scripts/build-release.ts --targets=linux-x64 --out="$RUNNER_TEMP/ml-dash-native"
+          CLI_VERSION=$(node -p 'JSON.parse(require("fs").readFileSync("package.json","utf8")).version')
+          "$RUNNER_TEMP/ml-dash-native/$CLI_VERSION/linux-x64/ml-dash" version
+          "$RUNNER_TEMP/ml-dash-native/$CLI_VERSION/linux-x64/ml-dash" setup --help
