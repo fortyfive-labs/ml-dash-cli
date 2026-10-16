@@ -17,7 +17,7 @@ export async function organizationInspection(c: Context, orgId: string, kind: 'm
     (value.hasMore ? !rows.length || value.nextOffset !== paging.offset + rows.length || value.nextOffset >= value.totalCount : value.nextOffset !== null)) throw invalidResponse();
   const ids = new Set<string>();
   for (const row of rows) {
-    if (!row || typeof row.id !== 'string' || !row.id || ids.has(row.id) || (kind === 'members' ? typeof row.userId !== 'string' || !row.userId || !['OWNER','MEMBER'].includes(row.role) : typeof row.slug !== 'string' || !row.slug || typeof row.name !== 'string' || !['PUBLIC','PRIVATE'].includes(row.visibility))) throw invalidResponse();
+    if (!row || typeof row.id !== 'string' || !row.id || ids.has(row.id) || (kind === 'members' ? typeof row.userId !== 'string' || !row.userId || !['OWNER','MEMBER'].includes(row.role) : typeof row.slug !== 'string' || !row.slug || typeof row.name !== 'string' || !['VISIBLE','SECRET'].includes(row.visibility))) throw invalidResponse();
     ids.add(row.id);
   }
   return { organizationId: orgId, [kind]: rows, totalCount: value.totalCount, hasMore: value.hasMore, nextOffset: value.nextOffset, pagination: { kind: 'offset', ...paging } };
