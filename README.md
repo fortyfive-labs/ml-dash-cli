@@ -27,31 +27,40 @@ The command is still `ml-dash`. The package is scoped because the unscoped
 name is not claimable — npm refuses `ml-dash` as too similar to the existing
 `mldash`.
 
-*Current state:* **0.1.1 is published and is what the commands above
-install.** It is on npm as
-[`@dreamlake/ml-dash@0.1.1`](https://www.npmjs.com/package/@dreamlake/ml-dash/v/0.1.1),
-published from CI by npm trusted publishing (OIDC, no token) and carrying a
-provenance attestation; on R2 all eight platform binaries, the tarball, the
-manifest and both installers are published and were read back byte-for-byte;
-and `latest` now reads `0.1.1`, so no `--version` is needed. `stable` is
-deliberately still unwritten. The **GitHub Release
-[`v0.1.1`](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.1.1)**
-carries all twelve artifacts — eight binaries, the tarball, both installers
-and the manifest — each byte-identical to what R2 serves, tagged at the commit
-they were built from. Both channels were installed from their public URLs and
-run on 0.1.1.
+The original distribution channels are the scoped npm package and the R2
+installers above. Unpinned installs follow each channel's published version or
+pointer; a version in this source tree does not establish what is published.
+Check the [npm registry](https://www.npmjs.com/package/@dreamlake/ml-dash?activeTab=versions),
+the [R2 latest pointer](https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/ml-dash-cli/releases/latest)
+and the [GitHub releases](https://github.com/fortyfive-labs/ml-dash-cli/releases)
+for actual availability. Do not infer the current `latest` or `stable` pointer
+from a historical README snapshot.
+
+The CI-only release pipeline builds the npm tarball, eight native binaries and
+both installers from the reviewed source. Each version's
+`ml-dash-cli/releases/<version>/manifest.json` records its source commit, hashes
+and byte counts. A completed publish and exact artifact readback establish the
+released bytes; merging a version bump or documentation does not publish them.
 
 Both channels run the same code — the binaries are `src/index.ts` compiled
 ahead of time, the npm package is the same source compiled to `dist/`.
 
 ### Pinning a version
 
+These examples select the 0.3.0 contract documented below. Run them only after
+that version is available in the relevant channel; otherwise select a version
+confirmed by the registry and its published manifest.
+
 ```sh
-curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.1.1
+curl -fsSL https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.sh | sh -s -- --version 0.3.0
 ```
 
 ```powershell
-& ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.1.1
+& ([scriptblock]::Create((irm https://pub-42e1dcc7de574d4a92984865fdc95f10.r2.dev/install.ps1))) -Version 0.3.0
+```
+
+```sh
+npm install -g @dreamlake/ml-dash@0.3.0
 ```
 
 An installer always downloads from the host it was itself served from — that
