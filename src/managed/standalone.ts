@@ -19,7 +19,12 @@ export async function standaloneCommand(name:string,action:string,c:Context,a:Pa
  const limit=Number(arg(a,'limit')||50);if(!Number.isInteger(limit)||limit<1||limit>100)throw new ManagementError('MANAGED_INVALID_LIMIT','Standalone inspection page size must be 1–100.','Choose a bounded page size.');
  if(name==='auth')return{authenticated:true,authority:'standalone-dash',server:c.url,user:identity(await client.getCurrentUser())};
  if(name==='health')return{authority:'standalone-dash',...record(await request(c,'/health'))};
- if(name==='instance')return request(c,'/.well-known/dash-experiments');
+ if(name==='instance'){
+  if(action==='schema')throw new ManagementError('STANDALONE_SCHEMA_UNAVAILABLE','This standalone API does not publish the managed operation schema.','Use ml-dash schema for offline command inspection, or instance schema against the managed BFF.');
+  const metadata=record(await request(c,'/.well-known/dash-experiments'));
+  if(metadata.protocolVersion!=='1')throw new ManagementError('STANDALONE_PROTOCOL_UNSUPPORTED','Unsupported standalone discovery protocol.','Upgrade matching CLI and server versions.');
+  return metadata;
+ }
  if(name==='orgs'){
   if(action==='list')return(await graphql(c,'query CliStandaloneOrgs($limit:Int!,$offset:Int!){ myOrganizationsPaginated(limit:$limit,offset:$offset){ organizations{id slug name myRole} totalCount hasMore nextOffset } }',{limit,offset:offset(a)})).myOrganizationsPaginated;
   const resolved=await graphql(c,'query CliStandaloneOrg($slug:String!){ organizationBySlug(slug:$slug){id slug name myRole} }',{slug:required(a,'namespace')});const org=record(resolved.organizationBySlug);

@@ -5,6 +5,10 @@ These commands are published in **`@dreamlake/ml-dash` 0.2.0**, invoked as
 [0.2.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.2.0)
 for native binaries and installers. The CLI complements the Python logging SDK.
 
+The server-paged managed member/team lists, complete external cursor traversal
+and machine-readable schema commands documented below are an **unreleased
+follow-up**, not features already shipped in the 0.2.0 package.
+
 Managed operations require matching DreamLake BFF control/consumption routes and
 Dash managed routes with scoped workload capabilities enabled. Standalone
 pagination and safe organization deletion require the companion server APIs;
@@ -42,8 +46,12 @@ isolated shared-login directory for tests or an explicit alternate environment.
 Namespace/project/credential pages retain opaque `nextCursor` values. Repeat the
 same list with `--cursor` to continue. Exact project/run/file selection traverses
 bounded cursor pages, fails on repeated cursors, and never calls the first page
-complete. Organization member arrays use the existing typed GraphQL API, which
-has no server pagination; the response identifies that fact.
+complete. Organization member and organization-team inspection use the companion server's
+typed `organizationMembersPaginated` and `organizationTeamsPaginated` queries
+with `--limit` (1–100) and `--offset`. Preserve `nextOffset`, `hasMore` and
+`totalCount`; opaque `--cursor` is refused for these offset-based lists. Member
+mutations review the complete bounded paginated inventory and stop if counts or
+continuation change; no client-side slice substitutes for server pagination.
 
 By default all these management commands use DreamLake authority. Explicit
 `--standalone` uses the separate Dash config and login; neither credential is
@@ -70,6 +78,37 @@ name guess. These update DreamLake only; no Dash memberships are copied or union
 ml-dash orgs member-add --namespace fortyfive --user USER_ID --role MEMBER --out member-review.json --json
 ml-dash orgs member-add --namespace fortyfive --user USER_ID --role MEMBER --apply --review member-review.json --json
 ```
+
+## Machine-readable inspection (unreleased follow-up)
+
+These inspection improvements require the matching new BFF pagination/schema
+routes; their presence in source does not mean published 0.2.0 contains them.
+No package version or remote deployment is changed by this follow-up.
+
+```sh
+ml-dash schema --json
+ml-dash instance schema --schema-version 1 --json
+ml-dash orgs members --namespace fortyfive --limit 50 --offset 0 --json
+ml-dash orgs teams --namespace fortyfive --limit 50 --offset 0 --json
+```
+
+`schema` is offline and needs no login. It derives dispatch names, actions,
+option aliases/types/enums, positionals and parser-required arguments from the
+actual command registry. Per-action contracts describe managed default authority
+(and explicit standalone team diagnostics), required inputs, pagination and
+preview/apply policy. Legacy command output remains command-specific and is
+marked accordingly; it is not falsely described as a managed JSON envelope.
+
+`instance schema` uses the shared DreamLake login and reads
+`/managed-experiments/schema?version=1`. Its output separates CLI package version,
+local schema version and server managed protocol/schema versions, with actual
+operation input/output JSON Schemas and success/error contracts. This is a
+bounded managed protocol description, not an introspection export of every
+backend GraphQL type. Unknown versions, absent required operations and labels
+without real schemas fail closed. Capability discovery also rejects an unknown
+managed protocol rather than printing success. Standalone capability metadata
+is not a substitute for this managed schema; use the offline command to inspect
+the local CLI while working with independent Dash.
 
 ## Setup: exact preview, receipt and recovery
 
@@ -171,7 +210,13 @@ ml-dash workspaces apply --namespace fortyfive --connection APPROVED_ALIAS --rem
 ```
 
 Managed setup is the default path; external connection management is advanced.
-Only operator-approved aliases are accepted. Discovery verifies the external
+Only operator-approved aliases are accepted. Connections and workspace lists
+preserve server `nextCursor`/`hasMore`, with `--limit` (1–100) and `--cursor`
+continuation. Exact plan/apply selection starts at the first page, traverses at
+most 100 pages, and refuses repeated cursors, duplicate IDs or instance drift;
+passing a partial starting cursor for exact selection is refused. Missing paging
+metadata is a backend compatibility error, not a complete inventory.
+Discovery verifies the external
 instance and eligible workspace. No URL/token is supplied by the user, and equal
 organization names never establish a mapping. Applying pins the reviewed
 instance/namespace/alias and current binding revision. `workspaces detach`
