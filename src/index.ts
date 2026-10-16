@@ -6,6 +6,7 @@
  * `ml-dash version` does not pay for the GraphQL client or the QR encoder.
  */
 import { ParseError, parseArgs, renderCommandHelp, renderRootHelp, usageError, type CommandSpec } from "./cli/parser.js";
+import { managementLoaders } from "./managed/commands.js";
 import { red, yellow } from "./util/ansi.js";
 
 interface CommandModule {
@@ -14,6 +15,7 @@ interface CommandModule {
 }
 
 const loaders: Record<string, () => Promise<CommandModule>> = {
+  ...managementLoaders,
   version: () => import("./commands/version.js") as Promise<CommandModule>,
   login: () => import("./commands/login.js") as Promise<CommandModule>,
   logout: () => import("./commands/logout.js") as Promise<CommandModule>,
@@ -52,6 +54,7 @@ export async function main(argv: string[]): Promise<number> {
     args = parseArgs(mod.spec, rest);
   } catch (e) {
     if (e instanceof ParseError) {
+      if (command in managementLoaders && rest.includes('--json')) { console.log(JSON.stringify({ok:false,error:{code:'MANAGED_USAGE_ERROR',message:'Invalid command arguments.',remediation:`Run ml-dash ${command} --help.`,retryable:false}})); return 2; }
       console.error(usageError(command, e.message));
       return 2;
     }

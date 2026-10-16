@@ -721,3 +721,31 @@ can reach, which is the way to do that.
   `contents: write`, and no organization setting changes it. A maintainer
   pushed the tag; CI made the Release from bytes it had fetched and re-hashed.
   See "How the Release was finally created".
+
+## 0.2.0 managed candidate preparation
+
+The management commands are additive; existing standalone commands and the
+Python logging SDK remain compatible, so this preparation uses minor version
+0.2.0. Package manifest, lockfile root version and `src/version.ts` must agree.
+The owning procedure is `docs/MANAGED.md` and is included in the npm package.
+
+Before invoking the existing CI-only publisher, merge and verify the matching
+DreamLake/Dash control/consumption routes, standalone pagination/identity API,
+scoped workload/delete capabilities, and hardened standalone empty-org deletion.
+Do not deploy the CLI as proof that these server capabilities are enabled.
+Adoption apply/recover additionally requires an implemented operator fence,
+backup and drain proof; its safe default rejection is not a completed migration.
+
+Local preparation must retain full `npm test`, management-guide parser checks,
+and installed-tarball HTTP fixture readback. Public acceptance remains separate:
+verify immutable native/npm bytes and default pointers, install the public
+package in an isolated directory with scripts disabled, then check version,
+command help, login status and the authorized project's setup/readback. Never
+publish this version twice or substitute a local publish for the reviewed CI
+workflow. No release workflow was dispatched during local preparation.
+
+Pull requests and main pushes also run `.github/workflows/ci.yml`: the full
+existing suite, typed management/doc checks, fresh local tarball HTTP fixtures,
+and a native host build/read-only smoke. This job has read-only repository
+permissions and no publisher credentials. Its success does not dispatch the
+separate tag/manual production release workflow or prove public publication.

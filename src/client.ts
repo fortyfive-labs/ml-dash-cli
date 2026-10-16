@@ -554,7 +554,7 @@ export class RemoteClient {
       { namespaceSlug: namespaceSlug ?? null, limit, offset },
     );
     const page = result?.projectsPaginated ?? {};
-    return { projects: page.projects ?? [], totalCount: page.totalCount ?? 0 };
+    return { projects: page.projects ?? [], totalCount: page.totalCount ?? 0, hasMore: page.hasMore ?? false };
   }
 
   async listExperimentsGraphql(
@@ -588,7 +588,7 @@ export class RemoteClient {
       variables,
     );
     const page = result?.experimentsPaginated ?? {};
-    return { experiments: page.experiments ?? [], totalCount: page.totalCount ?? 0 };
+    return { experiments: page.experiments ?? [], totalCount: page.totalCount ?? 0, hasMore: page.hasMore ?? false };
   }
 
   async getExperimentGraphql(
@@ -636,7 +636,7 @@ export class RemoteClient {
       { pattern, limit, offset },
     );
     const page = result?.searchExperimentsPaginated ?? {};
-    return { experiments: page.experiments ?? [], totalCount: page.totalCount ?? 0 };
+    return { experiments: page.experiments ?? [], totalCount: page.totalCount ?? 0, hasMore: page.hasMore ?? false };
   }
 
   /** Walk the project node tree to find an experiment nested under folders. */
