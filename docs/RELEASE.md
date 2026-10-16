@@ -722,6 +722,29 @@ can reach, which is the way to do that.
   pushed the tag; CI made the Release from bytes it had fetched and re-hashed.
   See "How the Release was finally created".
 
+## 0.3.0 inspection release
+
+The 0.3.0 package extends the managed CLI with server-paged organization member
+and team inspection, complete external workspace cursor traversal, an offline
+command schema and versioned authenticated operation JSON Schemas. The current
+owning guide is `docs/MANAGED.md`; the 0.2.0 section below records historical
+publication evidence, not the feature set of the 0.3.0 package.
+
+The version-pinned install is `npm install -g @dreamlake/ml-dash@0.3.0` after
+publication. Use the existing CI-only publisher once against the reviewed source;
+do not infer publication from a version bump or merge. The versioned
+[0.3.0 release](https://github.com/fortyfive-labs/ml-dash-cli/releases/tag/v0.3.0)
+and npm registry establish availability. Public-package and native readbacks
+remain required after that workflow completes. This documentation update does
+not trigger publication.
+
+Deploy and verify the matching BFF pagination/schema routes before enabling the
+dependent commands. Offline `schema` remains usable without authentication;
+`instance schema` requires the supported managed protocol/schema version and
+shared DreamLake login. Keep the documented cursor/offset distinctions, explicit
+standalone authority and all existing preview/apply and operator safeguards.
+Source-backed storage remains excluded.
+
 ## 0.2.0 managed release
 
 The management commands are additive; existing standalone commands and the
