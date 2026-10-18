@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.1 — Current experiment schema
 
 - Fix standalone experiment listing, wildcard search, track discovery and download discovery against the current server schema by removing retired `logMetadata` and `metricMetadata` selections.
 - Display unavailable log counts as `unknown`; log download remains independent of those counts.
