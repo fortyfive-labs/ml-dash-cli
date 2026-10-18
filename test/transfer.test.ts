@@ -526,6 +526,7 @@ describe("download", () => {
     ]);
     assert.equal(r.code, 0, r.out);
     assert.match(r.stdout, /Dry run - would download/);
+    assert.match(r.stdout, /Logs: unknown/);
     assert.ok(!existsSync(path.join(root, "test-user", "alpha", "exp-one", "experiment.json")));
   });
 

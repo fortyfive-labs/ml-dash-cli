@@ -151,7 +151,7 @@ function experimentRow(exp: any, detailed: boolean, timeField: "createdAt" | "st
     cyan(exp.displayPath || exp.name),
     styleStatus(exp.status ?? "UNKNOWN"),
     String((exp.metrics ?? []).length),
-    String(exp.logMetadata?.totalLogs ?? 0),
+    "unknown", // The schema does not expose an aggregate log count.
     String(exp.trackCount ?? 0),
     String((exp.files ?? []).length),
   ];

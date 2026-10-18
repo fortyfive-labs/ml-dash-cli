@@ -84,7 +84,6 @@ export interface RemoteExperiment {
   description?: string | null;
   tags: string[];
   metricNames: string[];
-  logCount: number;
   fileCount: number;
   status: string;
 }
@@ -100,7 +99,6 @@ function fromGraphql(data: any): RemoteExperiment {
     description: data?.description ?? null,
     tags: data?.tags ?? [],
     metricNames: (data?.metrics ?? []).map((m: any) => m.name),
-    logCount: Number(data?.logMetadata?.totalLogs ?? 0),
     fileCount: (data?.files ?? []).length,
     status: data?.status ?? "RUNNING",
   };
@@ -737,7 +735,7 @@ export async function run(args: ParsedArgs): Promise<number> {
     for (const exp of queued) {
       console.log(`  • ${exp.project}/${exp.experiment}`);
       console.log(
-        `    Logs: ${exp.logCount}, Metrics: ${exp.metricNames.length}, Files: ${exp.fileCount}`,
+        `    Logs: unknown, Metrics: ${exp.metricNames.length}, Files: ${exp.fileCount}`,
       );
     }
     return 0;

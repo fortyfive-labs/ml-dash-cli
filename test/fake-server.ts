@@ -95,7 +95,6 @@ export function defaultState(): FakeState {
         createdAt: "2026-01-01T00:00:00Z",
         metadata: null,
         project: { id: "1111111111111111111", slug: "alpha", namespace: { slug: "test-user" } },
-        logMetadata: { totalLogs: 7 },
         metrics: [{ name: "loss" }, { name: "acc" }],
         files: [{ id: "3333333333333333333" }],
         trackCount: 1,
@@ -111,7 +110,6 @@ export function defaultState(): FakeState {
         createdAt: "2026-02-01T00:00:00Z",
         metadata: null,
         project: { id: "1111111111111111111", slug: "alpha", namespace: { slug: "test-user" } },
-        logMetadata: { totalLogs: 0 },
         metrics: [],
         files: [],
         trackCount: 0,
@@ -459,6 +457,12 @@ export async function startFakeServer(state: FakeState = defaultState()): Promis
 }
 
 function graphqlResponse(state: FakeState, query: string, vars: Record<string, any>): string {
+  // The deployed schema no longer exposes these aggregate metadata relations.
+  // Reject stale selections instead of silently accepting every query string.
+  const removedField = query.match(/\b(logMetadata|metricMetadata)\b/)?.[1];
+  if (removedField) {
+    return JSON.stringify({ data: null, errors: [{ message: `Cannot query field "${removedField}"` }] });
+  }
   const page = <T>(items: T[], limit: number, offset: number) => ({
     slice: items.slice(offset, offset + limit),
     totalCount: items.length,
@@ -487,7 +491,7 @@ function graphqlResponse(state: FakeState, query: string, vars: Record<string, a
   if (query.includes("query Experiment(")) {
     const exp = state.experiments.find((e) => e.name === vars.experimentName);
     if (!exp) return `{"data":{"experiment":null}}`;
-    return `{"data":{"experiment":{"id":${exp.id},"name":"${exp.name}","description":"","tags":[],"status":"${exp.status}","metadata":${JSON.stringify(exp.metadata ?? null)},"project":{"slug":"alpha","namespace":{"slug":"${state.username}"}},"logMetadata":{"totalLogs":0},"metrics":[],"files":[],"parameters":null}}}`;
+    return `{"data":{"experiment":{"id":${exp.id},"name":"${exp.name}","description":"","tags":[],"status":"${exp.status}","metadata":${JSON.stringify(exp.metadata ?? null)},"project":{"slug":"alpha","namespace":{"slug":"${state.username}"}},"metrics":[],"files":[],"parameters":null}}}`;
   }
   if (query.includes("ListExperimentFilesPaginated")) {
     const { slice, totalCount, hasMore } = page(state.transfer.files, vars.limit ?? 500, vars.offset ?? 0);

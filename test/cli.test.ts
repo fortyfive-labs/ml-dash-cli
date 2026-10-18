@@ -355,6 +355,7 @@ describe("list", () => {
     const r = await h.cli(["list", "-p", "alpha", "--dash-url", h.server.url]);
     assert.equal(r.code, 0, r.out);
     assert.match(r.stdout, /Experiments in project: alpha/);
+    assert.match(r.stdout, /exp-one\s*│\s*COMPLETED\s*│\s*2\s*│\s*unknown\s*│/);
     assert.match(r.stdout, /exp-one/);
     assert.match(r.stdout, /COMPLETED/);
     assert.match(r.stdout, /nested\/exp-two/);

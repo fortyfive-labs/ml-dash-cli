@@ -575,7 +575,6 @@ export class RemoteClient {
            experiments {
              id name description tags status startedAt endedAt metadata
              project { slug namespace { slug } }
-             logMetadata { totalLogs }
              metrics { name }
              files { id }
              trackCount
@@ -602,8 +601,7 @@ export class RemoteClient {
          experiment(namespaceSlug: $namespaceSlug, projectSlug: $projectSlug, experimentName: $experimentName) {
            id name description tags status metadata
            project { slug namespace { slug } }
-           logMetadata { totalLogs }
-           metrics { name metricMetadata { totalDataPoints } }
+           metrics { name }
            files {
              id name pPath description tags metadata
              physicalFile { filename contentType sizeBytes checksum s3Url }
@@ -623,8 +621,7 @@ export class RemoteClient {
            experiments {
              id name description tags status startedAt endedAt metadata
              project { id slug name namespace { id slug } }
-             logMetadata { totalLogs }
-             metrics { name metricMetadata { totalDataPoints } }
+             metrics { name }
              files { id name }
              trackCount
              displayPath
