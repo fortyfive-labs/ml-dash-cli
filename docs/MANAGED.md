@@ -270,7 +270,7 @@ Options an action would not send are refused, in every mode.
 | `api --query\|--mutation [--jq]` | `<DreamLake API>/native-dash/graphql`, the same query grammar |
 | `instance show\|capabilities\|schema`, `health`, `diagnostics`, `projects access` | the project's native `/status`; `instance schema` returns the server's `native-1` operation schema where advertised |
 | `auth status\|login`, `profile`, `logout` | `/auth/me` and the DreamLake shared login contract v1 (`logout --env NAME` removes one saved environment; the standalone login is untouched) |
-| `orgs …`, `teams list\|members`, `projects list` | DreamLake GraphQL and the project catalog; `orgs delete` stays refused, as in managed mode |
+| `orgs …`, `teams list\|members`, `projects list` | DreamLake GraphQL and the project catalog. `orgs delete` (owner, preview then `--apply --review`) runs DreamLake's organization deletion: a logical quarantine that retains records and keeps the name reserved, refused while work is still running |
 | `setup`, `adoption`, `connections`, `workspaces` | managed-only by design (`NATIVE_NOT_AVAILABLE`); native mode performs no migration |
 | `schema`, `version`, `update` | backend-independent |
 
