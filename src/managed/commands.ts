@@ -9,7 +9,7 @@ import { adoptionCommand } from './adoption.js';
 import { connectionCommand } from './connections.js';
 import { login, standaloneLogin } from './auth.js';
 import { organizationInspection, organizationPaging, allOrganizationMembers } from './organizationInspection.js';
-import { assertNativeSelection, nativeCommand } from './native.js';
+import { assertNativeSelection, nativeCommand, nativeOnlyActions, sharedOrganizationAction } from './native.js';
 
 const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams'] as const;
 export const managementActions: Record<string,string[]> = {
@@ -17,8 +17,8 @@ export const managementActions: Record<string,string[]> = {
  adoption:['inventory','plan','apply','reconcile','recover'],
  connections:['list'],workspaces:['list','status','plan','apply','detach'],
  auth:['status','login'],instance:['show','capabilities','schema'],orgs:['list','create','update','delete','members','teams','member-add','member-role','member-remove'],projects:['list','access'],
- setup:['plan','apply','status','resume'],credentials:['list','inspect','create','rotate','retire'],runs:['list','show','create','status','parameters','delete'],
- metrics:['list','read','append'],logs:['read','append'],files:['list','inspect','upload','download'],health:['check'],diagnostics:['check'],
+ setup:['plan','apply','status','resume'],credentials:['list','inspect','create','rotate','retire'],runs:['list','show','create','status','parameters','delete','archive','unarchive','trash','restore','update','parameters-delete'],
+ metrics:['list','read','append','stats','metadata'],logs:['read','append'],files:['list','inspect','upload','download','update','delete'],health:['check'],diagnostics:['check'],
 };
 const help: Record<string,string>={teams:'Inspect standalone teams and membership for access diagnostics',adoption:'Inventory and explicitly adopt a legacy project with operator safeguards',connections:'List operator-approved external connections (advanced)',workspaces:'Explicit external workspace discovery, binding and detachment (advanced)',auth:'Shared DreamLake login and live status',instance:'Managed instance identity, version and capabilities',orgs:'Discover organizations and current membership',projects:'Discover projects and inspect effective access',setup:'Review exact resources and resume idempotent setup',credentials:'Inspect or revoke scoped credentials without exporting tokens',runs:'Inspect and create experiment runs',metrics:'Read cursor pages and append metric points',logs:'Read cursor pages and append logs',files:'Inspect and transfer experiment files',health:'Read instance health',diagnostics:'Check identity, capabilities, setup and access'};
 export function managementCommand(name: typeof names[number]) {
@@ -55,6 +55,14 @@ export function managementCommand(name: typeof names[number]) {
   {flags:['--mode'],dest:'mode',choices:['read','write'],help:'Scoped credential mode (default read)'},
   {flags:['--credential'],dest:'credential',help:'Workload credential ID, never its token'},
   {flags:['--expected-generation'],dest:'expected_generation',help:'Reviewed workload credential generation'},
+  {flags:['--include-archived'],dest:'include_archived',boolean:true,help:'Native runs list: include archived runs'},
+  {flags:['--level'],dest:'level',help:'Native logs read: comma list of info, warn, error, debug, fatal'},
+  {flags:['--start-time'],dest:'start_time',help:'Native logs read: inclusive ISO lower bound'},
+  {flags:['--end-time'],dest:'end_time',help:'Native logs read: inclusive ISO upper bound'},
+  {flags:['--search'],dest:'search',help:'Native logs read: case-sensitive message substring'},
+  {flags:['--order-by'],dest:'order_by',choices:['sequenceNumber','timestamp'],help:'Native logs read: sort field'},
+  {flags:['--order'],dest:'order',choices:['asc','desc'],help:'Native logs read: sort direction'},
+  {flags:['--prefix'],dest:'prefix',help:'Native files: destination or filter prefix'},
   {flags:['--limit'],dest:'limit',help:'Page size, 1–1000'}, {flags:['--cursor'],dest:'cursor',help:'Opaque next-page cursor'},
   {flags:['--out'],dest:'out',help:'Save a non-secret plan/receipt, or download destination'},
   {flags:['--review'],dest:'review',help:'Previously reviewed plan JSON; required for apply/resume'},
@@ -113,12 +121,14 @@ async function writeIntent(c:ReturnType<typeof context>,a:ParsedArgs,intent:unkn
 export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
  try{
   const act=action(a,name);
-  if(arg(a,'backend')==='native'){
+  if(arg(a,'backend')!=='native'&&nativeOnlyActions[name]?.includes(act))throw new ManagementError('MANAGED_NATIVE_ONLY_ACTION',`${name} ${act} is served only by the native backend.`,'Add --backend native for a DreamLake-native project.');
+  if(arg(a,'backend')==='native'&&!sharedOrganizationAction(name,act)){
    assertNativeSelection(name,act,a);
    const native=context(a,!(name==='auth'&&act==='login'));
    const value=name==='auth'&&act==='login'?await login(a):await nativeCommand(name,act,native,a);
    emit(a,safe(value,[native.token||'']));return 0;
   }
+  if(arg(a,'backend')==='native')assertNativeSelection(name,act,a);
   let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
   if(name==='orgs'&&['create','update','delete'].includes(act)){result=await organizationMutation(c,a,act);emit(a,safe(result,[c.token||'']));return 0;}
   if(a.standalone&&!(name==='auth'&&act==='login')){result=await standaloneCommand(name,act,c,a);emit(a,safe(result,[c.token||'']));return 0;}

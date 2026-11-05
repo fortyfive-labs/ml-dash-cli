@@ -143,8 +143,9 @@ test('native backend is explicit: default stays managed, native never touches ma
  assert.deepEqual(f.calls.map(c=>c.method+' '+c.path),[`GET ${nroot}/runs?limit=2&cursor=${'a'.repeat(24)}`]);assert.equal(f.calls[0].auth,'Bearer user-secret-never-print');
  assert.equal(native.data.data.runs[0].id,RUN);assert.doesNotMatch(native.out+native.err,/never-print/);});
 test('native backend refuses managed-only options, commands without a native form, and foreign paths before any request',async t=>{const f=await fixture(t);
- for(const args of [['setup','plan',...target],['credentials','list',...target],['runs','create',...target,'--run-key','k','--apply'],['runs','list',...target,'--standalone'],['instance','schema',...target],['runs','show',...target,'--run','../../other']]){
+ for(const args of [['setup','plan',...target],['credentials','list',...target],['runs','create',...target,'--run-key','k','--apply'],['runs','list',...target,'--standalone'],['adoption','inventory',...target],['orgs','list','--limit','5'],['runs','show',...target,'--run','../../other']]){
   const r=await f.cli([...args,'--backend','native','--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/^NATIVE_/);}
+ const managed=await f.cli(['runs','archive',...target,'--run',RUN,'--json']);assert.equal(managed.data.error.code,'MANAGED_NATIVE_ONLY_ACTION');
  assert.equal(f.calls.length,0);});
 test('native writes apply directly to the selected project with the documented bodies',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot)?{ok:true}:undefined);
  const points=path.join(f.dir,'points.json'),meta=path.join(f.dir,'meta.json'),params=path.join(f.dir,'params.json');writeFileSync(points,'[{"step":1,"loss":0.5}]');writeFileSync(meta,'{"unit":"nats"}');writeFileSync(params,'{"lr":0.001}');

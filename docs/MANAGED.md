@@ -250,25 +250,43 @@ No CLI flag enables server fencing or bypasses these safeguards.
 
 ## Native backend (preview)
 
-`--backend native` sends `auth`, `instance show|capabilities`, `health`,
-`diagnostics`, `runs`, `metrics`, `logs` and `files` to DreamLake-native
-Experiments of the selected DreamLake project, using the same DreamLake login.
-The default is unchanged (`managed`), and a native command never falls back
-to the managed or standalone backend. Writes apply directly, so `--apply`,
-`--review`, `--credential` and `--idempotency-key` are refused. Commands
-without a native form (`setup`, `credentials`, `adoption`, `workspaces`,
-`connections`, `projects`, `instance schema`) fail with `NATIVE_NOT_AVAILABLE`.
-Run and file IDs come from native list and create results.
+`--backend native` sends a command to DreamLake-native Experiments and other
+DreamLake APIs, using the same DreamLake login. The default is unchanged
+(`managed`), and a native command never falls back to the managed or standalone
+backend. Native writes apply directly, so run-data commands refuse `--apply`,
+`--review`, `--credential` and `--idempotency-key`. Organization changes keep
+their preview, `--apply` and `--review` flow.
+
+| Command | Native source |
+|---|---|
+| `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/...` |
+| `auth status`, `profile --backend native` | `/auth/me` |
+| `instance show\|capabilities\|schema`, `projects access`, `health`, `diagnostics` | the project's native `/status`; `instance schema` adds the offline CLI schema and reports `operationSchema: null` |
+| `projects list` | `/namespaces/:ns/projects` (readable projects only; `--cursor` is the page number) |
+| `orgs list`, `teams list\|members` | DreamLake GraphQL `myOrganizations`, `myTeams`, `teamMembers` (unpaginated) |
+| other `orgs` actions | the same DreamLake GraphQL operations as managed mode |
+
+Native-only actions: `runs archive|unarchive|trash|restore|update|parameters-delete`,
+`metrics stats|metadata` and `files update|delete`. `logs read` accepts `--level`,
+`--start-time`, `--end-time`, `--search`, `--order-by` and `--order`.
+`setup`, `credentials`, `adoption`, `workspaces` and `connections` have no native
+form and fail with `NATIVE_NOT_AVAILABLE`. Adoption stays managed-only, and native
+mode performs no migration.
 
 ```bash
 ml-dash runs create --namespace lab --project research --run-key trial-1 --backend native --json
 ml-dash metrics append --namespace lab --project research --run RUN_ID --metric loss --data points.json --description train-loss --backend native
 ml-dash metrics read --namespace lab --project research --run RUN_ID --metric loss --limit 1000 --backend native
+ml-dash logs read --namespace lab --project research --run RUN_ID --level warn,error --backend native
 ml-dash files download --namespace lab --project research --run RUN_ID --file FILE_ID --out model.pt --backend native
+ml-dash runs archive --namespace lab --project research --run RUN_ID --backend native
+ml-dash projects list --namespace lab --backend native --json
+ml-dash teams list --backend native --json
 ```
 
-A metric's `--description`, `--tags` and `--metadata` are stored only when the
-append creates the metric. Pages return `nextCursor`; pass it to `--cursor`.
+A metric's `--description`, `--tags` and `--metadata` on `append` are stored only
+when the append creates the metric. Pages return `nextCursor`; pass it to `--cursor`.
+A download is written beside the destination, verified, and only then linked into place.
 
 ## Output and backend mapping
 
