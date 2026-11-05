@@ -17,7 +17,7 @@ const FOLDER_ACTIONS = ['list', 'show', 'create', 'update', 'trash', 'restore', 
 export const nativeActions: Record<string, string[]> = {
   auth: ['status', 'login'], instance: ['show', 'capabilities', 'schema'], health: ['check'], diagnostics: ['check'],
   runs: ['list', 'show', 'create', 'status', 'parameters', 'delete', 'archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete',
-    'protect', 'unprotect', 'move', 'purge'],
+    'protect', 'unprotect', 'move', 'purge', 'bindrs', 'bind', 'unbind'],
   metrics: ['list', 'read', 'append', 'stats', 'metadata'], logs: ['read', 'append'],
   files: ['list', 'inspect', 'upload', 'download', 'update', 'delete'],
   orgs: ['list', 'members', 'teams', 'create', 'update', 'delete', 'member-add', 'member-role', 'member-remove'],
@@ -27,7 +27,7 @@ export const nativeActions: Record<string, string[]> = {
 };
 /** Actions only the native backend serves; the managed and standalone backends refuse them. */
 export const nativeOnlyActions: Record<string, string[]> = {
-  runs: ['archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete', 'protect', 'unprotect', 'move', 'purge'],
+  runs: ['archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete', 'protect', 'unprotect', 'move', 'purge', 'bindrs', 'bind', 'unbind'],
   metrics: ['stats', 'metadata'], files: ['update', 'delete'], teams: ['delete'],
   folders: FOLDER_ACTIONS, batch: ['trash', 'purge'],
 };
@@ -139,9 +139,10 @@ async function sha256File(file: string) {
 
 /** Options added for native mode, and the native actions that actually send them. Anything else is refused, never ignored. */
 const NATIVE_FLAGS = ['include_archived', 'level', 'start_time', 'end_time', 'search', 'order_by', 'order', 'prefix', 'tags', 'metadata',
-  'write_protected', 'folder', 'folder_path', 'parent', 'path', 'operation', 'wait', 'runs', 'folders'];
+  'write_protected', 'folder', 'folder_path', 'parent', 'path', 'operation', 'wait', 'runs', 'folders', 'bindrs', 'bindr', 'bindr_id', 'item_kind', 'item_id'];
 const flagUse: Record<string, string[]> = {
-  'runs list': ['include_archived'], 'runs create': ['description', 'tags', 'metadata', 'write_protected', 'folder_path'],
+  'runs list': ['include_archived'], 'runs create': ['description', 'tags', 'metadata', 'write_protected', 'folder_path', 'bindrs'],
+  'runs bindrs': ['item_kind', 'item_id'], 'runs bind': ['bindr', 'bindr_id', 'item_kind', 'item_id'], 'runs unbind': ['bindr', 'bindr_id', 'item_kind', 'item_id'],
   'runs update': ['description', 'tags', 'metadata'], 'runs move': ['name', 'folder', 'folder_path'],
   'folders list': ['parent'], 'folders show': ['folder', 'path'], 'folders create': ['path', 'name', 'parent'],
   'folders update': ['folder', 'name', 'parent'], 'folders trash': ['folder', 'wait'], 'folders restore': ['folder', 'wait'],
@@ -237,6 +238,29 @@ function moveOf(a: ParsedArgs) {
   if (!Object.keys(body).length) throw nativeError('NATIVE_ARGUMENT_REQUIRED', 'Give --name, --folder or --folder-path.', 'Supply the new name or destination.');
   return body;
 }
+/** `--bindrs a,b` of a create: 1-32 names of 1-120 characters (found or created in the project, the run attached). */
+function bindrNames(value: string) {
+  const names = [...new Set(tagList(value))];
+  if (!names.length || names.length > 32 || names.some(n => n.length > 120))
+    throw nativeError('NATIVE_INVALID_BINDRS', '--bindrs takes 1-32 comma-separated bindr names of at most 120 characters.', 'Shorten the list or the names.');
+  return names;
+}
+/** `--item-kind metric|file|parameters --item-id ID`: one item of the run, or none (the run itself). */
+function bindrItem(a: ParsedArgs) {
+  const kind = arg(a, 'item_kind'), id = arg(a, 'item_id');
+  if (kind === undefined && id === undefined) return null;
+  if (!kind || !['metric', 'file', 'parameters'].includes(kind) || !id || !/^[0-9a-f]{24}$/.test(id))
+    throw nativeError('NATIVE_INVALID_BINDRS', 'Give --item-kind metric|file|parameters with --item-id (a native id), or neither for the run.', 'Use the item id from metrics list, files list or runs parameters.');
+  return { kind, id };
+}
+/** `--bindr NAME` or `--bindr-id ID`: the bindr a bind or unbind names (bind by name creates it when missing). */
+function bindrRef(a: ParsedArgs) {
+  const name = arg(a, 'bindr'), id = arg(a, 'bindr_id');
+  if ((name === undefined) === (id === undefined)) throw nativeError('NATIVE_ARGUMENT_REQUIRED', 'Give --bindr NAME or --bindr-id ID.', 'Name the bindr.');
+  if (id !== undefined && !/^[0-9a-f]{24}$/.test(id)) throw nativeError('NATIVE_INVALID_BINDRS', '--bindr-id must be a bindr ID.', 'Use the id from runs bindrs.');
+  if (name !== undefined && (!name.trim() || name.trim().length > 120)) throw nativeError('NATIVE_INVALID_BINDRS', '--bindr must be 1-120 characters.', 'Choose a valid bindr name.');
+  return id !== undefined ? { bindrId: id } : { name: name!.trim() };
+}
 function logFilters(a: ParsedArgs) {
   const q = new URLSearchParams();
   const level = arg(a, 'level');
@@ -318,6 +342,15 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     if (act === 'move') return json(c, run(), 'PATCH', moveOf(a));
     // ADMIN, a trashed run only: accepted at once (202), the data deleted afterwards. Never restorable.
     if (act === 'purge') return json(c, `${run()}/purge`, 'POST');
+    // Bindr membership of the run, or of one of its items (metric, file, parameters): listed, attached, detached.
+    if (act === 'bindrs') {
+      const item = bindrItem(a);
+      return json(c, `${run()}/bindrs${item ? `?${new URLSearchParams({ itemKind: item.kind, itemId: item.id })}` : ''}`);
+    }
+    if (act === 'bind' || act === 'unbind') {
+      const item = bindrItem(a);
+      return json(c, `${run()}/bindrs`, act === 'bind' ? 'POST' : 'DELETE', { ...bindrRef(a), ...(item ? { item } : {}) });
+    }
     if (act === 'parameters-delete') return json(c, `${run()}/parameters`, 'DELETE');
     if (act === 'show') return json(c, run());
     if (act === 'create') {
@@ -328,7 +361,7 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
           : 'Run key must contain 1-128 letters, numbers, underscores or hyphens.', 'Choose a stable idempotent run key.');
       // PUT carries the run's human metadata, its metadata dict and a person's protection, all written with the run
       // in one transaction; repeating it with the same values changes nothing, and it never unprotects.
-      const body = { ...describe(a), ...(a.write_protected ? { writeProtected: true } : {}) };
+      const body = { ...describe(a), ...(a.write_protected ? { writeProtected: true } : {}), ...(arg(a, 'bindrs') !== undefined ? { bindrs: bindrNames(arg(a, 'bindrs')!) } : {}) };
       return json(c, folders ? `${base()}/run-paths/${[...folders, key].map(encodeURIComponent).join('/')}` : `${base()}/runs/${encodeURIComponent(key)}`, 'PUT', body);
     }
     if (act === 'status') return json(c, `${run()}/status`, 'POST', { status: required(a, 'status') });

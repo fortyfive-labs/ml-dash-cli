@@ -246,3 +246,67 @@ test('device login keeps polling through vuer-auth\'s HTTP 202 pending reply (li
   :c.path==='/auth/exchange'?{dreamlake_token:'new-dreamlake-fixture-secret'}:undefined);
  const r=await f.cli(['auth','login','--auth-url',f.url,'--json','--no-browser']);assert.equal(r.code,0,r.out+r.err);assert.equal(polls,3);
  assert.doesNotMatch(r.out+r.err,/vuer-fixture-secret|new-dreamlake-fixture-secret/);});
+const BINDR='a1'.repeat(12),NEWFILE='9'.repeat(24);
+test('native run bindrs: list, bind and unbind the run or one item; create joins named bindrs',async t=>{
+ const f=await fixture(t,c=>c.path.startsWith(nroot)?(c.path.endsWith('/bindrs')&&c.method==='POST'?{bindr:{id:BINDR,name:c.body.name??'x',parent:null},attached:true}:{ok:true,bindrs:[]}):undefined);
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','bindrs','--run',RUN],['runs','bindrs','--run',RUN,'--item-kind','file','--item-id',FILE],['runs','bind','--run',RUN,'--bindr',' best '],
+  ['runs','bind','--run',RUN,'--bindr-id',BINDR,'--item-kind','metric','--item-id',FILE],['runs','unbind','--run',RUN,'--bindr-id',BINDR],['runs','create','--run-key','k2','--bindrs','a, b,a']])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['GET',`/runs/${RUN}/bindrs`,undefined],['GET',`/runs/${RUN}/bindrs?itemKind=file&itemId=${FILE}`,undefined],
+  ['POST',`/runs/${RUN}/bindrs`,{name:'best'}],['POST',`/runs/${RUN}/bindrs`,{bindrId:BINDR,item:{kind:'metric',id:FILE}}],
+  ['DELETE',`/runs/${RUN}/bindrs`,{bindrId:BINDR}],['PUT','/runs/k2',{bindrs:['a','b']}]]);
+ f.calls.length=0;
+ for(const args of [['runs','bind','--run',RUN],['runs','bind','--run',RUN,'--bindr','x','--bindr-id',BINDR],['runs','bindrs','--run',RUN,'--item-kind','file']])
+  assert.equal((await f.cli([...args,...n])).code,1,args.join(' '));
+ assert.equal(f.calls.length,0);});
+
+/** A native `.dash` upload target: one run with params, a log, a metric and one file. */
+function dashRun(dir:string,meta:Record<string,unknown>,fileBindrs:string[]=[]){
+ const d=path.join(dir,'dash','lab','research','sweep','r1');const body=Buffer.from('ckpt');
+ for(const sub of ['logs','metrics/loss',`files/ckpt/${FILE}`])mkdirSync(path.join(d,sub),{recursive:true});
+ writeFileSync(path.join(d,'experiment.json'),JSON.stringify({name:'r1',project:'research',description:null,tags:[],bindrs:[],prefix:'lab/research/sweep/r1',metadata:null,created_at:'2026-01-01T00:00:00Z',write_protected:false,...meta}));
+ writeFileSync(path.join(d,'parameters.json'),JSON.stringify({version:1,data:{lr:0.1},updatedAt:'2026-01-01T00:00:00Z'}));
+ writeFileSync(path.join(d,'logs','logs.jsonl'),JSON.stringify({sequenceNumber:0,timestamp:'2026-01-01T00:00:00Z',level:'info',message:'go'})+'\n');
+ writeFileSync(path.join(d,'metrics','loss','data.jsonl'),JSON.stringify({index:0,data:{step:0,loss:1}})+'\n');
+ writeFileSync(path.join(d,'metrics','loss','metadata.json'),JSON.stringify({name:'loss',totalDataPoints:1,nextIndex:1}));
+ writeFileSync(path.join(d,'files','ckpt',FILE,'model.bin'),body);
+ writeFileSync(path.join(d,'files','.files_metadata.json'),JSON.stringify({files:[{id:FILE,experimentId:'x',path:'ckpt',filename:'model.bin',description:null,tags:[],bindrs:fileBindrs,contentType:'application/octet-stream',sizeBytes:body.length,checksum:hash(body),metadata:null,uploadedAt:'2026-01-01T00:00:00Z',updatedAt:'2026-01-01T00:00:00Z',deletedAt:null}]}));
+ return path.join(dir,'dash');
+}
+const schemaOps=(protection:boolean,bindrs:boolean)=>({schemaVersion:'1',protocolVersion:'native-1',operations:[
+ {id:'runs.update',method:'PATCH',path:`${nroot}/runs/:runId`,input:{properties:{body:{properties:{archived:{},...(protection?{writeProtected:{type:'boolean'}}:{})}}}}},
+ ...(bindrs?[{id:'runs.bindrs.attach',method:'POST',path:'/native-experiments/ns/:namespace/projects/:project/runs/:runId/bindrs'}]:[])]});
+function nativeServer(schema:any){return (c:Call)=>{
+ if(c.path==='/native-experiments/schema?version=1')return schema??{statusCode:404,response:{error:{code:'NATIVE_HTTP_404'}}};
+ if(c.path==='/namespaces/lab/projects/research')return {id:'p'.repeat(24),slug:'research',visibility:'private'};
+ if(c.path===`${nroot}/status`)return {status:'ready',capabilities:['runs','run-paths','folders','machine-schema']};
+ if(c.method==='PUT'&&c.path.startsWith(`${nroot}/run-paths/`))return {experiment:{id:RUN,name:'r1'},...(c.body.bindrs?{bindrs:c.body.bindrs.map((name:string,i:number)=>({id:String(i).repeat(24),name}))}:{})};
+ if(c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/files`)return {id:NEWFILE,filename:'model.bin'};
+ if(c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/bindrs`)return {bindr:{id:BINDR,name:c.body.name,parent:null},attached:true};
+ if(c.method==='PATCH'&&c.path===`${nroot}/runs/${RUN}`)return {experiment:{id:RUN,writeProtected:c.body.writeProtected===true}};
+ if(c.path.startsWith(nroot))return {ok:true};
+ return undefined;};}
+const writes=(calls:Call[])=>calls.filter(c=>c.method!=='GET');
+test('native upload refuses write_protected or bindrs before any write when the server does not list them',async t=>{
+ for(const [meta,schema] of [[{write_protected:true},null],[{write_protected:true},schemaOps(false,true)],[{bindrs:['best']},schemaOps(true,false)]] as const){
+  const f=await fixture(t,nativeServer(schema));
+  const r=await f.cli(['upload',dashRun(f.dir,meta as any),'--backend','native']);
+  assert.equal(r.code,1,JSON.stringify(meta));assert.match(r.err+r.out,/nothing was uploaded/);
+  assert.deepEqual(writes(f.calls),[],JSON.stringify(meta));
+  assert.ok(!f.calls.some(c=>c.path.startsWith('/namespaces/')),'no project lookup or create before the refusal');}});
+test('native upload attaches run and file bindrs (by the new file id) before protecting the run last',async t=>{
+ const f=await fixture(t,nativeServer(schemaOps(true,true)));
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true,bindrs:['best','sweep']},['ckpt']),'--backend','native']);assert.equal(r.code,0,r.out+r.err);
+ const w=writes(f.calls).map(c=>[c.method,c.path.slice(nroot.length),c.path.endsWith('/files')?'(form)':c.body]);
+ assert.deepEqual(w[0].slice(0,2),['PUT','/run-paths/sweep/r1']);assert.deepEqual((w[0][2] as any).bindrs,['best','sweep']);
+ const fileAt=w.findIndex(x=>x[1]===`/runs/${RUN}/files`),bindAt=w.findIndex(x=>x[1]===`/runs/${RUN}/bindrs`);
+ assert.ok(fileAt>0&&bindAt===fileAt+1);assert.deepEqual(w[bindAt][2],{name:'ckpt',item:{kind:'file',id:NEWFILE}});
+ assert.deepEqual(w[w.length-1],['PATCH',`/runs/${RUN}`,{writeProtected:true}]);
+ assert.equal(w.filter(x=>x[0]==='PATCH').length,1);});
+test('native upload fails the run, unprotected, when a file bindr is not confirmed',async t=>{
+ const base=nativeServer(schemaOps(true,true));
+ const f=await fixture(t,c=>c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/bindrs`?{statusCode:409,response:{error:{code:'NATIVE_RUN_BINDRS_UNAVAILABLE'}}}:base(c));
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true},['ckpt']),'--backend','native']);assert.equal(r.code,1,r.out);
+ assert.ok(!f.calls.some(c=>c.method==='PATCH'),'never protected after a failed part');});

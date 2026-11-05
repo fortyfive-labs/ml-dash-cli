@@ -27,7 +27,7 @@ function operation(spec:CommandSpec, action:string) {
  if(['setup','credentials','runs','metrics','logs','files','adoption','folders','batch'].includes(spec.name))required.push('namespace','project');
  const nativeOnly=!!nativeOnlyActions[spec.name]?.includes(action);
  if(nativeOnly)required.push('backend');
- if(spec.name==='runs'&&['protect','unprotect','move','purge'].includes(action))required.push('run');
+ if(spec.name==='runs'&&['protect','unprotect','move','purge','bindrs','bind','unbind'].includes(action))required.push('run');
  if(spec.name==='folders'&&!['list','show','create','operation'].includes(action))required.push('folder');
  if(id==='folders.operation')required.push('operation');
  if(id==='teams.delete')required.push('team');

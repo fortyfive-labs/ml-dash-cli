@@ -575,6 +575,7 @@ async function uploadFiles(
         filename: record.filename,
         description: record.description,
         tags: record.tags,
+        bindrs: record.bindrs,
         metadata: record.metadata,
         checksum: record.checksum,
         contentType: record.contentType,

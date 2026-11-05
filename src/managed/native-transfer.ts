@@ -7,9 +7,10 @@
  * own native routes. Everything uses the shared DreamLake login (managed `context`), and
  * nothing falls back to a standalone Dash server.
  *
- * Runs keep their folders, names and metadata on servers with `run-paths`. A `write_protected`
- * run is protected by your login after all of its data is written (a protected run takes no
- * data). Bindrs have no committed native contract yet and are refused before any write, never dropped.
+ * Runs keep their folders, names and metadata on servers with `run-paths`. Bindrs (the run's, with
+ * its create; each file's, right after that file with its new id) and `write_protected` (your
+ * login protects the run once every part and bindr is written; a protected run takes no data) need
+ * the server's native-1 operation schema to list them: otherwise they are refused before any write.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream, existsSync, linkSync, openAsBlob, renameSync, statSync, unlinkSync, readFileSync } from 'node:fs';
@@ -219,24 +220,30 @@ class NativeUploadClient implements ExperimentUploadClient {
     const target = parsePrefix(args.prefix ?? '', this.personal);
     // The prefix is the run's DreamLake location (checked against --target or the declared prefix in the preflight).
     if (!target || target.name !== args.name) throw new Error(`prefix '${args.prefix}' does not name run '${args.name}'`);
-    if ((args.bindrs ?? []).length) throw new Error('bindrs have no committed native contract yet');
     // Protection is applied by protectExperiment once every part is written: a protected run takes no data.
     const caps = this.caps.get(`${target.ns}/${target.project}`) ?? [];
     const body: Record<string, unknown> = {};
+    const bindrs = args.bindrs ?? [];
     // A string clears or sets ('' clears); null means "not recorded" and leaves the run as it is.
     if (typeof args.description === 'string') body.description = args.description;
     if (Array.isArray(args.tags)) body.tags = args.tags;
     if (args.metadata && Object.keys(args.metadata).length) body.metadata = args.metadata;
+    if (bindrs.length) body.bindrs = bindrs;
     const base = runsBase(target.ns, target.project);
     const value = caps.includes('run-paths')
       ? await json(this.c, `${base}/run-paths/${segmentsPath([...target.folders, target.name])}`, 'PUT', body)
       : await json(this.c, `${base}/runs/${encodeURIComponent(target.name)}`, 'PUT', body);
     this.bases.set(String(value.experiment?.id), base);
+    // The run's bindrs are found or created and attached with the create; a name missing from the answer is a failed run.
+    const attached = new Set(Array.isArray(value.bindrs) ? value.bindrs.map((b: any) => b?.name) : []);
+    const missing = [...new Set(bindrs.map(name => name.trim()))].filter(name => !attached.has(name));
+    if (missing.length) throw new Error(`the server did not confirm the run's bindrs ${JSON.stringify(missing)}`);
     return value;
   }
   /** `write_protected`: a person's protection, set last (PATCH `writeProtected: true`), after all data was written. */
   async protectExperiment(id: string): Promise<void> {
-    await json(this.c, this.run(id), 'PATCH', { writeProtected: true });
+    const value = await json(this.c, this.run(id), 'PATCH', { writeProtected: true });
+    if (value.experiment?.writeProtected !== true) throw new Error('the server did not confirm the run\'s write protection');
   }
   async setParameters(id: string, data: Record<string, unknown>): Promise<any> {
     return json(this.c, `${this.run(id)}/parameters`, 'POST', { data });
@@ -261,7 +268,17 @@ class NativeUploadClient implements ExperimentUploadClient {
     if (args.tags?.length) form.append('tags', args.tags.join(','));
     if (args.metadata) form.append('metadata', JSON.stringify(args.metadata));
     form.append('file', blob, args.filename);
-    return json(this.c, `${this.run(args.experimentId)}/files`, 'POST', undefined, form);
+    const value = await json(this.c, `${this.run(args.experimentId)}/files`, 'POST', undefined, form);
+    // The file's bindrs go on the file just stored, by its new id; a failed attach fails the file (and the run).
+    if (args.bindrs?.length) {
+      const id = value.id ?? value.file?.id;
+      if (typeof id !== 'string' || !/^[0-9a-f]{24}$/.test(id)) throw new Error('the server returned no file id to attach its bindrs to');
+      for (const name of new Set(args.bindrs.map(b => b.trim()))) {
+        const done = await json(this.c, `${this.run(args.experimentId)}/bindrs`, 'POST', { name, item: { kind: 'file', id } });
+        if (done.bindr?.name !== name) throw new Error(`the server did not confirm bindr '${name}' on file ${args.filename}`);
+      }
+    }
+    return value;
   }
 }
 
@@ -277,6 +294,7 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
   const problems: string[] = [];
   if (items.some(i => i.fullPrefix.replace(/^\/+|\/+$/g, '').split('/').length === 2)) client.personal = await personalNamespace(client.c);
   const targets = new Map<string, { ns: string; project: string }>();
+  const wants = { bindrs: [] as string[], protection: [] as string[] };
   const needs: Array<{ name: string; key: string; folders: string[]; runName: string; metadata: boolean }> = [];
   for (const { info, validation, fullPrefix, targetProject } of items) {
     const name = `${info.project}/${info.experiment}`;
@@ -290,8 +308,13 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
     for (const segment of [...target.folders, target.name])
       if (!validName(segment)) problems.push(`${name}: '${segment}' is not a valid native folder or run name.`);
     const meta = validation.metadata ?? {};
-    if (Array.isArray(meta.bindrs) && meta.bindrs.length)
-      problems.push(`${name}: bindrs ${JSON.stringify(meta.bindrs)} need the canonical run bindr contract, which no DreamLake server has yet.`);
+    const runBindrs = Array.isArray(meta.bindrs) ? meta.bindrs : [];
+    let fileBindrs = false;
+    try { fileBindrs = storage.listFiles(info.storagePrefix).some(f => (f.bindrs ?? []).length > 0); } catch { /* reported by the file upload */ }
+    for (const b of runBindrs) if (typeof b !== 'string' || !b.trim() || b.trim().length > 120) problems.push(`${name}: bindr ${JSON.stringify(b)} is not a valid name (1-120 characters).`);
+    if (new Set(runBindrs.map((b: string) => String(b).trim())).size > 32) problems.push(`${name}: a run takes at most 32 bindrs.`);
+    if (runBindrs.length || fileBindrs) wants.bindrs.push(name);
+    if (meta.write_protected === true) wants.protection.push(name);
     if (!skipMetrics) for (const metric of info.metrics) {
       if (!isNativeMetricName(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (1-256 characters, no '/', not '.' or '..').`); continue; }
       if (storage.readMetricPoints(metric).points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
@@ -315,6 +338,15 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
       metadata: !!(meta.metadata && typeof meta.metadata === 'object' && Object.keys(meta.metadata).length) });
   }
   if (problems.length) return problems;
+  // Before any project, run or byte is written: the server must list run protection and run bindrs in its operation schema.
+  if (wants.bindrs.length || wants.protection.length) {
+    const schema = await operationSchema(client.c);
+    if (wants.protection.length && !supportsRunProtection(schema))
+      problems.push(`write_protected (${wants.protection.join(', ')}) needs a server whose native operation schema lists run protection (runs.update writeProtected); this one does not.`);
+    if (wants.bindrs.length && !supportsRunBindrs(schema))
+      problems.push(`bindrs (${wants.bindrs.join(', ')}) need a server whose native operation schema lists run bindrs (POST runs/:runId/bindrs); this one does not.`);
+    if (problems.length) return problems;
+  }
   for (const [key, t] of targets) {
     await ensureProject(client.c, t.ns, t.project);
     client.caps.set(key, (await json(client.c, `${runsBase(t.ns, t.project)}/status`)).capabilities ?? []);
@@ -329,6 +361,18 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
   }
   return problems;
 }
+
+/** The server's native-1 operation schema (`GET /native-experiments/schema?version=1`), or null when it has none. */
+async function operationSchema(c: Context): Promise<any[] | null> {
+  try {
+    const value = await json(c, '/native-experiments/schema?version=1');
+    return value.protocolVersion === 'native-1' && Array.isArray(value.operations) ? value.operations : null;
+  } catch (e) { if (has(e, 'NATIVE_HTTP_404')) return null; throw e; }
+}
+const supportsRunProtection = (ops: any[] | null) =>
+  !!ops?.some(op => op?.id === 'runs.update' && op.method === 'PATCH' && op.input?.properties?.body?.properties?.writeProtected);
+const supportsRunBindrs = (ops: any[] | null) =>
+  !!ops?.some(op => op?.method === 'POST' && typeof op.path === 'string' && /\/runs\/:runId\/bindrs$/.test(op.path));
 
 /** The upload pipeline's native target: its client, state identity and pre-write check. */
 export function nativeUploadTarget(args: ParsedArgs) {

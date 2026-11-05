@@ -372,6 +372,8 @@ export class RemoteClient {
   async uploadFile(args: {
     experimentId: string;
     filePath: string;
+    /** The local record's bindrs: the native adapter attaches them; the standalone upload never sent them. */
+    bindrs?: string[] | null;
     prefix: string;
     filename: string;
     description?: string | null;
