@@ -194,6 +194,55 @@ test('native logout follows the shared login contract and keeps other envs and t
  assert.doesNotMatch(one.out+two.out+denied.out,/secret/);
  const unknown=await f.cli(['logout','--backend','native','--env','gamma','--json']);assert.equal(unknown.code,1);assert.equal(unknown.data.error.code,'SHARED_LOGIN_UNKNOWN_ENV');});
 test('native flags that an action would ignore are refused in both modes',async t=>{const f=await fixture(t);
- for(const args of [['runs','update',...target,'--run',RUN,'--metadata','x.json','--backend','native'],['logs','append',...target,'--run',RUN,'--data','x','--level','warn','--backend','native'],['runs','list',...target,'--tags','a']]){
+ for(const args of [['runs','protect',...target,'--run',RUN,'--tags','a','--backend','native'],['folders','list',...target,'--wait','--backend','native'],['logs','append',...target,'--run',RUN,'--data','x','--level','warn','--backend','native'],['runs','list',...target,'--tags','a']]){
   const r=await f.cli([...args,'--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/_OPTION_UNSUPPORTED$/);}
  assert.equal(f.calls.length,0);});
+
+const FOLDER='d'.repeat(24),OP='e'.repeat(24),TEAM='f'.repeat(24);
+test('native protection, folders and batches send the protocol-6 bodies; folder operations are followed to a terminal state',async t=>{let polls=0;
+ const f=await fixture(t,c=>{
+  if(c.path===`${nroot}/folders/${FOLDER}/purge`)return {operationId:OP,state:'checking'};
+  if(c.path===`${nroot}/folders/${FOLDER}/protect`)return {operationId:OP,state:'applying'};
+  if(c.path===`${nroot}/folder-operations/${OP}`)return {operation:{id:OP,kind:'purge',state:++polls<2?'checking':'done',counts:{applied:2,skipped:0}}};
+  if(c.path===`${nroot}/batch/trash`)return {items:c.body.items.map((i:any)=>({...i,status:i.type==='run'?'done':'accepted',...(i.type==='folder'?{operationId:OP}:{})})),counts:{done:1,accepted:1,skipped:0}};
+  if(c.path===`${nroot}/batch/purge`)return {items:[{type:'run',id:RUN,status:'skipped',reason:'NATIVE_RUN_WRITE_PROTECTED'}],counts:{done:0,accepted:0,skipped:1}};
+  return c.path.startsWith(nroot)?{ok:true}:undefined;});
+ const meta=path.join(f.dir,'meta.json');writeFileSync(meta,'{"seed":1}');
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','create','--run-key','训练 1','--folder-path','sweep/a','--write-protected','--metadata',meta],['runs','create','--run-key','k1','--write-protected'],
+  ['runs','protect','--run',RUN],['runs','unprotect','--run',RUN],['runs','update','--run',RUN,'--metadata',meta],['runs','move','--run',RUN,'--name','r2','--folder-path','root'],['runs','purge','--run',RUN],
+  ['folders','create','--path','sweep/a'],['folders','create','--name','b','--parent',FOLDER],['folders','update','--folder',FOLDER,'--parent','root'],['folders','list','--parent',FOLDER,'--limit','200'],
+  ['folders','show','--path','sweep/a'],['folders','protect','--folder',FOLDER],['folders','purge','--folder',FOLDER,'--wait'],['batch','trash','--runs',RUN,'--folders',FOLDER]]){
+  const r=await f.cli([...args,...n]);assert.equal(r.code,0,args.join(' ')+r.out);}
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['PUT','/run-paths/sweep/a/%E8%AE%AD%E7%BB%83%201',{metadata:{seed:1},writeProtected:true}],['PUT','/runs/k1',{writeProtected:true}],
+  ['PATCH',`/runs/${RUN}`,{writeProtected:true}],['PATCH',`/runs/${RUN}`,{writeProtected:false}],['PATCH',`/runs/${RUN}`,{metadata:{seed:1}}],
+  ['PATCH',`/runs/${RUN}`,{name:'r2',folderPath:''}],['POST',`/runs/${RUN}/purge`,undefined],
+  ['POST','/folders',{path:'sweep/a'}],['POST','/folders',{name:'b',parentId:FOLDER}],['PATCH',`/folders/${FOLDER}`,{parentId:null}],['GET',`/folders?limit=200&parentId=${FOLDER}`,undefined],
+  ['GET','/by-path/sweep/a',undefined],['POST',`/folders/${FOLDER}/protect`,undefined],
+  ['POST',`/folders/${FOLDER}/purge`,undefined],['GET',`/folder-operations/${OP}`,undefined],['GET',`/folder-operations/${OP}`,undefined],
+  ['POST','/batch/trash',{items:[{type:'run',id:RUN},{type:'folder',id:FOLDER}]}]]);
+ f.calls.length=0;
+ const partial=await f.cli(['batch','purge','--runs',RUN,...n]);assert.equal(partial.code,1);assert.equal(partial.data.error.code,'NATIVE_BATCH_PARTIAL');assert.match(partial.data.error.remediation,/NATIVE_RUN_WRITE_PROTECTED/);
+ // Refused before any request: bad ids, both destinations, an empty batch, and the managed backend.
+ for(const args of [['folders','trash','--folder','x',...n],['runs','move','--run',RUN,'--folder',FOLDER,'--folder-path','a',...n],['batch','trash',...n],['folders','list',...target,'--json'],['runs','protect',...target,'--run',RUN,'--json']]){
+  const r=await f.cli(args);assert.equal(r.code,1,args.join(' '));}
+ assert.deepEqual(f.calls.map(c=>c.path),[`${nroot}/batch/purge`]);});
+test('native teams delete previews the exact team, then applies only that reviewed state',async t=>{let members=[{id:'m1'}];let deleted=0;
+ const f=await fixture(t,c=>{if(c.path!=='/graphql')return undefined;
+  if(/teamDelete/.test(c.body.query)){deleted++;return {data:{teamDelete:true}};}
+  return {data:{team:{id:TEAM,slug:'leaf',name:'Leaf',orgId:'org-1',parentId:null,myRole:'MAINTAINER',org:{slug:'lab',myRole:'OWNER'},children:[],members}}};});
+ const out=path.join(f.dir,'team-review.json');
+ const preview=await f.cli(['teams','delete','--team',TEAM,'--out',out,'--backend','native','--json']);assert.equal(preview.code,0,preview.out);
+ assert.equal(preview.data.data.review.kind,'team-delete-review-v1');assert.equal(deleted,0);
+ members=[{id:'m1'},{id:'m2'}];
+ const stale=await f.cli(['teams','delete','--team',TEAM,'--apply','--review',out,'--backend','native','--json']);assert.equal(stale.data.error.code,'NATIVE_REVIEW_CHANGED');assert.equal(deleted,0);
+ members=[{id:'m1'}];
+ const applied=await f.cli(['teams','delete','--team',TEAM,'--apply','--review',out,'--backend','native','--json']);assert.equal(applied.code,0,applied.out);assert.equal(deleted,1);
+ const managed=await f.cli(['teams','delete','--team',TEAM,'--json']);assert.equal(managed.data.error.code,'MANAGED_NATIVE_ONLY_ACTION');});
+test('device login keeps polling through vuer-auth\'s HTTP 202 pending reply (live behavior) and its RFC 400 form',async t=>{let polls=0;
+ const f=await fixture(t,c=>c.path==='/api/device/start'?{user_code:'ABCD-EFGH',verification_uri:'https://auth.example/verify',interval:1,expires_in:20}
+  :c.path==='/api/device/poll'?(++polls===1?{statusCode:202,response:{error:'authorization_pending'}}:polls===2?{statusCode:400,response:{error:'authorization_pending'}}:{access_token:'vuer-fixture-secret'})
+  :c.path==='/auth/exchange'?{dreamlake_token:'new-dreamlake-fixture-secret'}:undefined);
+ const r=await f.cli(['auth','login','--auth-url',f.url,'--json','--no-browser']);assert.equal(r.code,0,r.out+r.err);assert.equal(polls,3);
+ assert.doesNotMatch(r.out+r.err,/vuer-fixture-secret|new-dreamlake-fixture-secret/);});

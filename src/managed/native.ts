@@ -12,20 +12,24 @@ import path from 'node:path';
 import type { ParsedArgs } from '../cli/parser.js';
 import { arg, invalidResponse, ManagementError, record, required, type Context } from './client.js';
 
+const FOLDER_ACTIONS = ['list', 'show', 'create', 'update', 'trash', 'restore', 'protect', 'unprotect', 'purge', 'operation'];
 /** Commands that have a native implementation, and the actions each supports there. */
 export const nativeActions: Record<string, string[]> = {
   auth: ['status', 'login'], instance: ['show', 'capabilities', 'schema'], health: ['check'], diagnostics: ['check'],
-  runs: ['list', 'show', 'create', 'status', 'parameters', 'delete', 'archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete'],
+  runs: ['list', 'show', 'create', 'status', 'parameters', 'delete', 'archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete',
+    'protect', 'unprotect', 'move', 'purge'],
   metrics: ['list', 'read', 'append', 'stats', 'metadata'], logs: ['read', 'append'],
   files: ['list', 'inspect', 'upload', 'download', 'update', 'delete'],
   orgs: ['list', 'members', 'teams', 'create', 'update', 'delete', 'member-add', 'member-role', 'member-remove'],
-  teams: ['list', 'members'], projects: ['list', 'access'],
+  teams: ['list', 'members', 'delete'], projects: ['list', 'access'],
   credentials: ['list', 'inspect', 'create', 'rotate', 'retire'],
+  folders: FOLDER_ACTIONS, batch: ['trash', 'purge'],
 };
 /** Actions only the native backend serves; the managed and standalone backends refuse them. */
 export const nativeOnlyActions: Record<string, string[]> = {
-  runs: ['archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete'],
-  metrics: ['stats', 'metadata'], files: ['update', 'delete'],
+  runs: ['archive', 'unarchive', 'trash', 'restore', 'update', 'parameters-delete', 'protect', 'unprotect', 'move', 'purge'],
+  metrics: ['stats', 'metadata'], files: ['update', 'delete'], teams: ['delete'],
+  folders: FOLDER_ACTIONS, batch: ['trash', 'purge'],
 };
 /** Why the remaining commands have no native form; reported instead of falling back. */
 const unavailable: Record<string, string> = {
@@ -38,7 +42,7 @@ const unavailable: Record<string, string> = {
 const managedOnly = ['apply', 'review', 'idempotency_key', 'credential', 'expected_generation', 'plan_hash', 'offset',
   'remote_project', 'remote_namespace', 'connection', 'expected_revision', 'standalone', 'dash_url'];
 /** Organization commands run the same DreamLake GraphQL review/apply flow in both backends. */
-const keptOptions: Record<string, string[]> = { orgs: ['apply', 'review', 'offset'],
+const keptOptions: Record<string, string[]> = { orgs: ['apply', 'review', 'offset'], teams: ['apply', 'review'],
   credentials: ['apply', 'review', 'idempotency_key', 'credential', 'expected_generation'] };
 
 const RUN_ID = /^[0-9a-f]{24}$/;
@@ -134,9 +138,15 @@ async function sha256File(file: string) {
 }
 
 /** Options added for native mode, and the native actions that actually send them. Anything else is refused, never ignored. */
-const NATIVE_FLAGS = ['include_archived', 'level', 'start_time', 'end_time', 'search', 'order_by', 'order', 'prefix', 'tags', 'metadata'];
+const NATIVE_FLAGS = ['include_archived', 'level', 'start_time', 'end_time', 'search', 'order_by', 'order', 'prefix', 'tags', 'metadata',
+  'write_protected', 'folder', 'folder_path', 'parent', 'path', 'operation', 'wait', 'runs', 'folders'];
 const flagUse: Record<string, string[]> = {
-  'runs list': ['include_archived'], 'runs create': ['description', 'tags'], 'runs update': ['description', 'tags'],
+  'runs list': ['include_archived'], 'runs create': ['description', 'tags', 'metadata', 'write_protected', 'folder_path'],
+  'runs update': ['description', 'tags', 'metadata'], 'runs move': ['name', 'folder', 'folder_path'],
+  'folders list': ['parent'], 'folders show': ['folder', 'path'], 'folders create': ['path', 'name', 'parent'],
+  'folders update': ['folder', 'name', 'parent'], 'folders trash': ['folder', 'wait'], 'folders restore': ['folder', 'wait'],
+  'folders protect': ['folder', 'wait'], 'folders unprotect': ['folder', 'wait'], 'folders purge': ['folder', 'wait'],
+  'folders operation': ['operation', 'wait'], 'batch trash': ['runs', 'folders'], 'batch purge': ['runs', 'folders'],
   'metrics append': ['description', 'tags', 'metadata'], 'metrics metadata': ['description', 'tags', 'metadata'],
   'logs read': ['level', 'start_time', 'end_time', 'search', 'order_by', 'order'],
   'files list': ['prefix', 'tags'], 'files upload': ['prefix', 'description', 'tags', 'metadata'], 'files update': ['description', 'tags', 'metadata'],
@@ -148,13 +158,13 @@ const flagUse: Record<string, string[]> = {
  */
 export function assertFlagUse(name: string, act: string, a: ParsedArgs, native: boolean) {
   const used = flagUse[`${name} ${act}`] ?? [];
-  const given = (native ? [...NATIVE_FLAGS, 'description'] : NATIVE_FLAGS).filter(k => a[k] !== undefined && a[k] !== false);
+  // `--description` and `--name` keep their organization meaning outside the native run and folder actions.
+  const scoped = native && (name === 'runs' || name === 'folders' || name === 'batch') ? ['description', 'name'] : native ? ['description'] : [];
+  const given = [...NATIVE_FLAGS, ...scoped].filter(k => a[k] !== undefined && a[k] !== false);
   const ignored = given.find(k => !(native ? used : []).includes(k));
   if (ignored) throw nativeError(native ? 'NATIVE_OPTION_UNSUPPORTED' : 'MANAGED_OPTION_UNSUPPORTED',
     `--${ignored.replace(/_/g, '-')} is not used by ${name} ${act}${native ? ' on the native backend' : ' without --backend native'}.`,
-    name === 'runs' && act === 'update' && ignored === 'metadata'
-      ? 'Native runs accept --description and --tags; run metadata needs a backend contract that does not exist yet.'
-      : 'Remove the option; it would otherwise be ignored.');
+    'Remove the option; it would otherwise be ignored.');
 }
 
 export function assertNativeSelection(name: string, act: string, a: ParsedArgs) {
@@ -199,6 +209,34 @@ function patchOf(a: ParsedArgs, withMetadata = true) {
   if (!Object.keys(patch).length) throw nativeError('NATIVE_ARGUMENT_REQUIRED', `Give --description${withMetadata ? ', --tags or --metadata' : ' or --tags'}.`, 'Supply the fields to change.');
   return patch;
 }
+/** A native folder or run name (WP4a `validName`): Unicode, at most 255 code points, no '/', control characters, '.' or '..'. */
+export const validName = (name: string) => name.length > 0 && [...name].length <= 255 && !name.includes('/') &&
+  !/[\u0000-\u001f\u007f]/.test(name) && name !== '.' && name !== '..' && name.trim().length > 0;
+/** A folder path `a/b/c` (leading and trailing '/' ignored) as its validated segments. */
+function pathOf(value: string, flag: string) {
+  const segments = value.replace(/^\/+|\/+$/g, '').split('/');
+  if (!value.replace(/\//g, '') || !segments.every(validName))
+    throw nativeError('NATIVE_INVALID_PATH', `${flag} must be a folder path a/b/c of valid names.`, 'Names are 1-255 characters without control characters, and not "." or "..".');
+  return segments;
+}
+const folderIdOf = (value: string, flag: string) => {
+  if (!/^[0-9a-f]{24}$/.test(value)) throw nativeError('NATIVE_INVALID_FOLDER', `${flag} must be a native folder ID.`, 'Use an id from folders list or folders show.');
+  return value;
+};
+/** `runs move`: a new `--name` and/or a destination (`--folder ID`, `--folder-path a/b`, or `root` for the project root). */
+function moveOf(a: ParsedArgs) {
+  const body: Record<string, unknown> = {};
+  const name = arg(a, 'name'), folder = arg(a, 'folder'), folderPath = arg(a, 'folder_path');
+  if (name !== undefined) {
+    if (!validName(name)) throw nativeError('NATIVE_INVALID_RUN', '--name must be 1-255 characters without "/" or control characters.', 'Choose a valid run name.');
+    body.name = name;
+  }
+  if (folder !== undefined && folderPath !== undefined) throw nativeError('NATIVE_ARGUMENT_CONFLICT', 'Give --folder or --folder-path, not both.', 'Choose one destination.');
+  if (folder !== undefined) body.folderId = folder === 'root' ? null : folderIdOf(folder, '--folder');
+  if (folderPath !== undefined) body.folderPath = folderPath === 'root' ? '' : pathOf(folderPath, '--folder-path').join('/');
+  if (!Object.keys(body).length) throw nativeError('NATIVE_ARGUMENT_REQUIRED', 'Give --name, --folder or --folder-path.', 'Supply the new name or destination.');
+  return body;
+}
 function logFilters(a: ParsedArgs) {
   const q = new URLSearchParams();
   const level = arg(a, 'level');
@@ -228,6 +266,7 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     noPaging(a, 'your organizations');
     return { organizations: (await graphqlData(c, 'query MlDashNativeOrganizations { myOrganizations { id slug name description myRole } }')).myOrganizations };
   }
+  if (name === 'teams' && act === 'delete') return teamDelete(c, a);
   if (name === 'teams') {
     noPaging(a, act === 'list' ? 'your teams' : 'team members');
     if (act === 'list') return { teams: (await graphqlData(c, 'query MlDashNativeTeams { myTeams { id orgId slug name visibility myRole } }')).myTeams };
@@ -243,6 +282,8 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     return json(c, `/namespaces/${encodeURIComponent(required(a, 'namespace'))}/projects${q.size ? `?${q}` : ''}`);
   }
   if (name === 'credentials') return credentialsCommand(c, act, a, base());
+  if (name === 'folders') return foldersCommand(c, act, a, base());
+  if (name === 'batch') return batchCommand(c, act, a, base());
   if (name === 'auth') {
     const me = record(await json(c, '/auth/me'));
     return { authenticated: true, server: c.url, backend: 'native', user: me.user ?? me, credentialSource: 'DreamLake shared login' };
@@ -271,14 +312,24 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     if (act === 'trash') return json(c, `${base()}/trash${page(a, 100, RUN_ID)}`);
     if (act === 'archive' || act === 'unarchive') return json(c, run(), 'PATCH', { archived: act === 'archive' });
     if (act === 'restore') return json(c, `${run()}/restore`, 'POST');
-    if (act === 'update') return json(c, run(), 'PATCH', patchOf(a, false));
+    if (act === 'update') return json(c, run(), 'PATCH', patchOf(a));
+    // A person's protection (ml-dash `writeProtected`): set and cleared with WRITE; a workload or job session gets 403.
+    if (act === 'protect' || act === 'unprotect') return json(c, run(), 'PATCH', { writeProtected: act === 'protect' });
+    if (act === 'move') return json(c, run(), 'PATCH', moveOf(a));
+    // ADMIN, a trashed run only: accepted at once (202), the data deleted afterwards. Never restorable.
+    if (act === 'purge') return json(c, `${run()}/purge`, 'POST');
     if (act === 'parameters-delete') return json(c, `${run()}/parameters`, 'DELETE');
     if (act === 'show') return json(c, run());
     if (act === 'create') {
       const key = required(a, 'run_key');
-      if (!/^[A-Za-z0-9_-]{1,128}$/.test(key)) throw nativeError('NATIVE_INVALID_RUN_KEY', 'Run key must contain 1-128 letters, numbers, underscores or hyphens.', 'Choose a stable idempotent run key.');
-      // PUT carries the run's human metadata; repeating it with the same values changes nothing.
-      return json(c, `${base()}/runs/${encodeURIComponent(key)}`, 'PUT', describe(a, false));
+      const folders = arg(a, 'folder_path') !== undefined ? pathOf(arg(a, 'folder_path')!, '--folder-path') : null;
+      if (folders ? !validName(key) : !/^[A-Za-z0-9_-]{1,128}$/.test(key))
+        throw nativeError('NATIVE_INVALID_RUN_KEY', folders ? 'A run name in a folder is 1-255 characters without "/" or control characters, and not "." or "..".'
+          : 'Run key must contain 1-128 letters, numbers, underscores or hyphens.', 'Choose a stable idempotent run key.');
+      // PUT carries the run's human metadata, its metadata dict and a person's protection, all written with the run
+      // in one transaction; repeating it with the same values changes nothing, and it never unprotects.
+      const body = { ...describe(a), ...(a.write_protected ? { writeProtected: true } : {}) };
+      return json(c, folders ? `${base()}/run-paths/${[...folders, key].map(encodeURIComponent).join('/')}` : `${base()}/runs/${encodeURIComponent(key)}`, 'PUT', body);
     }
     if (act === 'status') return json(c, `${run()}/status`, 'POST', { status: required(a, 'status') });
     if (act === 'parameters') {
@@ -423,4 +474,154 @@ async function credentialsCommand(c: Context, act: string, a: ParsedArgs, base: 
   if (JSON.stringify(saved) !== JSON.stringify(review))
     throw nativeError('NATIVE_REVIEW_CHANGED', 'The credential, project or intent changed since the review.', 'Create and review a fresh preview; nothing was changed.');
   return json(c, `${base}/credentials`, 'POST', intent);
+}
+
+// ── folders, folder operations and batches (dreamlake-server protocol 6) ─────────
+
+const OPERATION_ID = /^[0-9a-f]{24}$/;
+const OPEN_OPERATION = ['checking', 'applying'];
+/** How long `--wait` follows an accepted folder operation before handing back its id. */
+const WAIT_MS = 10 * 60 * 1000;
+
+/** Follow a folder operation until it is `done` or `refused`, or the wait ends (then its current state is returned). */
+async function followOperation(c: Context, base: string, id: string, deadline = Date.now() + WAIT_MS) {
+  for (let delay = 250; ; delay = Math.min(delay * 2, 5000)) {
+    const value = await json(c, `${base}/folder-operations/${id}`);
+    const operation = record(value.operation);
+    if (!OPEN_OPERATION.includes(String(operation.state)) || Date.now() + delay > deadline) return value;
+    await new Promise(resolve => setTimeout(resolve, delay));
+  }
+}
+
+/**
+ * `folders list|show|create|update|trash|restore|protect|unprotect|purge|operation --backend native`: a project's
+ * native folders (servers with the run lifecycle). trash/restore/protect/unprotect/purge are accepted at once (202
+ * `{ operationId, state }`) and applied to every run below by the server; `operation --operation ID` reads its state
+ * and counts, and `--wait` follows it to `done` or `refused`. A purge (ADMIN, a trashed folder) deletes nothing until
+ * every run below was found unprotected. People only: a workload or job session is refused by the server.
+ */
+async function foldersCommand(c: Context, act: string, a: ParsedArgs, base: string): Promise<unknown> {
+  if (act === 'operation') {
+    const id = required(a, 'operation');
+    if (!OPERATION_ID.test(id)) throw nativeError('NATIVE_INVALID_OPERATION', '--operation must be a folder operation ID.', 'Use the operationId a folder change returned.');
+    return a.wait ? followOperation(c, base, id) : json(c, `${base}/folder-operations/${id}`);
+  }
+  if (act === 'list') {
+    const q = new URLSearchParams(page(a, 200, RUN_ID).slice(1));
+    if (arg(a, 'parent') !== undefined && arg(a, 'parent') !== 'root') q.set('parentId', folderIdOf(arg(a, 'parent')!, '--parent'));
+    return json(c, `${base}/folders${q.size ? `?${q}` : ''}`);
+  }
+  if (act === 'show') {
+    if (arg(a, 'folder') !== undefined && arg(a, 'path') !== undefined) throw nativeError('NATIVE_ARGUMENT_CONFLICT', 'Give --folder or --path, not both.', 'Choose one.');
+    // By path: the folder or the run there (`{ kind, folder | experiment }`).
+    if (arg(a, 'path') !== undefined) return json(c, `${base}/by-path/${pathOf(arg(a, 'path')!, '--path').map(encodeURIComponent).join('/')}`);
+    return json(c, `${base}/folders/${folderIdOf(required(a, 'folder'), '--folder')}`);
+  }
+  if (act === 'create') {
+    if (arg(a, 'path') !== undefined) {
+      if (arg(a, 'name') !== undefined || arg(a, 'parent') !== undefined) throw nativeError('NATIVE_ARGUMENT_CONFLICT', 'Give --path, or --name with an optional --parent.', 'Choose one form.');
+      return json(c, `${base}/folders`, 'POST', { path: pathOf(arg(a, 'path')!, '--path').join('/') });
+    }
+    const name = required(a, 'name');
+    if (!validName(name)) throw nativeError('NATIVE_INVALID_FOLDER', '--name must be 1-255 characters without "/" or control characters.', 'Choose a valid folder name.');
+    const parent = arg(a, 'parent');
+    return json(c, `${base}/folders`, 'POST', { name, ...(parent !== undefined && parent !== 'root' ? { parentId: folderIdOf(parent, '--parent') } : {}) });
+  }
+  const folder = folderIdOf(required(a, 'folder'), '--folder');
+  if (act === 'update') {
+    const body: Record<string, unknown> = {};
+    if (arg(a, 'name') !== undefined) {
+      if (!validName(arg(a, 'name')!)) throw nativeError('NATIVE_INVALID_FOLDER', '--name must be 1-255 characters without "/" or control characters.', 'Choose a valid folder name.');
+      body.name = arg(a, 'name');
+    }
+    if (arg(a, 'parent') !== undefined) body.parentId = arg(a, 'parent') === 'root' ? null : folderIdOf(arg(a, 'parent')!, '--parent');
+    if (!Object.keys(body).length) throw nativeError('NATIVE_ARGUMENT_REQUIRED', 'Give --name and/or --parent (a folder ID, or root).', 'Supply the new name or parent.');
+    return json(c, `${base}/folders/${folder}`, 'PATCH', body);
+  }
+  const accepted = await json(c, `${base}/folders/${folder}/${act}`, 'POST');
+  if (typeof accepted.operationId !== 'string' || !OPERATION_ID.test(accepted.operationId)) throw invalidResponse();
+  if (!a.wait) return { ...accepted, remediation: `Follow it with: folders operation --operation ${accepted.operationId} --wait` };
+  return { operationId: accepted.operationId, ...(await followOperation(c, base, accepted.operationId)) };
+}
+
+/** `--runs a,b --folders c,d`: the items of a batch, as the server takes them (at most 100). */
+function batchItems(a: ParsedArgs) {
+  const items: Array<{ type: 'run' | 'folder'; id: string }> = [];
+  for (const [type, dest] of [['run', 'runs'], ['folder', 'folders']] as const) {
+    if (arg(a, dest) === undefined) continue;
+    for (const id of tagList(arg(a, dest)!)) {
+      if (!/^[0-9a-f]{24}$/.test(id)) throw nativeError('NATIVE_INVALID_BATCH', `--${dest} takes comma-separated native ${type} IDs.`, 'Use ids from runs list or folders list.');
+      items.push({ type, id });
+    }
+  }
+  if (!items.length || items.length > 100) throw nativeError('NATIVE_INVALID_BATCH', 'A batch takes 1-100 items from --runs and --folders.', 'Split larger selections into several batches.');
+  return items;
+}
+
+/**
+ * `batch trash|purge --runs … --folders …` (ml-dash `nodes/batch-delete`): each item on its own, never one atomic
+ * batch. Runs change at once (`done`); folders are accepted operations (`accepted` with `operationId`); anything
+ * refused is `skipped` with the server's reason. Any skipped item makes the command fail after printing every receipt.
+ */
+async function batchCommand(c: Context, act: string, a: ParsedArgs, base: string): Promise<unknown> {
+  const value = await json(c, `${base}/batch/${act}`, 'POST', { items: batchItems(a) });
+  const counts = record(value.counts);
+  if (typeof counts.skipped !== 'number' || !Array.isArray(value.items)) throw invalidResponse();
+  if (counts.skipped > 0) {
+    const skipped = (value.items as any[]).filter(item => item?.status === 'skipped')
+      .map(item => `${item.type} ${item.id}: ${/^[A-Z0-9_]{1,100}$/.test(String(item.reason)) ? item.reason : 'refused'}`);
+    throw nativeError('NATIVE_BATCH_PARTIAL', `${counts.skipped} of ${value.items.length} items were skipped; the others were applied or accepted (done ${counts.done}, accepted ${counts.accepted}).`,
+      `Skipped: ${skipped.join('; ')}. Fix those items and send them again.`);
+  }
+  return value;
+}
+
+// ── team deletion (DreamLake `teamDelete`, dreamlake-server #1710) ────────────────
+
+const TEAM_DELETE_EFFECT = 'Delete this leaf team: its project grants, its references in pending invitations and its memberships are removed, and the team is kept as a tombstone whose slug stays reserved. Nothing is physically purged. Only an organization OWNER or a MAINTAINER of the team who is still an organization member may delete it; the server refuses a team with child teams, and one that still holds Vault secrets (including retired ones), active access keys, host credential bindings, a KMS boundary or migration, or a pending secret transfer.';
+
+async function teamGraphql(c: Context, query: string, variables: Record<string, unknown>) {
+  const value = await json(c, '/graphql', 'POST', { query, variables });
+  if (Array.isArray(value.errors) && value.errors.length) {
+    const supplied = value.errors[0]?.extensions?.code;
+    const code = typeof supplied === 'string' && /^[A-Z_]{2,60}$/.test(supplied) ? supplied : 'NATIVE_GRAPHQL_REJECTED';
+    // The server's precondition names what must be resolved first (child teams, Vault state); keep it.
+    if (code === 'PRECONDITION_FAILED' && typeof value.errors[0]?.message === 'string')
+      throw nativeError(code, 'DreamLake refused to delete the team.', value.errors[0].message.slice(0, 300));
+    throw nativeError(code, 'DreamLake rejected the team operation.', code === 'FORBIDDEN'
+      ? 'Only an organization owner or a maintainer of this team can delete it.' : 'Check the team ID and your organization membership; nothing was changed.');
+  }
+  return record(value.data);
+}
+
+/**
+ * `teams delete --team ID --backend native`: a preview by default (`--out` saves it), then `--apply --review <saved>`
+ * deletes exactly the reviewed team, as `orgs delete` does. The review binds the server, the actor and the team's
+ * current state, so a changed team refuses instead of applying.
+ */
+async function teamDelete(c: Context, a: ParsedArgs): Promise<unknown> {
+  const id = required(a, 'team');
+  if (!/^[0-9a-f]{24}$/.test(id)) throw nativeError('NATIVE_INVALID_TEAM', '--team must be a DreamLake team ID.', 'Use an id from teams list or orgs teams.');
+  const me = record(await json(c, '/auth/me'));
+  const actorId = record(me.user ?? me).id;
+  const found = (await teamGraphql(c, 'query MlDashNativeTeamReview($id: ID!) { team(id: $id) { id slug name orgId parentId myRole org { slug myRole } children { id } members { id } } }', { id })).team;
+  if (!found) throw nativeError('NOT_FOUND', 'Team not found.', 'Check the team ID; a deleted team is not shown.');
+  const t = record(found);
+  const team = { id: t.id, slug: t.slug, name: t.name, orgId: t.orgId, organization: t.org?.slug ?? null, parentId: t.parentId ?? null,
+    myOrganizationRole: t.org?.myRole ?? null, myTeamRole: t.myRole ?? null,
+    childTeams: Array.isArray(t.children) ? t.children.length : null, members: Array.isArray(t.members) ? t.members.length : null };
+  const review = { kind: 'team-delete-review-v1', server: c.url, actorId, team, effect: TEAM_DELETE_EFFECT };
+  if (!a.apply) {
+    const out = arg(a, 'out');
+    if (out) writeFileSync(out, JSON.stringify(review, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    return { status: 'preview', review, remediation: 'Review it, then repeat with --apply --review <saved-file>.' };
+  }
+  let saved: unknown;
+  try { saved = JSON.parse(readFileSync(required(a, 'review'), 'utf8')); }
+  catch { throw nativeError('NATIVE_INVALID_REVIEW', 'The --review file is not a saved team delete review.', 'Save a preview with --out and review it first.'); }
+  if (JSON.stringify(saved) !== JSON.stringify(review))
+    throw nativeError('NATIVE_REVIEW_CHANGED', 'The team, its members or your access changed since the review.', 'Create and review a fresh preview; nothing was changed.');
+  const result = await teamGraphql(c, 'mutation MlDashNativeTeamDelete($id: ID!) { teamDelete(id: $id) }', { id });
+  if (result.teamDelete !== true) throw invalidResponse();
+  return { status: 'deleted', team: { id: team.id, slug: team.slug, organization: team.organization } };
 }

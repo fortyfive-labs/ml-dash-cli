@@ -340,7 +340,13 @@ export interface UploadResult {
 
 /** What one experiment's upload needs from a server: the standalone RemoteClient, or the native adapter. */
 export type ExperimentUploadClient = Pick<RemoteClient,
-  "createOrUpdateExperiment" | "setParameters" | "createLogEntries" | "appendBatchToMetric" | "uploadFile">;
+  "createOrUpdateExperiment" | "setParameters" | "createLogEntries" | "appendBatchToMetric" | "uploadFile"> & {
+  /**
+   * Native only: protect a `write_protected` run after every part was written (a native protected run takes no
+   * data). The standalone server receives `writeProtected` with the create, as before.
+   */
+  protectExperiment?(id: string): Promise<void>;
+};
 
 /**
  * Where an experiment goes: `--target` acts like an scp destination directory (the
@@ -467,6 +473,16 @@ async function uploadExperiment(
         `${failedSections.join(", ")} failed: ` +
           failedSections.flatMap((s) => result.failed[s]).slice(0, 3).join("; "),
       );
+    } else if (meta.write_protected === true && client.protectExperiment) {
+      // Only a complete run is protected; a failed part leaves it writable for --resume.
+      try {
+        await client.protectExperiment(experimentId);
+        note(`  ${green("✓")} Write-protected`);
+        result.success = true;
+      } catch (e) {
+        result.success = false;
+        result.errors.push(`all data was uploaded, but write protection failed: ${(e as Error).message}`);
+      }
     } else {
       result.success = true;
     }

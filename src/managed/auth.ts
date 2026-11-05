@@ -14,18 +14,23 @@ export async function login(a: ParsedArgs): Promise<unknown> {
   const verification = new URL(text(flow.verification_uri));
   if (verification.protocol !== 'https:' && !['127.0.0.1','localhost'].includes(verification.hostname)) throw invalidResponse();
   process.stderr.write(`Authorize this login at ${verification.origin}${verification.pathname}\nCode: ${text(flow.user_code)}\n`);
-  const interval = typeof flow.interval === 'number' ? Math.max(1,Math.min(flow.interval,30)) : 5;
+  let interval = typeof flow.interval === 'number' ? Math.max(1,Math.min(flow.interval,30)) : 5;
   const until = Date.now()+Math.min(Number(flow.expires_in)||600,600)*1000;
   let access: string | undefined;
   while (Date.now()<until) {
-    // Poll replies use OAuth's HTTP400 pending envelope, not the management error contract.
+    // Poll replies use OAuth's pending envelope, not the management error contract: vuer-auth answers a pending
+    // poll with HTTP 202 `{error:"authorization_pending"}` (RFC 8628 uses 400), so a 2xx alone is not a token.
     let response: Response;
     try { response = await fetch(`${authUrl}/api/device/poll`,{method:'POST',redirect:'error',signal:AbortSignal.timeout(10000),headers:{'content-type':'application/json'},body:JSON.stringify({client_id:'dreamlake-app',device_secret_hash:hash})}); }
     catch { throw new ManagementError('MANAGED_AUTH_NETWORK','Device authorization could not be completed.','Retry login; no credential was saved.',true); }
-    const result = record(await response.json());
-    if (response.ok) { access = text(result.access_token); break; }
-    if (!['authorization_pending','slow_down'].includes(result.error)) throw new ManagementError('MANAGED_AUTH_DENIED','Device authorization was denied or expired.','Run auth login again.');
-    await new Promise(resolve=>setTimeout(resolve,interval*1000));
+    const result = record(await response.json().catch(()=>null));
+    if (result.error === 'authorization_pending' || result.error === 'slow_down') {
+      if (result.error === 'slow_down') interval = Math.min(interval+5,30);
+      await new Promise(resolve=>setTimeout(resolve,interval*1000));
+      continue;
+    }
+    if (response.status === 200 && result.error === undefined) { access = text(result.access_token); break; }
+    throw new ManagementError('MANAGED_AUTH_DENIED','Device authorization was denied or expired.','Run auth login again.');
   }
   if (!access) throw new ManagementError('MANAGED_AUTH_EXPIRED','Device authorization expired.','Run auth login again.');
   const exchanged = record(await request({...c,token:access},'/auth/exchange','POST'));

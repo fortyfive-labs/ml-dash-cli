@@ -7,9 +7,9 @@
  * own native routes. Everything uses the shared DreamLake login (managed `context`), and
  * nothing falls back to a standalone Dash server.
  *
- * Native runs live directly in a DreamLake project, so only flat run prefixes
- * (`<namespace>/<project>/<run>`) can be stored; folders, bindrs, write protection and run
- * metadata have no native contract yet and are refused before any write, never dropped.
+ * Runs keep their folders, names and metadata on servers with `run-paths`. A `write_protected`
+ * run is protected by your login after all of its data is written (a protected run takes no
+ * data). Bindrs have no committed native contract yet and are refused before any write, never dropped.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { createWriteStream, existsSync, linkSync, openAsBlob, renameSync, statSync, unlinkSync, readFileSync } from 'node:fs';
@@ -23,7 +23,7 @@ import type { ExperimentDownloadClient, RemoteExperiment } from '../commands/dow
 import { bold, cyan, green, red, yellow } from '../util/ansi.js';
 import { fnmatch, hasWildcard } from '../util/glob.js';
 import { context, ManagementError, type Context } from './client.js';
-import { call, isNativeMetricName, json, nativeError } from './native.js';
+import { call, isNativeMetricName, json, nativeError, validName } from './native.js';
 
 const RUN_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const LEVELS = ['info', 'warn', 'error', 'debug', 'fatal'];
@@ -191,9 +191,7 @@ export async function listProjectsNative(args: ParsedArgs): Promise<number> {
 
 // ── upload adapter ──────────────────────────────────────────────────────────
 
-/** A native folder or run name (WP4a `validName`): Unicode, at most 255 code points, no '/', control characters, '.' or '..'. */
-export const validName = (name: string) => name.length > 0 && [...name].length <= 255 && !name.includes('/') &&
-  !/[\u0000-\u001f\u007f]/.test(name) && name !== '.' && name !== '..' && name.trim().length > 0;
+export { validName };
 
 /** `namespace/project/folders…/run`; a legacy two-part `project/run` is in the personal namespace (the old CLI's default). */
 function parsePrefix(prefix: string, personal: string | null) {
@@ -221,7 +219,8 @@ class NativeUploadClient implements ExperimentUploadClient {
     const target = parsePrefix(args.prefix ?? '', this.personal);
     // The prefix is the run's DreamLake location (checked against --target or the declared prefix in the preflight).
     if (!target || target.name !== args.name) throw new Error(`prefix '${args.prefix}' does not name run '${args.name}'`);
-    if ((args.bindrs ?? []).length || args.writeProtected) throw new Error('bindrs and write protection have no native contract yet');
+    if ((args.bindrs ?? []).length) throw new Error('bindrs have no committed native contract yet');
+    // Protection is applied by protectExperiment once every part is written: a protected run takes no data.
     const caps = this.caps.get(`${target.ns}/${target.project}`) ?? [];
     const body: Record<string, unknown> = {};
     // A string clears or sets ('' clears); null means "not recorded" and leaves the run as it is.
@@ -234,6 +233,10 @@ class NativeUploadClient implements ExperimentUploadClient {
       : await json(this.c, `${base}/runs/${encodeURIComponent(target.name)}`, 'PUT', body);
     this.bases.set(String(value.experiment?.id), base);
     return value;
+  }
+  /** `write_protected`: a person's protection, set last (PATCH `writeProtected: true`), after all data was written. */
+  async protectExperiment(id: string): Promise<void> {
+    await json(this.c, this.run(id), 'PATCH', { writeProtected: true });
   }
   async setParameters(id: string, data: Record<string, unknown>): Promise<any> {
     return json(this.c, `${this.run(id)}/parameters`, 'POST', { data });
@@ -287,8 +290,8 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
     for (const segment of [...target.folders, target.name])
       if (!validName(segment)) problems.push(`${name}: '${segment}' is not a valid native folder or run name.`);
     const meta = validation.metadata ?? {};
-    if (Array.isArray(meta.bindrs) && meta.bindrs.length) problems.push(`${name}: bindrs ${JSON.stringify(meta.bindrs)} have no native contract yet.`);
-    if (meta.write_protected === true) problems.push(`${name}: write_protected has no native contract yet.`);
+    if (Array.isArray(meta.bindrs) && meta.bindrs.length)
+      problems.push(`${name}: bindrs ${JSON.stringify(meta.bindrs)} need the canonical run bindr contract, which no DreamLake server has yet.`);
     if (!skipMetrics) for (const metric of info.metrics) {
       if (!isNativeMetricName(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (1-256 characters, no '/', not '.' or '..').`); continue; }
       if (storage.readMetricPoints(metric).points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))

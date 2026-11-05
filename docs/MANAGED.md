@@ -66,8 +66,10 @@ not a project data ACL. Standalone instance inspection reads
 not an invented running binary version.
 
 Organization create/update actions use typed GraphQL and exact reviewed metadata.
-DreamLake organization deletion is intentionally disabled with
-`OWNERSHIP_LIFECYCLE_UNSUPPORTED`; resource/secret retention manifests are absent.
+DreamLake `orgs delete` (owner, preview then `--apply --review`) runs the canonical
+`organizationDelete`, a logical quarantine that retains records and keeps the name reserved; a
+server's `PRECONDITION_FAILED` instruction is shown as is, and an older server's
+`OWNERSHIP_LIFECYCLE_UNSUPPORTED` refusal is reported without retrying.
 Standalone `orgs delete --standalone` requires the companion server's advertised
 transactional empty-only soft-delete capability, refuses visible projects, and
 relies on the server to atomically include soft-deleted projects in its guard.
@@ -260,27 +262,32 @@ Options an action would not send are refused, in every mode.
 
 | Command | Native behavior |
 |---|---|
-| `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/…`. Native-only: `runs archive\|unarchive\|trash\|restore\|update\|parameters-delete`, `metrics stats\|metadata`, `files update\|delete`, log filters (`--level`, `--start-time`, `--end-time`, `--search`, `--order-by`, `--order`). A metric's `--description/--tags/--metadata` on `append` are stored only when the append creates it. Metric names are 1-256 characters without `/` (not `.`/`..`), Unicode and spaces included, sent percent-encoded; a metric or log append takes up to 1000 entries of any size, or more when they serialize to at most 1 MiB |
-| `upload [PATH]`, `download [PATH] -p …` | the standalone upload/download pipeline with all its options. Runs keep their folders (`<ns>/<project>/<folders…>/<run>`, from `--target`, the declared prefix or the storage path; a two-part prefix is in your personal namespace), Unicode names and run metadata on servers with `run-paths`. Before any run data is written, upload refuses nonempty bindrs, `write_protected`, invalid names and payloads the server cannot store; a missing target project is created `private` where you may. Resume state is tagged `native:<server>` |
+| `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/…`. Native-only: `runs archive\|unarchive\|trash\|restore\|purge\|update\|parameters-delete\|protect\|unprotect\|move`, `metrics stats\|metadata`, `files update\|delete`, log filters (`--level`, `--start-time`, `--end-time`, `--search`, `--order-by`, `--order`). `runs create` takes `--description`, `--tags`, `--metadata` (the run's dict), `--folder-path a/b` (then `--run-key` is the run's name, Unicode allowed) and `--write-protected`, all written with the run in one step; a repeat with the same values returns the run and never unprotects. `runs protect\|unprotect` set a person's write protection (a protected run takes no data or metadata change; archiving stays allowed); `runs update` changes `--description`, `--tags` and `--metadata`; `runs move` takes `--name` and `--folder ID`/`--folder-path a/b` (`root` for the project root); `runs purge` permanently deletes a trashed run (ADMIN). A metric's `--description/--tags/--metadata` on `append` are stored only when the append creates it. Metric names are 1-256 characters without `/` (not `.`/`..`), Unicode and spaces included, sent percent-encoded; a metric or log append takes up to 1000 entries of any size, or more when they serialize to at most 1 MiB |
+| `upload [PATH]`, `download [PATH] -p …` | the standalone upload/download pipeline with all its options. Runs keep their folders (`<ns>/<project>/<folders…>/<run>`, from `--target`, the declared prefix or the storage path; a two-part prefix is in your personal namespace), Unicode names and run metadata on servers with `run-paths`. A `write_protected` run is protected with your login after all of its parts are written (a protected run takes no data, so protecting it first would lose them); if a part fails it stays writable for `--resume`. Before any run data is written, upload refuses nonempty bindrs (no DreamLake server has a run bindr contract yet), invalid names and payloads the server cannot store; a missing target project is created `private` where you may. Resume state is tagged `native:<server>` |
 | `list [-n ns]`, `list -p ns/project[/…]` | readable projects, or runs by path. Globs work in every segment and fan out over namespaces and projects you can read only |
 | `upload\|download\|list --tracks …` | native tracks (`json`, `jsonl`, `parquet`, `mcap`); the run is found by path, never created; a path naming two runs is refused as ambiguous |
+| `folders list\|show\|create\|update` | a project's native folders (servers with the run lifecycle): `list [--parent ID]`, `show --folder ID` or `show --path a/b` (the folder or run there), `create --path a/b` (mkdir -p) or `create --name N [--parent ID]`, `update --folder ID [--name N] [--parent ID\|root]` |
+| `folders trash\|restore\|protect\|unprotect\|purge --folder ID [--wait]`, `folders operation --operation ID [--wait]` | accepted at once as one server operation applied to every run below; the reply is `{operationId, state}`. `--wait` follows it to `done` or `refused` (up to 10 minutes). A purge (ADMIN, a trashed folder) deletes nothing until every run below was found unprotected, else it ends `refused` |
+| `batch trash\|purge --runs ID,… --folders ID,…` | at most 100 items, each on its own (never one atomic batch): runs are `done` at once, folders `accepted` as operations. Any `skipped` item (with the server's reason) fails the command after the rest were applied (`NATIVE_BATCH_PARTIAL`) |
 | `create -p [ns/]project [-d]` | `POST /namespaces/:ns/projects`, always `private`; an existing readable project is success |
 | `remove -p [ns/]project [-y]` | deletes the DreamLake project and queues its native runs for permanent deletion, in one server step (`project-delete-native-cleanup`). Notes, artifacts and other filed items stay in the namespace, bindrs and grants are removed, nothing is restorable, and a project's managed Dash entry stops working through DreamLake. Confirm with the full `ns/project`; refused while a run is write-protected or a job runs, and on servers without the capability |
 | `credentials list\|inspect\|create\|rotate\|retire` | your own native workload credentials, metadata only (`native-workload-review-v1` receipts) |
 | `api --query\|--mutation [--jq]` | `<DreamLake API>/native-dash/graphql`, the same query grammar |
 | `instance show\|capabilities\|schema`, `health`, `diagnostics`, `projects access` | the project's native `/status`; `instance schema` returns the server's `native-1` operation schema where advertised |
 | `auth status\|login`, `profile`, `logout` | `/auth/me` and the DreamLake shared login contract v1 (`logout --env NAME` removes one saved environment; the standalone login is untouched) |
-| `orgs …`, `teams list\|members`, `projects list` | DreamLake GraphQL and the project catalog. `orgs delete` (owner, preview then `--apply --review`) runs DreamLake's organization deletion: a logical quarantine that retains records and keeps the name reserved, refused while work is still running |
+| `orgs …`, `teams list\|members\|delete`, `projects list` | DreamLake GraphQL and the project catalog. `orgs delete` (owner, preview then `--apply --review`) runs DreamLake's organization deletion: a logical quarantine that retains records and keeps the name reserved, refused while work is still running. `teams delete --team ID` (an organization owner or the team's maintainer; preview then `--apply --review`) deletes a leaf team: grants, invitation references and memberships are removed and the slug stays reserved; refused for a team with child teams or Vault authority |
 | `setup`, `adoption`, `connections`, `workspaces` | managed-only by design (`NATIVE_NOT_AVAILABLE`); native mode performs no migration |
 | `schema`, `version`, `update` | backend-independent |
 
-Not yet native, waiting for server contracts: run write protection on/off, bindrs, `api`
-while the run lifecycle is on, and permanent deletion after `remove` (the purge processor).
+Write protection, folder operations, batches and purges are a person's actions: the server refuses
+them for workload and job sessions. Bindrs are refused (upload) and have no command until DreamLake
+has a run bindr contract. `api` answers `503` on a server with the run lifecycle on until its
+GraphQL endpoint covers the lifecycle.
 
 To try a native command against a local server, sign in with `ml-dash auth login --dreamlake-url
 <server>` (or write `remote_url` and `dreamlake-token` under `ML_DASH_MANAGED_CONFIG_DIR`), then add
 `--backend native`. The server needs `DREAMLAKE_NATIVE_EXPERIMENTS_ENABLED=true`; folders need
-`DREAMLAKE_NATIVE_RUN_LIFECYCLE=on`.
+`DREAMLAKE_NATIVE_RUN_LIFECYCLE=on`, and folder operations `DREAMLAKE_NATIVE_FOLDER_OPS=on`.
 
 ```bash
 ml-dash runs create --namespace lab --project research --run-key trial-1 --backend native --json
@@ -288,6 +295,10 @@ ml-dash upload ./.dash --backend native
 ml-dash download ./.dash -p 'lab/research/sweep-*' --backend native
 ml-dash download --tracks lab/research/trial-1/arm/pose --format mcap --backend native
 ml-dash credentials create --namespace lab --project research --idempotency-key UUID --out review.json --backend native
+ml-dash runs create --namespace lab --project research --run-key final --folder-path sweep/a --write-protected --backend native
+ml-dash folders protect --namespace lab --project research --folder FOLDER_ID --wait --backend native
+ml-dash batch trash --namespace lab --project research --runs RUN_ID --folders FOLDER_ID --backend native
+ml-dash teams delete --team TEAM_ID --out team-review.json --backend native
 ml-dash remove -p lab/old-project --backend native
 ```
 
