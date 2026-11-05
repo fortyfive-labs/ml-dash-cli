@@ -813,7 +813,7 @@ export async function run(args: ParsedArgs): Promise<number> {
   const client: ExperimentUploadClient = nativeTarget ? nativeTarget.client : makeClient(ctx as ReturnType<typeof resolveContext>, namespace);
   if (nativeTarget) {
     // Everything the native backend cannot store is refused here, before the first write of any experiment.
-    const problems = nativeTarget.preflight(storage, valid.map(exp => ({ info: exp, validation: validations.get(`${exp.project}/${exp.experiment}`)!,
+    const problems = await nativeTarget.preflight(storage, valid.map(exp => ({ info: exp, validation: validations.get(`${exp.project}/${exp.experiment}`)!,
       ...remotePrefixFor(exp, target) })), args.skip_logs === true, args.skip_metrics === true);
     if (problems.length) {
       console.error(red(`Error: ${problems.length} experiment(s) cannot be uploaded to the native backend without losing data; nothing was uploaded.`));

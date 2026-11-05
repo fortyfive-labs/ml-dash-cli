@@ -21,6 +21,7 @@ import type { LocalStorage } from '../local/storage.js';
 import type { ExperimentInfo, ExperimentUploadClient } from '../commands/upload.js';
 import type { ExperimentDownloadClient, RemoteExperiment } from '../commands/download.js';
 import { bold, cyan, green, red, yellow } from '../util/ansi.js';
+import { fnmatch, hasWildcard } from '../util/glob.js';
 import { context, ManagementError, type Context } from './client.js';
 import { call, json, nativeError } from './native.js';
 
@@ -40,12 +41,40 @@ function nativeContext(args: ParsedArgs): Context {
   refuse(args, ['dash_url'], 'Native mode uses the DreamLake login and server; remove --dash-url.');
   return context(args);
 }
-/** `ns/project/run/topic...` → parts; the run is exactly the third segment (no folders natively). */
+/** `ns/project/<run path>[/topic…]` split into namespace, project and the remaining path segments. */
 function trackTarget(raw: string, minParts: number, usage: string) {
   const parts = raw.replace(/^\/+|\/+$/g, '').split('/');
-  if (parts.length < minParts || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', `Path must be ${usage}.`, 'Native runs are addressed as namespace/project/run-key; nested folders are not available yet.');
-  if (!RUN_KEY.test(parts[2]!)) throw nativeError('NATIVE_INVALID_RUN_KEY', `'${parts[2]}' is not a native run key.`, 'Run keys contain 1-128 letters, digits, underscores or hyphens.');
-  return { namespace: parts[0]!, project: parts[1]!, key: parts[2]!, rest: parts.slice(3).join('/') };
+  if (parts.length < minParts || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', `Path must be ${usage}.`, 'Give namespace/project, the run (with its folders) and, for track data, the topic.');
+  return { namespace: parts[0]!, project: parts[1]!, segments: parts.slice(2) };
+}
+
+/**
+ * The run a track path names, and the topic after it. With native folders every split point is
+ * looked up by path (as the old CLI tried each split); a path that names more than one run is
+ * reported as ambiguous instead of picking one. Without folders the run is the third segment.
+ */
+async function resolveTrackRun(c: Context, ns: string, project: string, segments: string[], topicRequired: boolean) {
+  const base = runsBase(ns, project);
+  const caps: unknown[] = (await json(c, `${base}/status`)).capabilities ?? [];
+  if (!caps.includes('run-paths')) {
+    if (!RUN_KEY.test(segments[0]!)) throw nativeError('NATIVE_INVALID_RUN_KEY', `'${segments[0]}' is not a native run key.`, 'Run keys contain 1-128 letters, digits, underscores or hyphens.');
+    if (!topicRequired && segments.length > 1) throw nativeError('NATIVE_INVALID_PATH', 'This server has no native folders: give namespace/project/run.', 'Pass the topic with --topic-filter.');
+    return { run: await runByKey(c, ns, project, segments[0]!), topic: segments.slice(1).join('/') };
+  }
+  const found: Array<{ run: any; topic: string; at: string }> = [];
+  const last = topicRequired ? segments.length - 1 : segments.length;
+  for (let k = topicRequired ? 1 : last; k <= last; k++) {
+    const at = segments.slice(0, k);
+    if (!at.every(validName)) continue;
+    try {
+      const value = await json(c, `${base}/by-path/${at.map(encodeURIComponent).join('/')}`);
+      if (value.kind === 'run') found.push({ run: value.experiment, topic: segments.slice(k).join('/'), at: at.join('/') });
+    } catch (e) { if (!has(e, 'NATIVE_HTTP_404') && !has(e, 'NATIVE_PATH_NOT_FOUND')) throw e; }
+  }
+  if (!found.length) throw nativeError('NATIVE_RUN_NOT_FOUND', `No run found at ${ns}/${project}/${segments.join('/')}.`, 'Check the run path (folders and name).');
+  if (found.length > 1) throw nativeError('NATIVE_PATH_AMBIGUOUS', `The path names more than one run: ${found.map(f => `${f.at} (topic ${f.topic})`).join(', ')}.`,
+    'Rename the run or folder so that the run and the topic can be told apart.');
+  return { run: found[0]!.run, topic: found[0]!.topic };
 }
 
 /**
@@ -163,38 +192,47 @@ export async function listProjectsNative(args: ParsedArgs): Promise<number> {
 
 // ── upload adapter ──────────────────────────────────────────────────────────
 
-/** A flat `<namespace>/<project>/<run>` prefix, or null when it names folders. */
-function flatPrefix(prefix: string) {
+/** A native folder or run name (WP4a `validName`): Unicode, at most 255 code points, no '/', control characters, '.' or '..'. */
+export const validName = (name: string) => name.length > 0 && [...name].length <= 255 && !name.includes('/') &&
+  !/[\u0000-\u001f\u007f]/.test(name) && name !== '.' && name !== '..' && name.trim().length > 0;
+
+/** `namespace/project/folders…/run`; a legacy two-part `project/run` is in the personal namespace (the old CLI's default). */
+function parsePrefix(prefix: string, personal: string | null) {
   const parts = prefix.replace(/^\/+|\/+$/g, '').split('/');
-  return parts.length === 3 && parts.every(Boolean) ? { ns: parts[0]!, project: parts[1]!, key: parts[2]! } : null;
+  if (parts.some(p => !p) || parts.length < 2) return null;
+  const full = parts.length === 2 ? (personal ? [personal, ...parts] : null) : parts;
+  if (!full) return null;
+  return { ns: full[0]!, project: full[1]!, folders: full.slice(2, -1), name: full[full.length - 1]! };
 }
+const segmentsPath = (segments: string[]) => segments.map(encodeURIComponent).join('/');
 
 /** RemoteClient's upload surface over native REST. Run IDs map to their project route. */
 class NativeUploadClient implements ExperimentUploadClient {
   private readonly bases = new Map<string, string>();
-  private readonly projects = new Map<string, Promise<unknown>>();
-  constructor(private readonly c: Context) {}
+  /** Capabilities per `namespace/project`, read in the preflight (after the project exists). */
+  readonly caps = new Map<string, string[]>();
+  personal: string | null = null;
+  constructor(readonly c: Context) {}
   private run(id: string) {
     const base = this.bases.get(id);
     if (!base) throw new Error(`unknown native run ${id}`);
     return `${base}/runs/${id}`;
   }
   async createOrUpdateExperiment(args: Parameters<ExperimentUploadClient['createOrUpdateExperiment']>[0]): Promise<any> {
-    const target = flatPrefix(args.prefix ?? '');
-    if (!target || target.key !== args.name || target.project !== args.project)
-      throw new Error(`prefix '${args.prefix}' is not a flat native run of project '${args.project}'`);
-    if ((args.bindrs ?? []).length || args.writeProtected || args.metadata && Object.keys(args.metadata).length)
-      throw new Error('bindrs, write protection and run metadata have no native contract');
+    const target = parsePrefix(args.prefix ?? '', this.personal);
+    // The prefix is the run's DreamLake location (checked against --target or the declared prefix in the preflight).
+    if (!target || target.name !== args.name) throw new Error(`prefix '${args.prefix}' does not name run '${args.name}'`);
+    if ((args.bindrs ?? []).length || args.writeProtected) throw new Error('bindrs and write protection have no native contract yet');
+    const caps = this.caps.get(`${target.ns}/${target.project}`) ?? [];
     const body: Record<string, unknown> = {};
     // A string clears or sets ('' clears); null means "not recorded" and leaves the run as it is.
     if (typeof args.description === 'string') body.description = args.description;
     if (Array.isArray(args.tags)) body.tags = args.tags;
+    if (args.metadata && Object.keys(args.metadata).length) body.metadata = args.metadata;
     const base = runsBase(target.ns, target.project);
-    // The old uploader created a missing project; so does this one, privately and only where allowed.
-    const key = `${target.ns}/${target.project}`;
-    if (!this.projects.has(key)) this.projects.set(key, ensureProject(this.c, target.ns, target.project));
-    try { await this.projects.get(key); } catch (e) { this.projects.delete(key); throw e; }
-    const value = await json(this.c, `${base}/runs/${encodeURIComponent(target.key)}`, 'PUT', body);
+    const value = caps.includes('run-paths')
+      ? await json(this.c, `${base}/run-paths/${segmentsPath([...target.folders, target.name])}`, 'PUT', body)
+      : await json(this.c, `${base}/runs/${encodeURIComponent(target.name)}`, 'PUT', body);
     this.bases.set(String(value.experiment?.id), base);
     return value;
   }
@@ -227,20 +265,31 @@ class NativeUploadClient implements ExperimentUploadClient {
 
 interface PreflightItem { info: ExperimentInfo; validation: { metadata?: Record<string, any> }; fullPrefix: string; targetProject: string }
 
-/** Every reason an experiment would reach native storage incompletely. Checked for all experiments before the first write. */
-function preflight(storage: LocalStorage, items: PreflightItem[], skipLogs: boolean, skipMetrics: boolean): string[] {
+/**
+ * Every reason an experiment would reach native storage incompletely, for all experiments, before
+ * any run data is written. Static checks first; then each target project is made to exist (created
+ * private where allowed, as the old uploader did) so its capabilities can be read; then folders,
+ * names and run metadata are checked against them. A refusal there can leave a new empty project.
+ */
+async function preflight(client: NativeUploadClient, storage: LocalStorage, items: PreflightItem[], skipLogs: boolean, skipMetrics: boolean): Promise<string[]> {
   const problems: string[] = [];
+  if (items.some(i => i.fullPrefix.replace(/^\/+|\/+$/g, '').split('/').length === 2)) client.personal = await personalNamespace(client.c);
+  const targets = new Map<string, { ns: string; project: string }>();
+  const needs: Array<{ name: string; key: string; folders: string[]; runName: string; metadata: boolean }> = [];
   for (const { info, validation, fullPrefix, targetProject } of items) {
     const name = `${info.project}/${info.experiment}`;
-    const target = flatPrefix(fullPrefix);
-    if (!target) { problems.push(`${name}: '${fullPrefix}' is inside folders (NATIVE_FOLDERS_PENDING); native folders are not available yet.`); continue; }
-    if (target.project !== targetProject || target.key !== info.experiment)
+    const target = parsePrefix(fullPrefix, client.personal);
+    if (!target) { problems.push(`${name}: '${fullPrefix}' is not namespace/project/[folders/]run.`); continue; }
+    // From --target or a declared prefix, the project and run must agree with it. From the storage path alone,
+    // the path is the location (its second segment is the project; deeper segments are folders).
+    const fromStorage = !info.declaredPrefix && fullPrefix === info.storagePrefix;
+    if (target.name !== info.experiment || !fromStorage && target.project !== targetProject)
       problems.push(`${name}: prefix '${fullPrefix}' does not name project '${targetProject}' and run '${info.experiment}'.`);
-    if (!RUN_KEY.test(info.experiment)) problems.push(`${name}: '${info.experiment}' is not a native run key (letters, digits, '_' or '-').`);
+    for (const segment of [...target.folders, target.name])
+      if (!validName(segment)) problems.push(`${name}: '${segment}' is not a valid native folder or run name.`);
     const meta = validation.metadata ?? {};
     if (Array.isArray(meta.bindrs) && meta.bindrs.length) problems.push(`${name}: bindrs ${JSON.stringify(meta.bindrs)} have no native contract yet.`);
     if (meta.write_protected === true) problems.push(`${name}: write_protected has no native contract yet.`);
-    if (meta.metadata && typeof meta.metadata === 'object' && Object.keys(meta.metadata).length) problems.push(`${name}: experiment metadata has no native run contract yet.`);
     if (!skipMetrics) for (const metric of info.metrics) {
       if (!METRIC.test(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (letters, digits, '.', '_' or '-').`); continue; }
       if (storage.readMetricPoints(metric).points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
@@ -258,6 +307,23 @@ function preflight(storage: LocalStorage, items: PreflightItem[], skipLogs: bool
       }
       if (bad) problems.push(`${name}: ${bad} log entr${bad === 1 ? 'y needs' : 'ies need'} a string message, an ISO timestamp and a native level.`);
     }
+    const key = `${target.ns}/${target.project}`;
+    targets.set(key, { ns: target.ns, project: target.project });
+    needs.push({ name, key, folders: target.folders, runName: target.name,
+      metadata: !!(meta.metadata && typeof meta.metadata === 'object' && Object.keys(meta.metadata).length) });
+  }
+  if (problems.length) return problems;
+  for (const [key, t] of targets) {
+    await ensureProject(client.c, t.ns, t.project);
+    client.caps.set(key, (await json(client.c, `${runsBase(t.ns, t.project)}/status`)).capabilities ?? []);
+  }
+  for (const n of needs) {
+    const caps = client.caps.get(n.key)!;
+    if (!caps.includes('run-paths')) {
+      if (n.folders.length) problems.push(`${n.name}: folders (${n.folders.join('/')}) need a server with native folders (run-paths).`);
+      else if (!RUN_KEY.test(n.runName)) problems.push(`${n.name}: the name '${n.runName}' needs a server with native folders (run-paths).`);
+    }
+    if (n.metadata && !caps.includes('run-metadata-dict') && !caps.includes('run-paths')) problems.push(`${n.name}: run metadata needs a newer server (run-metadata-dict).`);
   }
   return problems;
 }
@@ -265,7 +331,9 @@ function preflight(storage: LocalStorage, items: PreflightItem[], skipLogs: bool
 /** The upload pipeline's native target: its client, state identity and pre-write check. */
 export function nativeUploadTarget(args: ParsedArgs) {
   const c = nativeContext(args);
-  return { client: new NativeUploadClient(c), server: c.url, stateIdentity: `native:${c.url}`, preflight };
+  const client = new NativeUploadClient(c);
+  return { client, server: c.url, stateIdentity: `native:${c.url}`,
+    preflight: (storage: LocalStorage, items: PreflightItem[], skipLogs: boolean, skipMetrics: boolean) => preflight(client, storage, items, skipLogs, skipMetrics) };
 }
 
 // ── download adapter ────────────────────────────────────────────────────────
@@ -321,24 +389,37 @@ class NativeDownloadClient implements ExperimentDownloadClient {
   }
 }
 
-/** The download pipeline's native source: `-p namespace/project[/run]`, no globs (no native search yet). */
+/** A run's place under its project: its folder path and name (`path`), or its key at the root. */
+const runPath = (run: any) => String(run.path ?? run.name);
+/** `-p` beyond namespace/project: a glob over run paths, else an exact run or a folder's whole subtree. */
+function pathSelector(rest: string | undefined) {
+  if (!rest) return () => true;
+  if (hasWildcard(rest)) return (p: string) => fnmatch(p, rest);
+  return (p: string) => p === rest || p.startsWith(`${rest}/`);
+}
+function projectSelector(raw: string, what: string) {
+  const parts = raw.replace(/^\/+|\/+$/g, '').split('/');
+  const [ns, project] = parts;
+  if (!ns || !project) throw nativeError('NATIVE_INVALID_PATH', `--project must be namespace/project[/folder…], ${what}.`, 'Native runs live in a DreamLake project.');
+  if (hasWildcard(ns) || hasWildcard(project))
+    throw nativeError('NATIVE_GLOB_UNSUPPORTED', 'Globs over namespaces or projects are not available natively yet.', 'Name the namespace and project exactly; globs after them select runs.');
+  return { ns, project, rest: parts.slice(2).join('/') || undefined };
+}
+
+/** The download pipeline's native source: `-p namespace/project[/folder…|/glob]`, every page of runs. */
 export function nativeDownloadSource(args: ParsedArgs) {
-  const raw = String(args.project ?? '').replace(/^\/+|\/+$/g, '');
-  if (/[*?[\]]/.test(raw)) throw nativeError('NATIVE_GLOB_UNSUPPORTED', 'Native download does not expand project globs.', 'Pass an exact namespace/project; native search is not available yet.');
-  const [ns, project, key, extra] = raw.split('/');
-  if (!ns || !project || extra !== undefined) throw nativeError('NATIVE_INVALID_PATH', '--project must be namespace/project or namespace/project/run.', 'Native runs live directly in a DreamLake project; folders are not available yet.');
-  if (key && typeof args.experiment === 'string' && args.experiment !== key)
-    throw nativeError('NATIVE_INVALID_PATH', '--project names a different run than --experiment.', 'Give the run once.');
+  const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a run, folder or glob');
   const c = nativeContext(args);
   const base = runsBase(ns, project);
+  const selected = pathSelector(rest);
   return {
     client: new NativeDownloadClient(c, base),
     stateIdentity: `native:${c.url}`,
     async discover(experiment?: string): Promise<RemoteExperiment[]> {
-      const wanted = experiment ?? key;
-      const runs = await eachRun(c, ns, project, wanted ? run => run.name === wanted : undefined);
-      return runs.filter(run => !wanted || run.name === wanted).map(run => ({ project, experiment: run.name, experimentId: run.id, owner: ns,
-        description: run.description ?? null, tags: run.tags ?? [], metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true }));
+      const runs = (await eachRun(c, ns, project)).filter(run => selected(runPath(run)) && (experiment === undefined || run.name === experiment));
+      return runs.map(run => ({ project, experiment: run.name, experimentId: run.id, owner: ns, prefix: `${ns}/${project}/${runPath(run)}`,
+        description: run.description ?? null, tags: run.tags ?? [], metadata: run.metadata ?? null,
+        metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true }));
     },
   };
 }
@@ -354,10 +435,10 @@ export function reportNativeError(e: unknown): number {
 /** `upload --tracks FILE --remote-path ns/project/run/topic --backend native` */
 export async function uploadTrackNative(args: ParsedArgs): Promise<number> {
   const c = nativeContext(args);
-  const t = trackTarget(String(args.remote_path ?? ''), 4, "'namespace/project/run-key/topic'");
+  const t = trackTarget(String(args.remote_path ?? ''), 4, "'namespace/project/run/topic'");
   const local = String(args.tracks);
   if (!existsSync(local)) throw nativeError('NATIVE_FILE_UNREADABLE', `File not found: ${local}`, 'Choose a readable JSONL file.');
-  const run = await runByKey(c, t.namespace, t.project, t.key);
+  const { run, topic } = await resolveTrackRun(c, t.namespace, t.project, t.segments, true);
   const entries: Record<string, unknown>[] = [];
   readFileSync(local, 'utf8').split('\n').forEach((line, i) => {
     if (!line.trim()) return;
@@ -372,26 +453,26 @@ export async function uploadTrackNative(args: ParsedArgs): Promise<number> {
   });
   if (!entries.length) throw nativeError('NATIVE_TRACK_EMPTY', 'No valid entries found in the file.', 'Each JSONL line needs a numeric timestamp.');
   console.log(bold('Uploading track data (native)...'));
-  const route = `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks/${encodeURIComponent(t.rest)}/append_batch`;
+  const route = `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks/${encodeURIComponent(topic)}/append_batch`;
   let total = 0;
   for (const batch of chunks(entries, 1000)) {
     await json(c, route, 'POST', { entries: batch });
     total += batch.length;
     console.log(`  Uploaded ${total}/${entries.length} entries`);
   }
-  console.log(`\n${green('✓ Track data uploaded successfully')}\n  Total entries: ${total}\n  Topic: ${t.rest}\n  Run: ${t.namespace}/${t.project}/${t.key} (${run.id})`);
+  console.log(`\n${green('✓ Track data uploaded successfully')}\n  Total entries: ${total}\n  Topic: ${topic}\n  Run: ${t.namespace}/${t.project}/${runPath(run)} (${run.id})`);
   return 0;
 }
 
 /** `download --tracks ns/project/run/topic [--format F] [-o FILE] --backend native` */
 export async function downloadTrackNative(args: ParsedArgs): Promise<number> {
   const c = nativeContext(args);
-  const t = trackTarget(String(args.tracks), 4, "'namespace/project/run-key/topic'");
+  const t = trackTarget(String(args.tracks), 4, "'namespace/project/run/topic'");
   const format = typeof args.format === 'string' ? args.format : 'jsonl';
-  const run = await runByKey(c, t.namespace, t.project, t.key);
-  const output = path.resolve(typeof args.output === 'string' ? args.output : `${t.rest.replace(/\//g, '_')}.${format}`);
+  const { run, topic: name } = await resolveTrackRun(c, t.namespace, t.project, t.segments, true);
+  const output = path.resolve(typeof args.output === 'string' ? args.output : `${name.replace(/\//g, '_')}.${format}`);
   // A trailing '/' in the topic selects every track under it (mcap only), as the server documents.
-  const topic = encodeURIComponent(t.rest + (String(args.tracks).endsWith('/') ? '/' : ''));
+  const topic = encodeURIComponent(name + (String(args.tracks).endsWith('/') ? '/' : ''));
   const response = await call(c, `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks/${topic}/data?format=${encodeURIComponent(format)}`);
   const { bytes } = await saveResponse(response, output, true);
   console.log(`${green('✓ Track data downloaded successfully')}\n  Output: ${output}\n  Size: ${bytes} bytes\n  Format: ${format}`);
@@ -402,32 +483,29 @@ export async function downloadTrackNative(args: ParsedArgs): Promise<number> {
 export async function listTracksNative(args: ParsedArgs): Promise<number> {
   const c = nativeContext(args);
   refuse(args, ['status', 'tags', 'detailed'], 'Native track listing takes --project and --topic-filter only.');
-  const t = trackTarget(String(args.project ?? ''), 3, "'namespace/project/run-key'");
-  if (t.rest) throw nativeError('NATIVE_INVALID_PATH', 'Track listing takes namespace/project/run-key.', 'Pass the topic with --topic-filter.');
-  const run = await runByKey(c, t.namespace, t.project, t.key);
+  const t = trackTarget(String(args.project ?? ''), 3, "'namespace/project/run'");
+  const { run } = await resolveTrackRun(c, t.namespace, t.project, t.segments, false);
   const filter = typeof args.topic_filter === 'string' ? `?topic=${encodeURIComponent(args.topic_filter)}` : '';
   const { tracks } = await json(c, `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks${filter}`);
   if (!Array.isArray(tracks) || !tracks.length) { console.log(yellow('No tracks found')); return 0; }
-  console.log(bold(`\nTracks in ${t.namespace}/${t.project}/${t.key}\n`));
+  console.log(bold(`\nTracks in ${t.namespace}/${t.project}/${runPath(run)}\n`));
   for (const track of tracks) console.log(`  ${cyan(String(track.topic))}  ${track.totalEntries ?? track.count ?? 0} entries`);
   return 0;
 }
 
-/** `list -p ns/project [--status S] [--tags a,b] --backend native`: the project's native runs. */
+/** `list -p ns/project[/folder…|/glob] [--status S] [--tags a,b] --backend native`: the project's runs by path. */
 export async function listRunsNative(args: ParsedArgs): Promise<number> {
   const c = nativeContext(args);
   refuse(args, ['topic_filter', 'detailed'], 'Native run listing takes --project, --status and --tags.');
-  const raw = String(args.project ?? '');
-  if (/[*?[\]]/.test(raw)) throw nativeError('NATIVE_GLOB_UNSUPPORTED', 'Native listing does not expand globs.', 'Pass an exact namespace/project.');
-  const [ns, project, extra] = raw.replace(/^\/+|\/+$/g, '').split('/');
-  if (!ns || !project || extra !== undefined) throw nativeError('NATIVE_INVALID_PATH', '--project must be namespace/project.', 'Native runs live directly in a DreamLake project.');
+  const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a folder or glob');
+  const selected = pathSelector(rest);
   const tags = typeof args.tags === 'string' ? args.tags.split(',').map(t => t.trim()).filter(Boolean) : null;
-  const runs = (await eachRun(c, ns, project)).filter(run =>
+  const runs = (await eachRun(c, ns, project)).filter(run => selected(runPath(run)) &&
     (args.status === undefined || (args.status === 'ARCHIVED' ? !!run.archivedAt : run.status === args.status && !run.archivedAt)) &&
     (!tags || (run.tags ?? []).some((t: string) => tags.includes(t))));
   if (!runs.length) { console.log(yellow('No runs found')); return 0; }
-  console.log(bold(`\nRuns in ${ns}/${project}\n`));
-  for (const run of runs) console.log(`  ${cyan(String(run.name))}  ${run.archivedAt ? 'ARCHIVED' : run.status}  ${run.id}`);
+  console.log(bold(`\nRuns in ${ns}/${project}${rest ? `/${rest}` : ''}\n`));
+  for (const run of runs) console.log(`  ${cyan(runPath(run))}  ${run.archivedAt ? 'ARCHIVED' : run.status}  ${run.id}`);
   return 0;
 }
 
@@ -484,7 +562,9 @@ export async function removeProjectNative(args: ParsedArgs, confirm: (question: 
       `  • Its experiment runs (parameters, metrics, logs, files and tracks) are queued for permanent deletion.\n` +
       `  • Notes, artifacts, datasets and other items filed in the project are not deleted: they stay in '${ns}', no longer in this project.\n` +
       `  • The project's bindrs and everyone's access grants to it are removed.\n` +
-      `  • Experiments in a connected managed Dash workspace are not changed.\n\n` +
+      `  • If this project was set up for managed Dash Experiments, those experiments stay on the managed Dash service,\n` +
+      `    but you can no longer reach them through DreamLake: the project's managed commands (runs, metrics, logs, files,\n` +
+      `    setup and credentials without --backend native) stop working, and a new project with this name is not connected to them.\n\n` +
       `${red('This action CANNOT be undone.')}\n`);
     const answer = await confirm(`Type ${full} to confirm deletion: `);
     if (answer === null) { console.log(`\n${yellow('Deletion cancelled.')} No confirmation on stdin — pass -y to confirm non-interactively.`); return 0; }

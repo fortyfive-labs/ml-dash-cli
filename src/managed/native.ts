@@ -5,7 +5,7 @@
  * never a managed BFF or Dash proxy, and no fallback to another backend.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { createWriteStream, existsSync, linkSync, openAsBlob, readFileSync, statSync, unlinkSync } from 'node:fs';
+import { createWriteStream, existsSync, linkSync, openAsBlob, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
@@ -20,6 +20,7 @@ export const nativeActions: Record<string, string[]> = {
   files: ['list', 'inspect', 'upload', 'download', 'update', 'delete'],
   orgs: ['list', 'members', 'teams', 'create', 'update', 'delete', 'member-add', 'member-role', 'member-remove'],
   teams: ['list', 'members'], projects: ['list', 'access'],
+  credentials: ['list', 'inspect', 'create', 'rotate', 'retire'],
 };
 /** Actions only the native backend serves; the managed and standalone backends refuse them. */
 export const nativeOnlyActions: Record<string, string[]> = {
@@ -29,7 +30,6 @@ export const nativeOnlyActions: Record<string, string[]> = {
 /** Why the remaining commands have no native form; reported instead of falling back. */
 const unavailable: Record<string, string> = {
   setup: 'Native projects need no Dash setup; a DreamLake project with native Experiments is ready to use.',
-  credentials: 'Native workload credentials are a pending backend dependency; native writes use your DreamLake login.',
   adoption: 'Adoption is a managed-backend operation; native mode performs no migration.',
   connections: 'External Dash connections belong to the managed backend only.',
   workspaces: 'Dash workspace binding belongs to the managed backend only.',
@@ -38,7 +38,8 @@ const unavailable: Record<string, string> = {
 const managedOnly = ['apply', 'review', 'idempotency_key', 'credential', 'expected_generation', 'plan_hash', 'offset',
   'remote_project', 'remote_namespace', 'connection', 'expected_revision', 'standalone', 'dash_url'];
 /** Organization commands run the same DreamLake GraphQL review/apply flow in both backends. */
-const keptOptions: Record<string, string[]> = { orgs: ['apply', 'review', 'offset'] };
+const keptOptions: Record<string, string[]> = { orgs: ['apply', 'review', 'offset'],
+  credentials: ['apply', 'review', 'idempotency_key', 'credential', 'expected_generation'] };
 
 const RUN_ID = /^[0-9a-f]{24}$/;
 const FILE_ID = /^[0-9a-f]{24}$/;
@@ -229,6 +230,7 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     if (cursor !== undefined) { if (!/^[1-9]\d*$/.test(cursor)) throw nativeError('NATIVE_INVALID_CURSOR', '--cursor is the page number (1, 2, ...) of the DreamLake project catalog.', 'Pass the next page number.'); q.set('page', cursor); }
     return json(c, `/namespaces/${encodeURIComponent(required(a, 'namespace'))}/projects${q.size ? `?${q}` : ''}`);
   }
+  if (name === 'credentials') return credentialsCommand(c, act, a, base());
   if (name === 'auth') {
     const me = record(await json(c, '/auth/me'));
     return { authenticated: true, server: c.url, backend: 'native', user: me.user ?? me, credentialSource: 'DreamLake shared login' };
@@ -236,8 +238,15 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
   if (name === 'instance' || name === 'health' || name === 'diagnostics') {
     const status = await json(c, `${base()}/status`);
     if (name === 'instance' && act === 'schema') {
-      // Native Experiments publish capability names, not a machine operation schema; both are reported as such.
       const { cliInspectionSchema } = await import('../cli/schema.js');
+      if (Array.isArray(status.capabilities) && status.capabilities.includes('machine-schema')) {
+        // The server's machine contract (protocol native-1, distinct from managed protocol 1).
+        const server = await json(c, '/native-experiments/schema?version=1');
+        if (server.schemaVersion !== '1' || server.protocolVersion !== 'native-1' || !Array.isArray(server.operations) || !server.operations.length)
+          throw nativeError('NATIVE_SCHEMA_UNSUPPORTED', 'The native schema version is not one this CLI reads.', 'Use matching CLI and server versions.');
+        return { cli: await cliInspectionSchema(), server };
+      }
+      // An older server publishes capability names only; no operation schema is invented for it.
       return { cli: await cliInspectionSchema(), server: { kind: 'native-experiments-status', operationSchema: null, ...status } };
     }
     return name === 'instance' ? status : { status: status.status, backend: 'native', server: c.url, project: status };
@@ -350,4 +359,56 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     try { unlinkSync(temp); } catch { /* not created or already gone */ }
   }
   return { fileId: id, path: output, sizeBytes: bytes, checksum: meta.checksum, verified: true };
+}
+
+// ── workload credentials ────────────────────────────────────────────────────
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/**
+ * `credentials list|inspect|create|rotate|retire --backend native`: the requester's own native
+ * workload credentials (metadata only; no secret ever reaches the CLI). Changes keep the managed
+ * grammar: a preview by default (`--out` saves it), then `--apply --review <saved>` applies exactly
+ * that reviewed intent. The receipt binds server, namespace, project id and intent, and for rotate
+ * and retire the credential's current generation, so a changed target refuses instead of applying.
+ */
+async function credentialsCommand(c: Context, act: string, a: ParsedArgs, base: string): Promise<unknown> {
+  const status = await json(c, `${base}/status`);
+  if (!Array.isArray(status.capabilities) || !status.capabilities.includes('workload-credentials'))
+    throw nativeError('NATIVE_NOT_AVAILABLE', 'This DreamLake server has no native workload credentials.', 'Use a server that advertises workload-credentials.');
+  if (act === 'list') return json(c, `${base}/credentials${page(a, 100, UUID)}`);
+  const credentialId = () => {
+    const id = required(a, 'credential').toLowerCase();
+    if (!UUID.test(id)) throw nativeError('NATIVE_INVALID_CREDENTIAL', '--credential must be a credential id (UUID).', 'Use an id from credentials list.');
+    return id;
+  };
+  if (act === 'inspect') return json(c, `${base}/credentials/${credentialId()}`);
+  let intent: Record<string, unknown>;
+  let current: Record<string, unknown> | null = null;
+  if (act === 'create') {
+    const key = required(a, 'idempotency_key').toLowerCase();
+    if (!UUID.test(key)) throw nativeError('NATIVE_INVALID_INTENT', 'Credential creation requires a stable UUID --idempotency-key.', 'Create one intent UUID and reuse it across retries.');
+    intent = { operation: 'create', idempotencyKey: key, ...(arg(a, 'run') !== undefined ? { runId: runId(a) } : {}) };
+  } else {
+    const generation = required(a, 'expected_generation');
+    if (!/^[1-9]\d*$/.test(generation) || !Number.isSafeInteger(Number(generation)))
+      throw nativeError('NATIVE_INVALID_GENERATION', '--expected-generation must be a positive integer.', 'Inspect the credential for its current generation.');
+    intent = { operation: act, credentialId: credentialId(), expectedGeneration: Number(generation) };
+    const found = record((await json(c, `${base}/credentials/${intent.credentialId}`)).credential);
+    current = { generation: found.generation, active: found.active, runId: found.runId ?? null };
+  }
+  const review = { kind: 'native-workload-review-v1', server: c.url, namespace: required(a, 'namespace'), project: required(a, 'project'),
+    namespaceId: status.namespaceId, projectId: status.projectId, intent, ...(current ? { current } : {}),
+    intentHash: createHash('sha256').update(JSON.stringify(intent)).digest('hex') };
+  if (!a.apply) {
+    const out = arg(a, 'out');
+    if (out) writeFileSync(out, JSON.stringify(review, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
+    return { status: 'preview', review, remediation: 'Review it, then repeat with --apply --review <saved-file>.' };
+  }
+  let saved: unknown;
+  try { saved = JSON.parse(readFileSync(required(a, 'review'), 'utf8')); }
+  catch { throw nativeError('NATIVE_INVALID_REVIEW', 'The --review file is not a saved native credential review.', 'Save a preview with --out and review it first.'); }
+  if (JSON.stringify(saved) !== JSON.stringify(review))
+    throw nativeError('NATIVE_REVIEW_CHANGED', 'The credential, project or intent changed since the review.', 'Create and review a fresh preview; nothing was changed.');
+  return json(c, `${base}/credentials`, 'POST', intent);
 }

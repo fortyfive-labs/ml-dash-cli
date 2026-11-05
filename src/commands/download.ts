@@ -89,6 +89,8 @@ export interface RemoteExperiment {
   status: string;
   /** Native discovery lists runs only; metric and file counts are learned during the download. */
   countsUnknown?: boolean;
+  /** Native run metadata, recorded in experiment.json. */
+  metadata?: Record<string, unknown> | null;
 }
 
 function fromGraphql(data: any): RemoteExperiment {
@@ -236,7 +238,7 @@ async function downloadExperiment(
       description: exp.description,
       tags: exp.tags,
       bindrs: [],
-      metadata: null,
+      metadata: exp.metadata ?? null,
     });
 
     if (!opts.skipParams) {
