@@ -87,6 +87,8 @@ export interface RemoteExperiment {
   metricNames: string[];
   fileCount: number;
   status: string;
+  /** Native discovery lists runs only; metric and file counts are learned during the download. */
+  countsUnknown?: boolean;
 }
 
 function fromGraphql(data: any): RemoteExperiment {
@@ -192,6 +194,10 @@ interface DownloadResult {
   bytesDownloaded: number;
 }
 
+/** What one experiment's download needs from a server: the standalone RemoteClient, or the native adapter. */
+export type ExperimentDownloadClient = Pick<RemoteClient, "getParameters" | "queryLogs" | "listMetrics" | "getMetricStats" |
+  "downloadMetricChunk" | "getMetricData" | "listFiles" | "downloadFileStreaming">;
+
 interface DownloaderOptions {
   batchSize: number;
   skipLogs: boolean;
@@ -205,7 +211,7 @@ interface DownloaderOptions {
 
 async function downloadExperiment(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentDownloadClient,
   exp: RemoteExperiment,
   opts: DownloaderOptions,
 ): Promise<DownloadResult> {
@@ -348,7 +354,7 @@ async function downloadExperiment(
  */
 async function downloadMetric(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentDownloadClient,
   experimentId: string,
   prefix: string,
   metricName: string,
@@ -438,7 +444,7 @@ function normalizeFile(node: any): RemoteFile {
 
 async function downloadFiles(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentDownloadClient,
   exp: RemoteExperiment,
   prefix: string,
   result: DownloadResult,
@@ -480,7 +486,7 @@ async function downloadFiles(
 
 async function downloadSingleFile(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentDownloadClient,
   prefix: string,
   project: string,
   file: RemoteFile,
@@ -631,13 +637,17 @@ const positiveInt = (value: unknown, fallback: number): number => {
 };
 
 export async function run(args: ParsedArgs): Promise<number> {
-  if (args.backend === "native") {
-    const n = await import("../managed/native-transfer.js");
-    return n.runNativeTransfer(() => (args.tracks ? n.downloadTrackNative(args) : n.downloadNative(args)));
-  }
+  const native = args.backend === "native" ? await import("../managed/native-transfer.js") : null;
+  if (native && args.tracks) return native.runNativeTransfer(() => native.downloadTrackNative(args));
   if (args.tracks) return downloadTrack(args);
 
-  const ctx = resolveContext(args);
+  // The native backend uses the DreamLake login and its own state identity; the pipeline below is shared.
+  let nativeSource: ReturnType<NonNullable<typeof native>["nativeDownloadSource"]> | null = null;
+  if (native) {
+    try { nativeSource = native.nativeDownloadSource(args); }
+    catch (e) { return native.reportNativeError(e); }
+  }
+  const ctx = nativeSource ? { remoteUrl: nativeSource.stateIdentity, apiKey: "native" } : resolveContext(args);
   const batchSize = positiveInt(args.batch_size, 1000);
   const maxMetrics = positiveInt(args.max_concurrent_metrics, 5);
   const maxFiles = positiveInt(args.max_concurrent_files, 3);
@@ -662,16 +672,21 @@ export async function run(args: ParsedArgs): Promise<number> {
     return 1;
   }
   if (!ctx.apiKey) {
-    console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx)}`);
+    console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx as ReturnType<typeof resolveContext>)}`);
     return 1;
   }
 
   const localPath = path.resolve(String(args.path ?? "./.dash"));
-  const client = makeClient(ctx, namespace);
+  const client: ExperimentDownloadClient = nativeSource ? nativeSource.client : makeClient(ctx as ReturnType<typeof resolveContext>, namespace);
   const storage = new LocalStorage(localPath);
 
   const stateFile = path.resolve(String(args.state_file ?? ".dash-download-state.json"));
   let state = args.resume ? loadState(stateFile) : null;
+  // Completed experiments of one backend are never skipped on another (native state is tagged `native:`).
+  if (state && (nativeSource ? state.remote_url !== ctx.remoteUrl : state.remote_url.startsWith("native:"))) {
+    console.log(`${yellow("Warning:")} State file belongs to a different backend or server. Starting fresh download.`);
+    state = null;
+  }
   if (args.resume) {
     if (state) {
       console.log(cyan(`Resuming from previous download (${state.completed_experiments.length} completed)`));
@@ -691,11 +706,13 @@ export async function run(args: ParsedArgs): Promise<number> {
   console.log(bold("Discovering experiments on remote server..."));
   let experiments: RemoteExperiment[];
   try {
-    experiments = await discoverExperiments(
-      client,
-      projectFilter,
-      typeof args.experiment === "string" ? args.experiment : undefined,
-    );
+    experiments = nativeSource
+      ? await nativeSource.discover(typeof args.experiment === "string" ? args.experiment : undefined)
+      : await discoverExperiments(
+          client as RemoteClient,
+          projectFilter,
+          typeof args.experiment === "string" ? args.experiment : undefined,
+        );
   } catch (e) {
     console.error(red(`Failed to discover experiments: ${(e as Error).message}`));
     return 1;
@@ -739,9 +756,8 @@ export async function run(args: ParsedArgs): Promise<number> {
     console.log(`\n${bold("Dry run - would download:")}`);
     for (const exp of queued) {
       console.log(`  • ${exp.project}/${exp.experiment}`);
-      console.log(
-        `    Logs: unknown, Metrics: ${exp.metricNames.length}, Files: ${exp.fileCount}`,
-      );
+      console.log(exp.countsUnknown ? "    Logs: unknown, Metrics: unknown, Files: unknown"
+        : `    Logs: unknown, Metrics: ${exp.metricNames.length}, Files: ${exp.fileCount}`);
     }
     return 0;
   }

@@ -338,6 +338,23 @@ export interface UploadResult {
   bytesUploaded: number;
 }
 
+/** What one experiment's upload needs from a server: the standalone RemoteClient, or the native adapter. */
+export type ExperimentUploadClient = Pick<RemoteClient,
+  "createOrUpdateExperiment" | "setParameters" | "createLogEntries" | "appendBatchToMetric" | "uploadFile">;
+
+/**
+ * Where an experiment goes: `--target` acts like an scp destination directory (the
+ * experiment name is appended; its second segment names the project), else the prefix
+ * declared in experiment.json, else the storage location. Reading always uses storagePrefix.
+ */
+export function remotePrefixFor(info: ExperimentInfo, targetPrefix?: string): { fullPrefix: string; targetProject: string } {
+  if (targetPrefix) {
+    const parts = targetPrefix.replace(/^\/+|\/+$/g, "").split("/");
+    return { fullPrefix: `${targetPrefix.replace(/\/+$/, "")}/${info.experiment}`, targetProject: parts.length >= 2 ? parts[1] : info.project };
+  }
+  return { fullPrefix: info.declaredPrefix ?? info.storagePrefix, targetProject: info.project };
+}
+
 interface UploaderOptions {
   batchSize: number;
   skipLogs: boolean;
@@ -350,7 +367,7 @@ interface UploaderOptions {
 
 async function uploadExperiment(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentUploadClient,
   info: ExperimentInfo,
   validation: ValidationResult,
   opts: UploaderOptions,
@@ -370,21 +387,7 @@ async function uploadExperiment(
   try {
     const meta = validation.metadata ?? {};
 
-    // --target behaves like an scp destination directory: the experiment name
-    // is appended to it, and its second segment names the project.
-    let fullPrefix: string;
-    let targetProject: string;
-    if (opts.targetPrefix) {
-      fullPrefix = `${opts.targetPrefix.replace(/\/+$/, "")}/${info.experiment}`;
-      const parts = opts.targetPrefix.replace(/^\/+|\/+$/g, "").split("/");
-      targetProject = parts.length >= 2 ? parts[1] : info.project;
-    } else if (info.declaredPrefix) {
-      fullPrefix = info.declaredPrefix;
-      targetProject = info.project;
-    } else {
-      fullPrefix = info.storagePrefix;
-      targetProject = info.project;
-    }
+    const { fullPrefix, targetProject } = remotePrefixFor(info, opts.targetPrefix);
 
     note(dim("  Creating experiment..."));
     const response = await client.createOrUpdateExperiment({
@@ -478,7 +481,7 @@ async function uploadExperiment(
 
 async function uploadLogs(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentUploadClient,
   experimentId: string,
   info: ExperimentInfo,
   opts: UploaderOptions,
@@ -527,7 +530,7 @@ async function uploadLogs(
 
 async function uploadFiles(
   storage: LocalStorage,
-  client: RemoteClient,
+  client: ExperimentUploadClient,
   experimentId: string,
   info: ExperimentInfo,
   result: UploadResult,
@@ -666,13 +669,17 @@ async function uploadTrack(args: ParsedArgs): Promise<number> {
 // ── entry point ──────────────────────────────────────────────────────────────
 
 export async function run(args: ParsedArgs): Promise<number> {
-  if (args.backend === "native") {
-    const n = await import("../managed/native-transfer.js");
-    return n.runNativeTransfer(() => (args.tracks ? n.uploadTrackNative(args) : n.uploadNative(args)));
-  }
+  const native = args.backend === "native" ? await import("../managed/native-transfer.js") : null;
+  if (native && args.tracks) return native.runNativeTransfer(() => native.uploadTrackNative(args));
   if (args.tracks) return uploadTrack(args);
 
-  const ctx = resolveContext(args);
+  // The native backend uses the DreamLake login and its own state identity; the pipeline below is shared.
+  let nativeTarget: Awaited<ReturnType<NonNullable<typeof native>["nativeUploadTarget"]>> | null = null;
+  if (native) {
+    try { nativeTarget = native.nativeUploadTarget(args); }
+    catch (e) { return native.reportNativeError(e); }
+  }
+  const ctx = nativeTarget ? { remoteUrl: nativeTarget.stateIdentity, apiKey: "native" } : resolveContext(args);
   const batchSize = Number.parseInt(String(args.batch_size ?? "100"), 10);
   if (!Number.isFinite(batchSize) || batchSize <= 0) {
     console.error(`${red("Error:")} --batch-size must be a positive integer`);
@@ -685,7 +692,7 @@ export async function run(args: ParsedArgs): Promise<number> {
     return 1;
   }
   if (!ctx.apiKey) {
-    console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx)}`);
+    console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx as ReturnType<typeof resolveContext>)}`);
     return 1;
   }
 
@@ -803,7 +810,17 @@ export async function run(args: ParsedArgs): Promise<number> {
     namespace = first.replace(/^\/+/, "").split("/")[0];
   }
 
-  const client = makeClient(ctx, namespace);
+  const client: ExperimentUploadClient = nativeTarget ? nativeTarget.client : makeClient(ctx as ReturnType<typeof resolveContext>, namespace);
+  if (nativeTarget) {
+    // Everything the native backend cannot store is refused here, before the first write of any experiment.
+    const problems = nativeTarget.preflight(storage, valid.map(exp => ({ info: exp, validation: validations.get(`${exp.project}/${exp.experiment}`)!,
+      ...remotePrefixFor(exp, target) })), args.skip_logs === true, args.skip_metrics === true);
+    if (problems.length) {
+      console.error(red(`Error: ${problems.length} experiment(s) cannot be uploaded to the native backend without losing data; nothing was uploaded.`));
+      for (const problem of problems) console.error(`  ${red("✗")} ${problem}`);
+      return 1;
+    }
+  }
   const opts: UploaderOptions = {
     batchSize,
     skipLogs: args.skip_logs === true,
@@ -814,7 +831,7 @@ export async function run(args: ParsedArgs): Promise<number> {
     targetPrefix: target,
   };
 
-  console.log(`\n${bold("Uploading to:")} ${ctx.remoteUrl}`);
+  console.log(`\n${bold("Uploading to:")} ${nativeTarget ? `${nativeTarget.server} (native)` : ctx.remoteUrl}`);
   if (target) console.log(`${bold("Target prefix:")} ${target}`);
 
   const started = Date.now();

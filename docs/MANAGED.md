@@ -267,7 +267,7 @@ their preview, `--apply` and `--review` flow.
 | other `orgs` actions | the same DreamLake GraphQL operations as managed mode |
 | `logout --backend native [--env NAME]` | the DreamLake shared login contract (v1): removes one saved environment from `~/.dreamlake/auth.yml`, then re-projects or clears `tokens.json`/`config.json` only if they held it. The standalone ML-Dash login is untouched |
 | `upload --tracks FILE --remote-path ns/project/run/topic`, `download --tracks ns/project/run/topic [--format]`, `list --tracks -p ns/project/run` | native track routes. The run is found by key and never created |
-| `upload [PATH] [-t ns/project]`, `download [PATH] -p ns/project [--experiment KEY]`, `list -p ns/project` | flat local `.dash` runs (`<namespace>/<project>/<run>`) over native REST. Runs inside folders are refused with `NATIVE_FOLDERS_PENDING` |
+| `upload [PATH]`, `download [PATH] -p ns/project[/run]`, `list -p ns/project` | the same upload/download pipeline as the standalone server, with all of its options (`--target`, `--resume`, `--state-file`, `--strict`, `--batch-size`, concurrency, `--overwrite`, `--skip-*`, `--dry-run`). Only flat runs (`<namespace>/<project>/<run>`, from `--target`, the declared prefix or the storage path, in that order) can be stored. Before any write, upload refuses runs in folders (`NATIVE_FOLDERS_PENDING`), nonempty bindrs, `write_protected`, run metadata, native-invalid metric names or points, and logs without a timestamp or with a non-native level. Resume state is tagged `native:<server>` and never shared with another backend |
 
 `runs create` and `runs update` send `--description` and `--tags`. Run `--metadata` is refused until the backend offers it.
 Native-only actions: `runs archive|unarchive|trash|restore|update|parameters-delete`,
@@ -293,7 +293,7 @@ ml-dash logout --backend native --env staging
 ```
 
 A metric's `--description`, `--tags` and `--metadata` on `append` are stored only
-when the append creates the metric. Native transfer refuses `--resume`, `--state-file`, `--strict` and the concurrency options. Options a native action would ignore are refused in both modes.
+when the append creates the metric. Options a native action would ignore are refused in both modes.
 Pages return `nextCursor`; pass it to `--cursor`.
 A download is written beside the destination, verified, and only then linked into place.
 
