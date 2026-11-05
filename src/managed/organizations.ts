@@ -1,11 +1,13 @@
 import { readFileSync, writeFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import type { ParsedArgs } from '../cli/parser.js';
-import { arg, graphql, invalidResponse, ManagementError, record, request, required, type Context } from './client.js';
+import { arg, graphql, identity, invalidResponse, ManagementError, record, request, required, type Context } from './client.js';
 
 /** Typed organization CRUD. Delete relies on the companion server's transactional empty-org soft-delete guard. */
 export async function organizationMutation(c:Context,a:ParsedArgs,operation:string){
- const slug=required(a,'namespace');const actor=record((await graphql(c,'query CliOrganizationActor { me { id } }',{})).me);
+ const slug=required(a,'namespace');
+ // DreamLake's GraphQL has no `me`: its signed-in user comes from /auth/me, as every other DreamLake command reads it.
+ const actor=a.standalone?record((await graphql(c,'query CliOrganizationActor { me { id } }',{})).me):identity(await request(c,'/auth/me'));
  let current:any=null;let input:Record<string,string>|undefined;
  if(operation==='create'){
   const available=await graphql(c,'query CliOrganizationAvailable($slug:String!){isOrgSlugAvailable(slug:$slug)}',{slug});

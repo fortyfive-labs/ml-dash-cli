@@ -250,56 +250,46 @@ No CLI flag enables server fencing or bypasses these safeguards.
 
 ## Native backend (preview)
 
-`--backend native` sends a command to DreamLake-native Experiments and other
-DreamLake APIs, using the same DreamLake login. The default is unchanged
-(`managed`), and a native command never falls back to the managed or standalone
-backend. Native writes apply directly, so run-data commands refuse `--apply`,
-`--review`, `--credential` and `--idempotency-key`. Organization changes keep
-their preview, `--apply` and `--review` flow.
+`--backend native` sends a command to DreamLake-native Experiments and the canonical DreamLake APIs,
+with the shared DreamLake login. The default stays `managed` (`standalone` for the standalone
+commands), and a native command never falls back to another backend. Native run-data writes apply
+directly; organization and credential changes keep their preview, `--out`, `--apply --review` flow.
+Options an action would not send are refused, in every mode.
 
-| Command | Native source |
+### ml-dash 0.3.1 commands in native mode
+
+| Command | Native behavior |
 |---|---|
-| `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/...` |
-| `auth status`, `profile --backend native` | `/auth/me` |
-| `instance show\|capabilities\|schema`, `projects access`, `health`, `diagnostics` | the project's native `/status`. `instance schema` returns the offline CLI schema and the server's capability names with `operationSchema: null`. Native Experiments publish no operation schema yet, so this is **not** schema parity with managed mode |
-| `projects list` | `/namespaces/:ns/projects` (readable projects only; `--cursor` is the page number) |
-| `orgs list`, `teams list\|members` | DreamLake GraphQL `myOrganizations`, `myTeams`, `teamMembers` (unpaginated) |
-| other `orgs` actions | the same DreamLake GraphQL operations as managed mode |
-| `logout --backend native [--env NAME]` | the DreamLake shared login contract (v1): removes one saved environment from `~/.dreamlake/auth.yml`, then re-projects or clears `tokens.json`/`config.json` only if they held it. The standalone ML-Dash login is untouched |
-| `upload --tracks FILE --remote-path ns/project/<run path>/topic`, `download --tracks ns/project/<run path>/topic [--format]`, `list --tracks -p ns/project/<run path>` | native track routes. The run is found by path (every split is looked up; a path naming two runs is refused as ambiguous), and never created |
-| `create -p [namespace/]project [-d TEXT]`, `list [-n namespace]` | canonical DreamLake projects: `POST /namespaces/:ns/projects` (always `private`) and the readable-project catalog. An existing project is success, as before; the namespace defaults to your personal one. Namespaces are never created, and a project you cannot see is never taken over |
-| `credentials list\|inspect\|create\|rotate\|retire` | your own native workload credentials (metadata only; no secret is shown or stored). Changes keep the preview, `--out`, `--apply --review` flow with a `native-workload-review-v1` receipt bound to server, project, intent and current generation; `create` needs a UUID `--idempotency-key` and optionally `--run` |
-| `api --query\|--mutation [--jq]` | `<DreamLake API>/native-dash/graphql` (ml-dash's GraphQL schema over native experiments) with the DreamLake login; same query grammar |
-| `remove -p [namespace/]project [-y]` | deletes the DreamLake project and queues its experiment runs for permanent deletion, in one server step. Notes, artifacts and other filed items stay in the namespace (unfiled), bindrs and access grants are removed, and the project cannot be restored. Confirm by typing the full `namespace/project` (or `-y`). It refuses while a run is write-protected or a job is running, and refuses on servers that cannot delete the experiment data together with the project |
-| `upload [PATH]`, `download [PATH] -p ns/project[/folder…\|/glob]`, `list -p ns/project[/folder…\|/glob]` | the same upload/download pipeline as the standalone server, with all of its options. Runs keep their folders (`<namespace>/<project>/<folders…>/<run>`, from `--target`, the declared prefix or the storage path; a two-part `project/run` prefix is in your personal namespace), Unicode names and run metadata on servers with native folders (`run-paths`). Before any run data is written, upload refuses nonempty bindrs, `write_protected`, invalid names, native-invalid metric or log payloads, and folders or names the server cannot store. Resume state is tagged `native:<server>`. A glob after the project selects runs by path; globs in the namespace or project fan out over the namespaces and projects you can read (your personal namespace and organizations; readable projects only) |
+| `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/…`. Native-only: `runs archive\|unarchive\|trash\|restore\|update\|parameters-delete`, `metrics stats\|metadata`, `files update\|delete`, log filters (`--level`, `--start-time`, `--end-time`, `--search`, `--order-by`, `--order`). A metric's `--description/--tags/--metadata` on `append` are stored only when the append creates it |
+| `upload [PATH]`, `download [PATH] -p …` | the standalone upload/download pipeline with all its options. Runs keep their folders (`<ns>/<project>/<folders…>/<run>`, from `--target`, the declared prefix or the storage path; a two-part prefix is in your personal namespace), Unicode names and run metadata on servers with `run-paths`. Before any run data is written, upload refuses nonempty bindrs, `write_protected`, invalid names and payloads the server cannot store; a missing target project is created `private` where you may. Resume state is tagged `native:<server>` |
+| `list [-n ns]`, `list -p ns/project[/…]` | readable projects, or runs by path. Globs work in every segment and fan out over namespaces and projects you can read only |
+| `upload\|download\|list --tracks …` | native tracks (`json`, `jsonl`, `parquet`, `mcap`); the run is found by path, never created; a path naming two runs is refused as ambiguous |
+| `create -p [ns/]project [-d]` | `POST /namespaces/:ns/projects`, always `private`; an existing readable project is success |
+| `remove -p [ns/]project [-y]` | deletes the DreamLake project and queues its native runs for permanent deletion, in one server step (`project-delete-native-cleanup`). Notes, artifacts and other filed items stay in the namespace, bindrs and grants are removed, nothing is restorable, and a project's managed Dash entry stops working through DreamLake. Confirm with the full `ns/project`; refused while a run is write-protected or a job runs, and on servers without the capability |
+| `credentials list\|inspect\|create\|rotate\|retire` | your own native workload credentials, metadata only (`native-workload-review-v1` receipts) |
+| `api --query\|--mutation [--jq]` | `<DreamLake API>/native-dash/graphql`, the same query grammar |
+| `instance show\|capabilities\|schema`, `health`, `diagnostics`, `projects access` | the project's native `/status`; `instance schema` returns the server's `native-1` operation schema where advertised |
+| `auth status\|login`, `profile`, `logout` | `/auth/me` and the DreamLake shared login contract v1 (`logout --env NAME` removes one saved environment; the standalone login is untouched) |
+| `orgs …`, `teams list\|members`, `projects list` | DreamLake GraphQL and the project catalog; `orgs delete` stays refused, as in managed mode |
+| `setup`, `adoption`, `connections`, `workspaces` | managed-only by design (`NATIVE_NOT_AVAILABLE`); native mode performs no migration |
+| `schema`, `version`, `update` | backend-independent |
 
-`runs create` and `runs update` send `--description` and `--tags`. Run `--metadata` is refused until the backend offers it.
-Native-only actions: `runs archive|unarchive|trash|restore|update|parameters-delete`,
-`metrics stats|metadata` and `files update|delete`. `logs read` accepts `--level`,
-`--start-time`, `--end-time`, `--search`, `--order-by` and `--order`.
-`setup`, `credentials`, `adoption`, `workspaces` and `connections` have no native
-form and fail with `NATIVE_NOT_AVAILABLE`. Adoption stays managed-only, and native
-mode performs no migration.
+Not yet native, waiting for server contracts: run write protection on/off, bindrs, `api`
+while the run lifecycle is on, and permanent deletion after `remove` (the purge processor).
+
+To try a native command against a local server, sign in with `ml-dash auth login --dreamlake-url
+<server>` (or write `remote_url` and `dreamlake-token` under `ML_DASH_MANAGED_CONFIG_DIR`), then add
+`--backend native`. The server needs `DREAMLAKE_NATIVE_EXPERIMENTS_ENABLED=true`; folders need
+`DREAMLAKE_NATIVE_RUN_LIFECYCLE=on`.
 
 ```bash
 ml-dash runs create --namespace lab --project research --run-key trial-1 --backend native --json
-ml-dash metrics append --namespace lab --project research --run RUN_ID --metric loss --data points.json --description train-loss --backend native
-ml-dash metrics read --namespace lab --project research --run RUN_ID --metric loss --limit 1000 --backend native
-ml-dash logs read --namespace lab --project research --run RUN_ID --level warn,error --backend native
-ml-dash files download --namespace lab --project research --run RUN_ID --file FILE_ID --out model.pt --backend native
-ml-dash runs archive --namespace lab --project research --run RUN_ID --backend native
-ml-dash projects list --namespace lab --backend native --json
-ml-dash teams list --backend native --json
-ml-dash upload --tracks pose.jsonl --remote-path lab/research/trial-1/arm/pose --backend native
+ml-dash upload ./.dash --backend native
+ml-dash download ./.dash -p 'lab/research/sweep-*' --backend native
 ml-dash download --tracks lab/research/trial-1/arm/pose --format mcap --backend native
-ml-dash download ./.dash -p lab/research --backend native
-ml-dash logout --backend native --env staging
+ml-dash credentials create --namespace lab --project research --idempotency-key UUID --out review.json --backend native
+ml-dash remove -p lab/old-project --backend native
 ```
-
-A metric's `--description`, `--tags` and `--metadata` on `append` are stored only
-when the append creates the metric. Options a native action would ignore are refused in both modes.
-Pages return `nextCursor`; pass it to `--cursor`.
-A download is written beside the destination, verified, and only then linked into place.
 
 ## Output and backend mapping
 
