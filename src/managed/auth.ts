@@ -30,17 +30,16 @@ export async function login(a: ParsedArgs): Promise<unknown> {
   if (!access) throw new ManagementError('MANAGED_AUTH_EXPIRED','Device authorization expired.','Run auth login again.');
   const exchanged = record(await request({...c,token:access},'/auth/exchange','POST'));
   const token = text(exchanged.dreamlake_token);
-  identity(await request({...c,token},'/auth/me'));
-  mkdirSync(c.dir,{recursive:true,mode:0o700});
-  // Credentials are written only after exchange and live validation; never returned.
-  let previous: Record<string,unknown> = {};
-  try { previous=record(JSON.parse(readFileSync(path.join(c.dir,'config.json'),'utf8'))); } catch { /* No prior config. */ }
-  for (const [name,value] of [['tokens.json',{'dreamlake-token':token}],['config.json',{...previous,remote_url:c.url}]] as const) {
-    const file=path.join(c.dir,name); const temp=`${file}.${process.pid}.tmp`;
-    writeFileSync(temp,JSON.stringify(value)+'\n',{mode:0o600}); chmodSync(temp,0o600); renameSync(temp,file);
-  }
+  const me = record(await request({...c,token},'/auth/me'));
+  identity(me);
+  // Credentials are written only after exchange and live validation; never returned. The shared
+  // login contract saves the environment in auth.yml and projects it, as `dreamlake login` does.
+  const { envNameFor, saveLogin } = await import('./shared-login.js');
+  const env = envNameFor(c.dir, c.url, arg(a,'env'));
+  try { saveLogin(c.dir, env, { server: c.url, auth: authUrl, namespace: typeof me.namespace?.slug === 'string' ? me.namespace.slug : '', token }); }
+  catch (e) { if ((e as any)?.code === 'SHARED_LOGIN_ENV_CONFLICT') throw new ManagementError('SHARED_LOGIN_ENV_CONFLICT', (e as Error).message, 'Pass --env <name> for this server.'); throw e; }
   access='';
-  return {authenticated:true,server:c.url,credentialSource:'DreamLake shared login',scopedCredentialsPersisted:false};
+  return {authenticated:true,server:c.url,environment:env,credentialSource:'DreamLake shared login',scopedCredentialsPersisted:false};
 }
 
 /** Advanced standalone login has a separate client ID, token exchange and store. */

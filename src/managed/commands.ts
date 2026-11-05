@@ -9,7 +9,7 @@ import { adoptionCommand } from './adoption.js';
 import { connectionCommand } from './connections.js';
 import { login, standaloneLogin } from './auth.js';
 import { organizationInspection, organizationPaging, allOrganizationMembers } from './organizationInspection.js';
-import { assertNativeSelection, nativeCommand, nativeOnlyActions, sharedOrganizationAction } from './native.js';
+import { assertFlagUse, assertNativeSelection, nativeCommand, nativeOnlyActions, sharedOrganizationAction } from './native.js';
 
 const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams'] as const;
 export const managementActions: Record<string,string[]> = {
@@ -35,6 +35,7 @@ export function managementCommand(name: typeof names[number]) {
   {flags:['--connection'],dest:'connection',help:'Operator-approved external connection alias; never a URL'},
   {flags:['--remote-namespace'],dest:'remote_namespace',help:'Explicit verified external namespace ID or unique slug for preview'},
   {flags:['--dreamlake-url'],dest:'dreamlake_url',help:'DreamLake server matching the shared login'},
+  {flags:['--env'],dest:'env',help:'DreamLake environment name a login saves under (auth login; default: built-in or matching server, else default)'},
   {flags:['--auth-url'],dest:'auth_url',help:'Vuer device authorization server (auth login only)'},
   {flags:['-n','--namespace'],dest:'namespace',help:'Explicit DreamLake organization slug'},
   {flags:['-p','--project'],dest:'project',help:'Explicit DreamLake project slug or ID'},
@@ -129,6 +130,7 @@ export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
    emit(a,safe(value,[native.token||'']));return 0;
   }
   if(arg(a,'backend')==='native')assertNativeSelection(name,act,a);
+  else assertFlagUse(name,act,a,false);
   let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
   if(name==='orgs'&&['create','update','delete'].includes(act)){result=await organizationMutation(c,a,act);emit(a,safe(result,[c.token||'']));return 0;}
   if(a.standalone&&!(name==='auth'&&act==='login')){result=await standaloneCommand(name,act,c,a);emit(a,safe(result,[c.token||'']));return 0;}

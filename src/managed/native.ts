@@ -45,7 +45,7 @@ const FILE_ID = /^[0-9a-f]{24}$/;
 const METRIC = /^[A-Za-z0-9_.-]{1,128}$/;
 const RESPONSE_LIMIT = 12 * 1024 * 1024;
 
-function nativeError(code: string, message: string, remediation: string, retryable = false) {
+export function nativeError(code: string, message: string, remediation: string, retryable = false) {
   return new ManagementError(code, message, remediation, retryable);
 }
 function runId(a: ParsedArgs) {
@@ -82,7 +82,7 @@ function page(a: ParsedArgs, max: number, cursor: RegExp) {
 }
 
 /** One request to the DreamLake API origin. Redirects are refused, so the bearer never leaves it. */
-async function call(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Response> {
+export async function call(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Response> {
   let response: Response;
   const timeout = form ? 30 * 60 * 1000 : 30000;
   try {
@@ -104,7 +104,7 @@ async function call(c: Context, route: string, method = 'GET', body?: unknown, f
   }
   return response;
 }
-async function json(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Record<string, any>> {
+export async function json(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Record<string, any>> {
   const response = await call(c, route, method, body, form);
   try {
     if (Number(response.headers.get('content-length')) > RESPONSE_LIMIT) throw invalidResponse();
@@ -120,6 +120,30 @@ async function sha256File(file: string) {
   return hash.digest('hex');
 }
 
+/** Options added for native mode, and the native actions that actually send them. Anything else is refused, never ignored. */
+const NATIVE_FLAGS = ['include_archived', 'level', 'start_time', 'end_time', 'search', 'order_by', 'order', 'prefix', 'tags', 'metadata'];
+const flagUse: Record<string, string[]> = {
+  'runs list': ['include_archived'], 'runs create': ['description', 'tags'], 'runs update': ['description', 'tags'],
+  'metrics append': ['description', 'tags', 'metadata'], 'metrics metadata': ['description', 'tags', 'metadata'],
+  'logs read': ['level', 'start_time', 'end_time', 'search', 'order_by', 'order'],
+  'files list': ['prefix', 'tags'], 'files upload': ['prefix', 'description', 'tags', 'metadata'], 'files update': ['description', 'tags', 'metadata'],
+  'orgs create': ['description'], 'orgs update': ['description'],
+};
+/**
+ * Refuse a supplied option the selected action would not send. `--description` keeps its
+ * pre-existing managed meaning (organization description) outside native mode.
+ */
+export function assertFlagUse(name: string, act: string, a: ParsedArgs, native: boolean) {
+  const used = flagUse[`${name} ${act}`] ?? [];
+  const given = (native ? [...NATIVE_FLAGS, 'description'] : NATIVE_FLAGS).filter(k => a[k] !== undefined && a[k] !== false);
+  const ignored = given.find(k => !(native ? used : []).includes(k));
+  if (ignored) throw nativeError(native ? 'NATIVE_OPTION_UNSUPPORTED' : 'MANAGED_OPTION_UNSUPPORTED',
+    `--${ignored.replace(/_/g, '-')} is not used by ${name} ${act}${native ? ' on the native backend' : ' without --backend native'}.`,
+    name === 'runs' && act === 'update' && ignored === 'metadata'
+      ? 'Native runs accept --description and --tags; run metadata needs a backend contract that does not exist yet.'
+      : 'Remove the option; it would otherwise be ignored.');
+}
+
 export function assertNativeSelection(name: string, act: string, a: ParsedArgs) {
   const reason = unavailable[name];
   if (reason || !nativeActions[name]?.includes(act))
@@ -127,6 +151,7 @@ export function assertNativeSelection(name: string, act: string, a: ParsedArgs) 
   const bad = managedOnly.filter(k => a[k] !== undefined && a[k] !== false && !keptOptions[name]?.includes(k));
   if (bad.length) throw nativeError('NATIVE_OPTION_UNSUPPORTED', `--${bad[0]!.replace(/_/g, '-')} is a managed-backend option.`,
     'Native writes apply directly with your DreamLake login; remove the managed review, credential or paging options.');
+  assertFlagUse(name, act, a, true);
 }
 /** The organization actions native mode serves through the shared managed GraphQL code (everything but list). */
 export const sharedOrganizationAction = (name: string, act: string) => name === 'orgs' && act !== 'list';
@@ -231,7 +256,8 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     if (act === 'create') {
       const key = required(a, 'run_key');
       if (!/^[A-Za-z0-9_-]{1,128}$/.test(key)) throw nativeError('NATIVE_INVALID_RUN_KEY', 'Run key must contain 1-128 letters, numbers, underscores or hyphens.', 'Choose a stable idempotent run key.');
-      return json(c, `${base()}/runs/${encodeURIComponent(key)}`, 'PUT', {});
+      // PUT carries the run's human metadata; repeating it with the same values changes nothing.
+      return json(c, `${base()}/runs/${encodeURIComponent(key)}`, 'PUT', describe(a, false));
     }
     if (act === 'status') return json(c, `${run()}/status`, 'POST', { status: required(a, 'status') });
     if (act === 'parameters') {

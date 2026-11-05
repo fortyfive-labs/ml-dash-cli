@@ -56,6 +56,7 @@ Examples:
     { flags: ["-f", "--format"], dest: "format", metavar: "FORMAT", choices: ["json", "jsonl", "parquet", "mcap"], help: "Track export format (default: jsonl)" },
     { flags: ["-o", "--output"], dest: "output", metavar: "FILE", help: "Output file path (default: auto-generated from topic)" },
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (defaults to config or https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: DreamLake-native Experiments with the DreamLake login" },
     { flags: ["-p", "--pref", "--prefix", "--proj", "--project"], dest: "project", metavar: "PROJECT", help: "Filter experiments by project or pattern (supports glob: 'tut*', 'tom*/tutorials/*')" },
     { flags: ["--experiment"], dest: "experiment", metavar: "NAME", help: "Download specific experiment (requires --project)" },
     { flags: ["--skip-logs"], dest: "skip_logs", boolean: true, help: "Don't download logs" },
@@ -630,6 +631,10 @@ const positiveInt = (value: unknown, fallback: number): number => {
 };
 
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    const n = await import("../managed/native-transfer.js");
+    return n.runNativeTransfer(() => (args.tracks ? n.downloadTrackNative(args) : n.downloadNative(args)));
+  }
   if (args.tracks) return downloadTrack(args);
 
   const ctx = resolveContext(args);

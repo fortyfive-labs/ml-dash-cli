@@ -261,11 +261,15 @@ their preview, `--apply` and `--review` flow.
 |---|---|
 | `runs`, `metrics`, `logs`, `files` | `/native-experiments/ns/:ns/projects/:project/...` |
 | `auth status`, `profile --backend native` | `/auth/me` |
-| `instance show\|capabilities\|schema`, `projects access`, `health`, `diagnostics` | the project's native `/status`; `instance schema` adds the offline CLI schema and reports `operationSchema: null` |
+| `instance show\|capabilities\|schema`, `projects access`, `health`, `diagnostics` | the project's native `/status`. `instance schema` returns the offline CLI schema and the server's capability names with `operationSchema: null`. Native Experiments publish no operation schema yet, so this is **not** schema parity with managed mode |
 | `projects list` | `/namespaces/:ns/projects` (readable projects only; `--cursor` is the page number) |
 | `orgs list`, `teams list\|members` | DreamLake GraphQL `myOrganizations`, `myTeams`, `teamMembers` (unpaginated) |
 | other `orgs` actions | the same DreamLake GraphQL operations as managed mode |
+| `logout --backend native [--env NAME]` | the DreamLake shared login contract (v1): removes one saved environment from `~/.dreamlake/auth.yml`, then re-projects or clears `tokens.json`/`config.json` only if they held it. The standalone ML-Dash login is untouched |
+| `upload --tracks FILE --remote-path ns/project/run/topic`, `download --tracks ns/project/run/topic [--format]`, `list --tracks -p ns/project/run` | native track routes. The run is found by key and never created |
+| `upload [PATH] [-t ns/project]`, `download [PATH] -p ns/project [--experiment KEY]`, `list -p ns/project` | flat local `.dash` runs (`<namespace>/<project>/<run>`) over native REST. Runs inside folders are refused with `NATIVE_FOLDERS_PENDING` |
 
+`runs create` and `runs update` send `--description` and `--tags`. Run `--metadata` is refused until the backend offers it.
 Native-only actions: `runs archive|unarchive|trash|restore|update|parameters-delete`,
 `metrics stats|metadata` and `files update|delete`. `logs read` accepts `--level`,
 `--start-time`, `--end-time`, `--search`, `--order-by` and `--order`.
@@ -282,10 +286,15 @@ ml-dash files download --namespace lab --project research --run RUN_ID --file FI
 ml-dash runs archive --namespace lab --project research --run RUN_ID --backend native
 ml-dash projects list --namespace lab --backend native --json
 ml-dash teams list --backend native --json
+ml-dash upload --tracks pose.jsonl --remote-path lab/research/trial-1/arm/pose --backend native
+ml-dash download --tracks lab/research/trial-1/arm/pose --format mcap --backend native
+ml-dash download ./.dash -p lab/research --backend native
+ml-dash logout --backend native --env staging
 ```
 
 A metric's `--description`, `--tags` and `--metadata` on `append` are stored only
-when the append creates the metric. Pages return `nextCursor`; pass it to `--cursor`.
+when the append creates the metric. Native transfer refuses `--resume`, `--state-file`, `--strict` and the concurrency options. Options a native action would ignore are refused in both modes.
+Pages return `nextCursor`; pass it to `--cursor`.
 A download is written beside the destination, verified, and only then linked into place.
 
 ## Output and backend mapping

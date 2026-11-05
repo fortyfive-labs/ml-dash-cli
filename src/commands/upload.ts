@@ -53,6 +53,7 @@ Examples:
   ],
   options: [
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (defaults to config or https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: DreamLake-native Experiments with the DreamLake login" },
     { flags: ["--tracks"], dest: "tracks", metavar: "FILE", help: "Upload track data file (e.g., robot_position.jsonl). Requires --remote-path." },
     { flags: ["--remote-path"], dest: "remote_path", metavar: "PATH", help: "Remote path for track (e.g., 'namespace/project/exp/robot/position')" },
     { flags: ["-p", "--pref", "--prefix", "--proj", "--project"], dest: "project", metavar: "PROJECT", help: "Filter experiments by prefix pattern (supports glob: 'tom/*/exp*', 'alice/project-?/baseline')" },
@@ -665,6 +666,10 @@ async function uploadTrack(args: ParsedArgs): Promise<number> {
 // ── entry point ──────────────────────────────────────────────────────────────
 
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    const n = await import("../managed/native-transfer.js");
+    return n.runNativeTransfer(() => (args.tracks ? n.uploadTrackNative(args) : n.uploadNative(args)));
+  }
   if (args.tracks) return uploadTrack(args);
 
   const ctx = resolveContext(args);

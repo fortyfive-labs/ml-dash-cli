@@ -164,3 +164,20 @@ test('native files upload integrity fields before the file and download only che
  const body=String(f.calls[0].body);const order=['name="sizeBytes"','name="checksum"','name="file"'].map(k=>body.indexOf(k));assert.ok(order.every((v,i)=>v>=0&&(i===0||v>order[i-1])),body);assert.match(body,new RegExp(hash(Buffer.from([1,2,3]))));
  const out=path.join(f.dir,'got.bin');const d=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(d.code,0,d.out);assert.equal(readFileSync(out,'utf8'),served);
  const again=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(again.data.error.code,'NATIVE_DESTINATION_EXISTS');});
+test('native logout follows the shared login contract and keeps other envs and the standalone login',async t=>{const f=await fixture(t);
+ const {stringify}=await import('yaml');
+ writeFileSync(path.join(f.config,'auth.yml'),stringify({current:'beta',envs:{alpha:{server:'https://alpha.example',namespace:'a',token:'alpha-secret'},beta:{server:f.url,namespace:'b',token:'user-secret-never-print'}}}));
+ mkdirSync(path.join(f.dir,'standalone'),{recursive:true});writeFileSync(path.join(f.dir,'standalone','token'),'standalone-kept');
+ const one=await f.cli(['logout','--backend','native','--env','alpha','--json']);assert.equal(one.code,0,one.out);assert.equal(one.data.data.projection,'unchanged');
+ assert.equal(JSON.parse(readFileSync(path.join(f.config,'tokens.json'),'utf8'))['dreamlake-token'],'user-secret-never-print');
+ const two=await f.cli(['logout','--backend','native','--json']);assert.equal(two.data.data.projection,'cleared');
+ assert.equal(existsSync(path.join(f.config,'auth.yml')),false);assert.equal(JSON.parse(readFileSync(path.join(f.config,'tokens.json'),'utf8'))['dreamlake-token'],undefined);
+ assert.equal(JSON.parse(readFileSync(path.join(f.config,'config.json'),'utf8')).bss_url,'preserve-bss');
+ const denied=await f.cli(['auth','status','--backend','native','--json']);assert.equal(denied.data.error.code,'MANAGED_LOGIN_REQUIRED');
+ assert.equal(readFileSync(path.join(f.dir,'standalone','token'),'utf8'),'standalone-kept');
+ assert.doesNotMatch(one.out+two.out+denied.out,/secret/);
+ const unknown=await f.cli(['logout','--backend','native','--env','gamma','--json']);assert.equal(unknown.code,1);assert.equal(unknown.data.error.code,'SHARED_LOGIN_UNKNOWN_ENV');});
+test('native flags that an action would ignore are refused in both modes',async t=>{const f=await fixture(t);
+ for(const args of [['runs','update',...target,'--run',RUN,'--metadata','x.json','--backend','native'],['logs','append',...target,'--run',RUN,'--data','x','--level','warn','--backend','native'],['runs','list',...target,'--tags','a']]){
+  const r=await f.cli([...args,'--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/_OPTION_UNSUPPORTED$/);}
+ assert.equal(f.calls.length,0);});
