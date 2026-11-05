@@ -435,3 +435,84 @@ export async function listRunsNative(args: ParsedArgs): Promise<number> {
 export async function runNativeTransfer(work: () => Promise<number>): Promise<number> {
   try { return await work(); } catch (e) { return reportNativeError(e); }
 }
+
+// ── project removal ─────────────────────────────────────────────────────────
+
+/** The server's answer to a project delete, with only the fields a person needs to act on. */
+async function deleteProjectRequest(c: Context, route: string): Promise<{ ok: true; body: Record<string, any> } | { ok: false; status: number; body: Record<string, any> }> {
+  let response: Response;
+  try {
+    response = await fetch(`${c.url}${route}`, { method: 'DELETE', redirect: 'error', signal: AbortSignal.timeout(120_000),
+      headers: c.token ? { authorization: `Bearer ${c.token}` } : {} });
+  } catch {
+    throw nativeError('NATIVE_NETWORK_ERROR', 'The delete request did not complete; whether the project was deleted is unknown.', 'Run the same remove again: it reports "not found" if the delete went through.', true);
+  }
+  let body: Record<string, any> = {};
+  try { body = await response.json() as Record<string, any>; } catch { /* empty or not JSON */ }
+  return response.ok ? { ok: true, body } : { ok: false, status: response.status, body };
+}
+
+/**
+ * `remove -p [namespace/]project [-y] --backend native`: delete the canonical DreamLake project and
+ * accept permanent deletion of its native experiment data, in one server transaction. Refuses on
+ * servers that cannot accept both together; it never falls back to deleting only the project.
+ */
+export async function removeProjectNative(args: ParsedArgs, confirm: (question: string) => Promise<string | null>): Promise<number> {
+  const c = nativeContext(args);
+  const parts = String(args.project ?? '').replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length > 2 || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', 'Project can have at most 2 parts (namespace/project).', 'Example: ml-dash remove -p alice/old-project --backend native');
+  const [ns, slug] = parts.length === 2 ? parts as [string, string] : [await personalNamespace(c), parts[0]!];
+  const full = `${ns}/${slug}`;
+  let project: Record<string, any>;
+  try { project = await json(c, projectRoute(ns, slug)); } catch (e) {
+    if (has(e, 'NATIVE_HTTP_404')) { console.log(`${yellow('⚠')} Project '${bold(full)}' not found.`); return 0; }
+    throw e;
+  }
+  let capabilities: unknown[] = [];
+  // Native Experiments off or an older server: no capability, so no delete. Login and access errors are reported as they are.
+  try { capabilities = (await json(c, `${runsBase(ns, slug)}/status`)).capabilities ?? []; }
+  catch (e) { if (!(e instanceof ManagementError) || ['NATIVE_HTTP_401', 'NATIVE_LOGIN_REQUIRED', 'NATIVE_FORBIDDEN'].includes(e.code)) throw e; }
+  if (!capabilities.includes('project-delete-native-cleanup'))
+    throw nativeError('NATIVE_PROJECT_DELETE_UNAVAILABLE', 'This DreamLake server cannot delete a project together with its experiment data yet. Nothing was deleted.',
+      'Use a server that supports it; deleting only the project would leave its experiment data behind.');
+  const runs = (await eachRun(c, ns, slug)).length + ((await json(c, `${runsBase(ns, slug)}/trash?limit=100`)).runs ?? []).length;
+  if (!args.yes) {
+    console.log(`\n${red(bold('⚠ WARNING ⚠'))}\n\nYou are about to delete the DreamLake project ${bold(full)}\n` +
+      `  Project ID: ${project.id}\n  Visibility: ${project.visibility}\n  Experiment runs: ${runs}${runs >= 100 ? '+' : ''} (including archived and trashed)\n\n` +
+      'What happens:\n' +
+      `  • The project is removed and cannot be restored. Its name becomes free for a new project.\n` +
+      `  • Its experiment runs (parameters, metrics, logs, files and tracks) are queued for permanent deletion.\n` +
+      `  • Notes, artifacts, datasets and other items filed in the project are not deleted: they stay in '${ns}', no longer in this project.\n` +
+      `  • The project's bindrs and everyone's access grants to it are removed.\n` +
+      `  • Experiments in a connected managed Dash workspace are not changed.\n\n` +
+      `${red('This action CANNOT be undone.')}\n`);
+    const answer = await confirm(`Type ${full} to confirm deletion: `);
+    if (answer === null) { console.log(`\n${yellow('Deletion cancelled.')} No confirmation on stdin — pass -y to confirm non-interactively.`); return 0; }
+    if (answer !== full) { console.log(`\n${yellow('Deletion cancelled.')}`); return 0; }
+  }
+  // The name may have been released and taken since the preview: the server checks this id again.
+  const current = await json(c, projectRoute(ns, slug)).catch(() => null);
+  if (!current || current.id !== project.id) throw nativeError('NATIVE_PROJECT_REPLACED', `'${full}' no longer names the project you reviewed. Nothing was deleted.`, 'Run remove again to review the current project.');
+  console.log(`\nDeleting project '${full}'...`);
+  const result = await deleteProjectRequest(c, `${projectRoute(ns, slug)}?expectedProjectId=${project.id}&nativeExperiments=purge`);
+  if (!result.ok) {
+    const code = typeof result.body.code === 'string' ? result.body.code : `NATIVE_HTTP_${result.status}`;
+    if (code === 'NATIVE_RUNS_WRITE_PROTECTED') {
+      console.error(`${red('✗')} These runs are write-protected, so nothing was deleted. Remove their protection first:`);
+      for (const run of result.body.runs ?? []) console.error(`    ${run.name} (${run.home})`);
+    } else if (code === 'PROJECT_COMPUTE_ACTIVE') {
+      console.error(`${red('✗')} Jobs are still running in this project, so nothing was deleted. Finish or cancel them first:`);
+      for (const job of result.body.computations ?? []) console.error(`    ${job.kind} ${job.id} (${job.status})`);
+    } else if (code === 'PROJECT_REPLACED') console.error(`${red('✗')} '${full}' now names a different project. Nothing was deleted; run remove again.`);
+    else if (result.status === 403) console.error(`${red('✗')} You do not have permission to delete '${full}'.`);
+    else if (result.status === 404) { console.log(`${yellow('⚠')} Project '${bold(full)}' not found.`); return 0; }
+    else console.error(`${red('✗')} The server refused the delete (${code}). Nothing is known to have changed; run remove again to check.`);
+    return 1;
+  }
+  const done = result.body;
+  console.log(`${green('✓')} Project '${bold(full)}' deleted.`);
+  if (done.nativeCleanup?.accepted) console.log('  Its experiment data is queued for permanent deletion.');
+  for (const [label, key] of [['Items moved out of the project', 'mountsRemoved'], ['Bindrs removed', 'bindrsRemoved'], ['Access grants removed', 'grantsRemoved']] as const)
+    if (typeof done[key] === 'number') console.log(`  ${label}: ${done[key]}`);
+  return 0;
+}
