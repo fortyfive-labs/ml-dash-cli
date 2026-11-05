@@ -158,6 +158,21 @@ test('native writes apply directly to the selected project with the documented b
   ['PUT','/runs/trial_1',{}],['POST',`/runs/${RUN}/status`,{status:'COMPLETED'}],['POST',`/runs/${RUN}/parameters`,{data:{lr:0.001}}],
   ['POST',`/runs/${RUN}/metrics/train.loss`,{dataPoints:[{step:1,loss:0.5}],description:'loss',tags:['a','b'],metadata:{unit:'nats'}}],
   ['GET',`/runs/${RUN}/metrics/train.loss?limit=1000&cursor=1000`,undefined],['GET',`/runs/${RUN}/logs?cursor=100`,undefined]]);});
+test('native metric names and batches follow the server contract: Unicode names percent-encoded, >1000 small entries in one request',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot)?{ok:true}:undefined);
+ const n=['--backend','native','--json',...target];const small=path.join(f.dir,'small.json'),logs=path.join(f.dir,'logs.json'),big=path.join(f.dir,'big.json');
+ writeFileSync(small,JSON.stringify(Array.from({length:2000},(_,i)=>({step:i,v:i}))));
+ writeFileSync(logs,JSON.stringify(Array.from({length:1500},(_,i)=>({timestamp:'2026-11-05T00:00:00Z',level:'info',message:`m${i}`}))));
+ writeFileSync(big,JSON.stringify(Array.from({length:1001},()=>({blob:'x'.repeat(1100)}))));
+ for(const args of [['metrics','append','--run',RUN,'--metric','训练 loss','--data',small],['metrics','stats','--run',RUN,'--metric','acc?x#y'],
+  ['metrics','read','--run',RUN,'--metric','é'.repeat(256)],['logs','append','--run',RUN,'--data',logs]])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length)]),[['POST',`/runs/${RUN}/metrics/%E8%AE%AD%E7%BB%83%20loss`],
+  ['GET',`/runs/${RUN}/metrics/acc%3Fx%23y/stats`],['GET',`/runs/${RUN}/metrics/${encodeURIComponent('é'.repeat(256))}`],['POST',`/runs/${RUN}/logs`]]);
+ assert.equal(f.calls[0].body.dataPoints.length,2000);assert.equal(f.calls[3].body.entries.length,1500);
+ f.calls.length=0;
+ for(const bad of ['a/b','.','..','x'.repeat(257)])assert.equal((await f.cli(['metrics','stats','--run',RUN,'--metric',bad,...n])).data.error.code,'NATIVE_INVALID_METRIC',bad);
+ assert.equal((await f.cli(['metrics','append','--run',RUN,'--metric','m','--data',big,...n])).data.error.code,'NATIVE_INVALID_METRICS');
+ assert.equal(f.calls.length,0);});
 test('native files upload integrity fields before the file and download only checksum-verified bytes',async t=>{const served='"payload"';const sum=hash(Buffer.from(served));
  const f=await fixture(t,c=>c.path.endsWith('/download')?'payload':c.path.endsWith(`/files/${FILE}`)?{file:{id:FILE,checksum:sum}}:c.path.endsWith('/files')?{id:FILE}:undefined);
  const input=path.join(f.dir,'model.bin');writeFileSync(input,Buffer.from([1,2,3]));

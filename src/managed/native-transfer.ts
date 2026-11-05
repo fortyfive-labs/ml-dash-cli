@@ -23,10 +23,9 @@ import type { ExperimentDownloadClient, RemoteExperiment } from '../commands/dow
 import { bold, cyan, green, red, yellow } from '../util/ansi.js';
 import { fnmatch, hasWildcard } from '../util/glob.js';
 import { context, ManagementError, type Context } from './client.js';
-import { call, json, nativeError } from './native.js';
+import { call, isNativeMetricName, json, nativeError } from './native.js';
 
 const RUN_KEY = /^[A-Za-z0-9_-]{1,128}$/;
-const METRIC = /^[A-Za-z0-9_.-]{1,128}$/;
 const LEVELS = ['info', 'warn', 'error', 'debug', 'fatal'];
 /** Native per-request limits; larger --batch-size values are split, never truncated. */
 const MAX_BATCH = 1000;
@@ -291,7 +290,7 @@ async function preflight(client: NativeUploadClient, storage: LocalStorage, item
     if (Array.isArray(meta.bindrs) && meta.bindrs.length) problems.push(`${name}: bindrs ${JSON.stringify(meta.bindrs)} have no native contract yet.`);
     if (meta.write_protected === true) problems.push(`${name}: write_protected has no native contract yet.`);
     if (!skipMetrics) for (const metric of info.metrics) {
-      if (!METRIC.test(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (letters, digits, '.', '_' or '-').`); continue; }
+      if (!isNativeMetricName(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (1-256 characters, no '/', not '.' or '..').`); continue; }
       if (storage.readMetricPoints(metric).points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
         problems.push(`${name}: metric '${metric.name}' has non-object points, which native metrics do not store.`);
     }

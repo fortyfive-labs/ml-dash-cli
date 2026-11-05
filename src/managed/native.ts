@@ -43,7 +43,19 @@ const keptOptions: Record<string, string[]> = { orgs: ['apply', 'review', 'offse
 
 const RUN_ID = /^[0-9a-f]{24}$/;
 const FILE_ID = /^[0-9a-f]{24}$/;
-const METRIC = /^[A-Za-z0-9_.-]{1,128}$/;
+/**
+ * A native metric name, as the server takes it (dreamlake-server `isMetricName`, ml-dash's rule): one URL path
+ * segment of 1-256 characters (code points) without `/`, other than `.`/`..`. Unicode and spaces are names like any
+ * other; it is sent percent-encoded.
+ */
+export const isNativeMetricName = (v: string) => v.length > 0 && !v.includes('/') && v !== '.' && v !== '..' && [...v].length <= 256;
+/**
+ * A native metric or log append, as the server takes it: up to 1,000 entries at any size, or more when they
+ * serialize to at most 1 MiB (ml-dash-server's request bound). Larger is refused before any request.
+ */
+export const nativeBatchOk = (entries: unknown[]) =>
+  entries.length <= 1000 || Buffer.byteLength(JSON.stringify(entries)) <= 1024 * 1024;
+const BATCH_RULE = 'up to 1000 of any size, or more when they serialize to at most 1 MiB';
 const RESPONSE_LIMIT = 12 * 1024 * 1024;
 
 export function nativeError(code: string, message: string, remediation: string, retryable = false) {
@@ -61,7 +73,7 @@ function fileId(a: ParsedArgs) {
 }
 function metric(a: ParsedArgs) {
   const v = required(a, 'metric');
-  if (!METRIC.test(v)) throw nativeError('NATIVE_INVALID_METRIC', 'Metric name must be 1-128 letters, digits, ".", "_" or "-".', 'Choose a valid metric name.');
+  if (!isNativeMetricName(v)) throw nativeError('NATIVE_INVALID_METRIC', 'Metric name must be 1-256 characters without "/", and not "." or "..".', 'Choose a valid metric name.');
   return v;
 }
 function load(file: string): unknown {
@@ -284,8 +296,8 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     if (act === 'stats') return json(c, `${run()}/metrics/${encodeURIComponent(metric(a))}/stats`);
     if (act === 'metadata') return json(c, `${run()}/metrics/${encodeURIComponent(metric(a))}`, 'PATCH', patchOf(a));
     const points = load(required(a, 'data'));
-    if (!Array.isArray(points) || !points.length || points.length > 1000 || points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
-      throw nativeError('NATIVE_INVALID_METRICS', 'Metric data must be a JSON array of 1-1000 objects.', 'Provide a bounded JSON array.');
+    if (!Array.isArray(points) || !points.length || !nativeBatchOk(points) || points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
+      throw nativeError('NATIVE_INVALID_METRICS', `Metric data must be a non-empty JSON array of objects: ${BATCH_RULE}.`, 'Split the data into smaller appends.');
     // The descriptor is stored with the points only when this append creates the metric.
     const descriptor = describe(a);
     return json(c, `${run()}/metrics/${encodeURIComponent(metric(a))}`, 'POST', { dataPoints: points, ...descriptor });
@@ -297,7 +309,7 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
       return json(c, `${run()}/logs${q.size ? `?${q}` : ''}`);
     }
     const entries = load(required(a, 'data'));
-    if (!Array.isArray(entries) || !entries.length || entries.length > 1000) throw nativeError('NATIVE_INVALID_LOGS', 'Logs must contain 1-1000 entries.', 'Provide a bounded JSON array.');
+    if (!Array.isArray(entries) || !entries.length || !nativeBatchOk(entries)) throw nativeError('NATIVE_INVALID_LOGS', `Logs must be a non-empty JSON array: ${BATCH_RULE}.`, 'Split the logs into smaller appends.');
     return json(c, `${run()}/logs`, 'POST', { entries });
   }
   // files
