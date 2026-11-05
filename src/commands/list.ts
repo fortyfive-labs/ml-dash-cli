@@ -326,7 +326,7 @@ async function searchExperiments(
 export async function run(args: ParsedArgs): Promise<number> {
   if (args.backend === "native") {
     const n = await import("../managed/native-transfer.js");
-    return n.runNativeTransfer(() => (args.tracks ? n.listTracksNative(args) : n.listRunsNative(args)));
+    return n.runNativeTransfer(() => (args.tracks ? n.listTracksNative(args) : args.project === undefined ? n.listProjectsNative(args) : n.listRunsNative(args)));
   }
   const ctx = resolveContext(args);
   if (!ctx.apiKey) {

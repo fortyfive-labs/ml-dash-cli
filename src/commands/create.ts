@@ -26,6 +26,7 @@ Examples:
     { flags: ["-p", "--project"], dest: "project", required: true, metavar: "PROJECT", help: "Project name or namespace/project (e.g. 'my-project' or 'tom/my-project')" },
     { flags: ["-d", "--description"], dest: "description", metavar: "TEXT", help: "Project description (optional)" },
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (default: https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: a private DreamLake project, with the DreamLake login" },
   ],
 };
 
@@ -37,6 +38,10 @@ export function splitProjectArg(raw: string): { namespace?: string; project: str
 }
 
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    const n = await import("../managed/native-transfer.js");
+    return n.runNativeTransfer(() => n.createProjectNative(args));
+  }
   const ctx = resolveContext(args);
   const raw = String(args.project);
   const split = splitProjectArg(raw);

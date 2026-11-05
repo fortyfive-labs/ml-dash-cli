@@ -92,6 +92,75 @@ async function saveResponse(response: Response, output: string, replace: boolean
   return { bytes, checksum: hash.digest('hex') };
 }
 
+// ── canonical DreamLake projects ────────────────────────────────────────────
+
+const projectRoute = (ns: string, project: string) => `/namespaces/${encodeURIComponent(ns)}/projects/${encodeURIComponent(project)}`;
+/** The caller's personal namespace (what the old CLI's `me.username` named). */
+async function personalNamespace(c: Context): Promise<string> {
+  const me = await json(c, '/auth/me');
+  const slug = me.namespace?.slug ?? me.user?.namespace?.slug;
+  if (typeof slug !== 'string' || !slug) throw nativeError('NATIVE_NAMESPACE_UNKNOWN', 'Your DreamLake account has no personal namespace.', 'Pass namespace/project explicitly.');
+  return slug;
+}
+const has = (e: unknown, code: string) => e instanceof ManagementError && e.code === code;
+/**
+ * Make sure a canonical DreamLake project exists, creating it PRIVATE when it does not, as the old
+ * uploader's upsert did. A readable project is used as is; a slug held by a project the caller cannot
+ * see is reported, never taken over; a missing namespace is never created. Auth, network and other
+ * errors propagate unchanged, so only a real "not found" leads to a create.
+ */
+export async function ensureProject(c: Context, ns: string, project: string, description?: string): Promise<{ created: boolean; project: Record<string, any> }> {
+  try { return { created: false, project: await json(c, projectRoute(ns, project)) }; }
+  catch (e) { if (!has(e, 'NATIVE_HTTP_404')) throw e; }
+  try {
+    const created = await json(c, `/namespaces/${encodeURIComponent(ns)}/projects`, 'POST',
+      { name: project, slug: project, visibility: 'private', ...(description !== undefined ? { description } : {}) });
+    return { created: true, project: created };
+  } catch (e) {
+    if (has(e, 'NATIVE_HTTP_409')) {
+      // Created meanwhile by someone whose project we can read is fine; a hidden one is not ours to use.
+      try { return { created: false, project: await json(c, projectRoute(ns, project)) }; } catch (again) { if (!has(again, 'NATIVE_HTTP_404')) throw again; }
+      throw nativeError('NATIVE_PROJECT_INACCESSIBLE', `Project '${ns}/${project}' exists but you cannot access it.`, 'Ask its owner for access, or choose another project name. Nothing was created.');
+    }
+    if (has(e, 'NATIVE_HTTP_404')) throw nativeError('NATIVE_NAMESPACE_NOT_FOUND', `Namespace '${ns}' does not exist.`, 'Namespaces and organizations are not created automatically; check the name.');
+    if (has(e, 'NATIVE_HTTP_403')) throw nativeError('NATIVE_PROJECT_CREATE_FORBIDDEN', `You cannot create projects in '${ns}'.`, 'Ask a namespace owner for project create permission, or create the project there first.');
+    throw e;
+  }
+}
+
+/** `create -p [namespace/]project [-d TEXT] --backend native` */
+export async function createProjectNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  const parts = String(args.project ?? '').replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length > 2 || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', 'Project can have at most 2 parts (namespace/project).', 'Examples: ml-dash create -p new-project --backend native');
+  const [ns, project] = parts.length === 2 ? parts as [string, string] : [await personalNamespace(c), parts[0]!];
+  const result = await ensureProject(c, ns, project, typeof args.description === 'string' ? args.description : undefined);
+  const p = result.project;
+  console.log(result.created ? `${green('✓')} Project created successfully!` : `${yellow('⚠')} Project already exists.`);
+  console.log(`  Name: ${bold(String(p.slug ?? project))}\n  Namespace: ${bold(ns)}\n  ID: ${p.id}\n  Visibility: ${p.visibility ?? 'private'}`);
+  if (result.created && typeof args.description === 'string') console.log(`  Description: ${args.description}`);
+  return 0;
+}
+
+/** `list [-n namespace] --backend native`: every DreamLake project the caller can read in the namespace. */
+export async function listProjectsNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  refuse(args, ['status', 'tags', 'topic_filter', 'detailed'], 'Project listing takes --namespace only; pass -p namespace/project to list runs.');
+  const ns = typeof args.namespace === 'string' ? args.namespace : await personalNamespace(c);
+  const projects: any[] = [];
+  for (let page = 1; ; page++) {
+    const value = await json(c, `/namespaces/${encodeURIComponent(ns)}/projects?page=${page}&pageSize=200`);
+    if (!Array.isArray(value.projects)) throw nativeError('NATIVE_INVALID_RESPONSE', 'Invalid project list.', 'Check matching server versions.');
+    projects.push(...value.projects);
+    const pages = Number(value.totalPages);
+    if (!value.projects.length || !Number.isSafeInteger(pages) || page >= pages) break;
+  }
+  if (!projects.length) { console.log(yellow(`No projects found in ${ns}`)); return 0; }
+  console.log(bold(`\nProjects in ${ns}\n`));
+  for (const p of projects) console.log(`  ${cyan(String(p.slug))}  ${p.visibility}  ${p.name !== p.slug ? p.name : ''}`.trimEnd());
+  return 0;
+}
+
 // ── upload adapter ──────────────────────────────────────────────────────────
 
 /** A flat `<namespace>/<project>/<run>` prefix, or null when it names folders. */
@@ -103,6 +172,7 @@ function flatPrefix(prefix: string) {
 /** RemoteClient's upload surface over native REST. Run IDs map to their project route. */
 class NativeUploadClient implements ExperimentUploadClient {
   private readonly bases = new Map<string, string>();
+  private readonly projects = new Map<string, Promise<unknown>>();
   constructor(private readonly c: Context) {}
   private run(id: string) {
     const base = this.bases.get(id);
@@ -120,6 +190,10 @@ class NativeUploadClient implements ExperimentUploadClient {
     if (typeof args.description === 'string') body.description = args.description;
     if (Array.isArray(args.tags)) body.tags = args.tags;
     const base = runsBase(target.ns, target.project);
+    // The old uploader created a missing project; so does this one, privately and only where allowed.
+    const key = `${target.ns}/${target.project}`;
+    if (!this.projects.has(key)) this.projects.set(key, ensureProject(this.c, target.ns, target.project));
+    try { await this.projects.get(key); } catch (e) { this.projects.delete(key); throw e; }
     const value = await json(this.c, `${base}/runs/${encodeURIComponent(target.key)}`, 'PUT', body);
     this.bases.set(String(value.experiment?.id), base);
     return value;
