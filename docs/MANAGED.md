@@ -248,6 +248,28 @@ error is a real blocker, never a successful adoption. Recovery uses the same
 review, `--expected-revision` from current authority and a stable intent key.
 No CLI flag enables server fencing or bypasses these safeguards.
 
+## Native backend (preview)
+
+`--backend native` sends `auth`, `instance show|capabilities`, `health`,
+`diagnostics`, `runs`, `metrics`, `logs` and `files` to DreamLake-native
+Experiments of the selected DreamLake project, using the same DreamLake login.
+The default is unchanged (`managed`), and a native command never falls back
+to the managed or standalone backend. Writes apply directly, so `--apply`,
+`--review`, `--credential` and `--idempotency-key` are refused. Commands
+without a native form (`setup`, `credentials`, `adoption`, `workspaces`,
+`connections`, `projects`, `instance schema`) fail with `NATIVE_NOT_AVAILABLE`.
+Run and file IDs come from native list and create results.
+
+```bash
+ml-dash runs create --namespace lab --project research --run-key trial-1 --backend native --json
+ml-dash metrics append --namespace lab --project research --run RUN_ID --metric loss --data points.json --description train-loss --backend native
+ml-dash metrics read --namespace lab --project research --run RUN_ID --metric loss --limit 1000 --backend native
+ml-dash files download --namespace lab --project research --run RUN_ID --file FILE_ID --out model.pt --backend native
+```
+
+A metric's `--description`, `--tags` and `--metadata` are stored only when the
+append creates the metric. Pages return `nextCursor`; pass it to `--cursor`.
+
 ## Output and backend mapping
 
 The management commands in this guide offer `--json`: success is `{ok:true,data}`, failure is
@@ -271,3 +293,4 @@ offline schema instead of assuming they implement this managed JSON contract.
 | Writes | Dash `/api/managed/projects/:stableId/runs/...` with short scoped session |
 | External workspaces | BFF `/integrations/dash/ns/:ns/connections`, `/workspaces`, `/binding` |
 | Adoption | BFF project `/adoption/:legacyProjectId/{inventory,plan,apply,reconcile,recover}` |
+| `--backend native` | DreamLake `/native-experiments/ns/:ns/projects/:project/{status,runs,...}`; `/auth/me` |

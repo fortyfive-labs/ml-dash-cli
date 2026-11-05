@@ -17,7 +17,8 @@ async function fixture(t:any,respond?:(call:Call)=>any){
  const calls:Call[]=[];const dir=mkdtempSync(path.join(tmpdir(),'managed-cli-test-'));const config=path.join(dir,'config');mkdirSync(config);
  const server=http.createServer(async(req,res)=>{
   let input='';for await(const c of req)input+=c;
-  const call={path:req.url!,method:req.method!,body:input?JSON.parse(input):undefined,auth:req.headers.authorization};calls.push(call);
+  let body:any;try{body=input?JSON.parse(input):undefined;}catch{body=input;}
+  const call={path:req.url!,method:req.method!,body,auth:req.headers.authorization};calls.push(call);
   let value=respond?.(call);if(value===undefined){
    if(call.path==='/auth/me')value={user:{id:'user-id',name:'Researcher'}};
    else if(call.path.startsWith('/managed-experiments/capabilities'))value={instanceId:'dash-instance',version:'1',apiUrl:'/managed-experiments',capabilities:['managed-setup-plan','runs','files'],token:'never-print'};
@@ -131,3 +132,34 @@ test('managed team discovery keeps DreamLake visibility separate from standalone
  for(const allowed of ['VISIBLE','SECRET']){visibility=allowed;const r=await f.cli(['orgs','teams','--namespace','lab','--json']);assert.equal(r.code,0,r.out);assert.equal(r.data.data.teams[0].visibility,allowed);}
  for(const rejected of ['PUBLIC','PRIVATE']){visibility=rejected;const r=await f.cli(['orgs','teams','--namespace','lab','--json']);assert.equal(r.code,1);assert.equal(r.data.error.code,'MANAGED_INVALID_RESPONSE');}
 });
+
+// ─── --backend native ─────────────────────────────────────────────────────────
+// Contract checks against dreamlake-server PR #1683 native routes (9fa3c663); not a run against that server.
+const nroot='/native-experiments/ns/lab/projects/research';
+const RUN='b'.repeat(24),FILE='c'.repeat(24);
+test('native backend is explicit: default stays managed, native never touches managed or Dash routes',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot+'/runs?')?{runs:[{id:RUN,name:'k'}],hasMore:false,nextCursor:null,token:'never-print'}:undefined);
+ const managed=await f.cli(['runs','list',...target,'--json']);assert.equal(managed.code,0,managed.out);assert.ok(f.calls.every(c=>c.path.startsWith('/managed-experiments/')));
+ f.calls.length=0;const native=await f.cli(['runs','list',...target,'--backend','native','--limit','2','--cursor','a'.repeat(24),'--json']);assert.equal(native.code,0,native.out);
+ assert.deepEqual(f.calls.map(c=>c.method+' '+c.path),[`GET ${nroot}/runs?limit=2&cursor=${'a'.repeat(24)}`]);assert.equal(f.calls[0].auth,'Bearer user-secret-never-print');
+ assert.equal(native.data.data.runs[0].id,RUN);assert.doesNotMatch(native.out+native.err,/never-print/);});
+test('native backend refuses managed-only options, commands without a native form, and foreign paths before any request',async t=>{const f=await fixture(t);
+ for(const args of [['setup','plan',...target],['credentials','list',...target],['runs','create',...target,'--run-key','k','--apply'],['runs','list',...target,'--standalone'],['instance','schema',...target],['runs','show',...target,'--run','../../other']]){
+  const r=await f.cli([...args,'--backend','native','--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/^NATIVE_/);}
+ assert.equal(f.calls.length,0);});
+test('native writes apply directly to the selected project with the documented bodies',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot)?{ok:true}:undefined);
+ const points=path.join(f.dir,'points.json'),meta=path.join(f.dir,'meta.json'),params=path.join(f.dir,'params.json');writeFileSync(points,'[{"step":1,"loss":0.5}]');writeFileSync(meta,'{"unit":"nats"}');writeFileSync(params,'{"lr":0.001}');
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','create','--run-key','trial_1'],['runs','status','--run',RUN,'--status','COMPLETED'],['runs','parameters','--run',RUN,'--data',params],
+  ['metrics','append','--run',RUN,'--metric','train.loss','--data',points,'--description','loss','--tags','a, b','--metadata',meta],['metrics','read','--run',RUN,'--metric','train.loss','--limit','1000','--cursor','1000'],['logs','read','--run',RUN,'--cursor','100']])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['PUT','/runs/trial_1',{}],['POST',`/runs/${RUN}/status`,{status:'COMPLETED'}],['POST',`/runs/${RUN}/parameters`,{data:{lr:0.001}}],
+  ['POST',`/runs/${RUN}/metrics/train.loss`,{dataPoints:[{step:1,loss:0.5}],description:'loss',tags:['a','b'],metadata:{unit:'nats'}}],
+  ['GET',`/runs/${RUN}/metrics/train.loss?limit=1000&cursor=1000`,undefined],['GET',`/runs/${RUN}/logs?cursor=100`,undefined]]);});
+test('native files upload integrity fields before the file and download only checksum-verified bytes',async t=>{const served='"payload"';const sum=hash(Buffer.from(served));
+ const f=await fixture(t,c=>c.path.endsWith('/download')?'payload':c.path.endsWith(`/files/${FILE}`)?{file:{id:FILE,checksum:sum}}:c.path.endsWith('/files')?{id:FILE}:undefined);
+ const input=path.join(f.dir,'model.bin');writeFileSync(input,Buffer.from([1,2,3]));
+ assert.equal((await f.cli(['files','upload',...target,'--run',RUN,'--input',input,'--backend','native','--json'])).code,0);
+ const body=String(f.calls[0].body);const order=['name="sizeBytes"','name="checksum"','name="file"'].map(k=>body.indexOf(k));assert.ok(order.every((v,i)=>v>=0&&(i===0||v>order[i-1])),body);assert.match(body,new RegExp(hash(Buffer.from([1,2,3]))));
+ const out=path.join(f.dir,'got.bin');const d=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(d.code,0,d.out);assert.equal(readFileSync(out,'utf8'),served);
+ const again=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(again.data.error.code,'NATIVE_DESTINATION_EXISTS');});

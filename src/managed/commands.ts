@@ -9,6 +9,7 @@ import { adoptionCommand } from './adoption.js';
 import { connectionCommand } from './connections.js';
 import { login, standaloneLogin } from './auth.js';
 import { organizationInspection, organizationPaging, allOrganizationMembers } from './organizationInspection.js';
+import { assertNativeSelection, nativeCommand } from './native.js';
 
 const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams'] as const;
 export const managementActions: Record<string,string[]> = {
@@ -24,6 +25,7 @@ export function managementCommand(name: typeof names[number]) {
  const spec: CommandSpec={name,help:help[name],description:`Managed Experiments: ${help[name]}. Existing standalone login/list/upload remain available.`,positionals:[{dest:'action',metavar:'ACTION',help:managementActions[name].join(' | '),default:managementActions[name][0]}],options:[
   {flags:['--schema-version'],dest:'schema_version',choices:['1'],help:'Supported machine schema version (default 1; instance schema only)'},
   {flags:['--standalone'],dest:'standalone',boolean:true,help:'Explicitly use standalone Dash identity and APIs, never the DreamLake login'},
+  {flags:['--backend'],dest:'backend',choices:['managed','native'],help:'DreamLake Experiments backend: managed (default) or native; never falls back to the other'},
   {flags:['--dash-url','--api-url'],dest:'dash_url',help:'Standalone Dash server matching its existing login'},
   {flags:['--offset'],dest:'offset',help:'Server nextOffset for organization members/teams and standalone lists'},
   {flags:['--team'],dest:'team',help:'Explicit standalone team ID for membership inspection'},
@@ -38,7 +40,9 @@ export function managementCommand(name: typeof names[number]) {
   {flags:['-p','--project'],dest:'project',help:'Explicit DreamLake project slug or ID'},
   {flags:['--run'],dest:'run',help:'Stable experiment run ID'},
   {flags:['--name'],dest:'name',help:'Explicit organization display name'},
-  {flags:['--description'],dest:'description',help:'Explicit organization description'},
+  {flags:['--description'],dest:'description',help:'Explicit organization description, or a new native metric\'s description'},
+  {flags:['--tags'],dest:'tags',help:'Comma-separated tags of a new native metric (metrics append --backend native)'},
+  {flags:['--metadata'],dest:'metadata',help:'JSON object file (or -) of a new native metric\'s metadata'},
   {flags:['--user'],dest:'user',help:'Exact user ID for organization membership operations'},
   {flags:['--role'],dest:'role',choices:['OWNER','MEMBER'],help:'Explicit organization role'},
   {flags:['--run-key'],dest:'run_key',help:'Idempotent run creation key (letters/numbers/_/-)'},
@@ -108,7 +112,14 @@ async function writeIntent(c:ReturnType<typeof context>,a:ParsedArgs,intent:unkn
 }
 export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
  try{
-  const act=action(a,name);let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
+  const act=action(a,name);
+  if(arg(a,'backend')==='native'){
+   assertNativeSelection(name,act,a);
+   const native=context(a,!(name==='auth'&&act==='login'));
+   const value=name==='auth'&&act==='login'?await login(a):await nativeCommand(name,act,native,a);
+   emit(a,safe(value,[native.token||'']));return 0;
+  }
+  let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
   if(name==='orgs'&&['create','update','delete'].includes(act)){result=await organizationMutation(c,a,act);emit(a,safe(result,[c.token||'']));return 0;}
   if(a.standalone&&!(name==='auth'&&act==='login')){result=await standaloneCommand(name,act,c,a);emit(a,safe(result,[c.token||'']));return 0;}
   if(name==='teams')throw new ManagementError('MANAGED_AUTHORITY_SELECTION','Team inspection requires explicit --standalone in this CLI.','DreamLake project access is inspected using projects access; teams never imply standalone project grants.');
