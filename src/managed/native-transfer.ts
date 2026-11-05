@@ -341,8 +341,14 @@ export function nativeUploadTarget(args: ParsedArgs) {
 /** RemoteClient's download surface over native REST, for one DreamLake project. */
 class NativeDownloadClient implements ExperimentDownloadClient {
   private readonly fileRuns = new Map<string, string>();
-  constructor(private readonly c: Context, private readonly base: string) {}
-  private run(id: string) { return `${this.base}/runs/${encodeURIComponent(id)}`; }
+  /** The project route of each discovered run: a glob may select runs of several projects. */
+  readonly bases = new Map<string, string>();
+  constructor(private readonly c: Context) {}
+  private run(id: string) {
+    const base = this.bases.get(id);
+    if (!base) throw new Error(`native run ${id} was not discovered`);
+    return `${base}/runs/${encodeURIComponent(id)}`;
+  }
   async getParameters(id: string): Promise<Record<string, unknown>> {
     try {
       const value = (await json(this.c, `${this.run(id)}/parameters`)).parameters;
@@ -401,25 +407,57 @@ function projectSelector(raw: string, what: string) {
   const parts = raw.replace(/^\/+|\/+$/g, '').split('/');
   const [ns, project] = parts;
   if (!ns || !project) throw nativeError('NATIVE_INVALID_PATH', `--project must be namespace/project[/folder…], ${what}.`, 'Native runs live in a DreamLake project.');
-  if (hasWildcard(ns) || hasWildcard(project))
-    throw nativeError('NATIVE_GLOB_UNSUPPORTED', 'Globs over namespaces or projects are not available natively yet.', 'Name the namespace and project exactly; globs after them select runs.');
   return { ns, project, rest: parts.slice(2).join('/') || undefined };
 }
 
-/** The download pipeline's native source: `-p namespace/project[/folder…|/glob]`, every page of runs. */
+/**
+ * The canonical projects a `namespace/project` selector names. Exact names are used as given (an
+ * unreadable one fails with its own error). A glob fans out over what the caller can read: your
+ * personal namespace and your organizations, and each namespace's readable-project catalog, every
+ * page. A project you cannot see is never listed, so it is never matched.
+ */
+async function selectedProjects(c: Context, ns: string, project: string): Promise<Array<{ ns: string; project: string }>> {
+  let namespaces = [ns];
+  if (hasWildcard(ns)) {
+    const mine = await personalNamespace(c).catch(() => null);
+    const orgs = await json(c, '/graphql', 'POST', { query: 'query MlDashNativeGlobOrgs { myOrganizations { slug } }' });
+    const slugs = [...(mine ? [mine] : []), ...((orgs.data?.myOrganizations ?? []) as Array<{ slug: string }>).map(o => o.slug)];
+    namespaces = [...new Set(slugs)].filter(slug => fnmatch(slug, ns));
+  }
+  if (!hasWildcard(project)) return namespaces.map(n => ({ ns: n, project }));
+  const out: Array<{ ns: string; project: string }> = [];
+  for (const n of namespaces) {
+    for (let page = 1; ; page++) {
+      const value = await json(c, `/namespaces/${encodeURIComponent(n)}/projects?page=${page}&pageSize=200`);
+      for (const p of value.projects ?? []) if (fnmatch(String(p.slug), project)) out.push({ ns: n, project: String(p.slug) });
+      if (!value.projects?.length || !Number.isSafeInteger(Number(value.totalPages)) || page >= Number(value.totalPages)) break;
+    }
+  }
+  return out;
+}
+
+/** The download pipeline's native source: `-p namespace/project[/folder…|/glob]` (globs anywhere), every page of runs. */
 export function nativeDownloadSource(args: ParsedArgs) {
   const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a run, folder or glob');
   const c = nativeContext(args);
-  const base = runsBase(ns, project);
+  const client = new NativeDownloadClient(c);
   const selected = pathSelector(rest);
   return {
-    client: new NativeDownloadClient(c, base),
+    client,
     stateIdentity: `native:${c.url}`,
     async discover(experiment?: string): Promise<RemoteExperiment[]> {
-      const runs = (await eachRun(c, ns, project)).filter(run => selected(runPath(run)) && (experiment === undefined || run.name === experiment));
-      return runs.map(run => ({ project, experiment: run.name, experimentId: run.id, owner: ns, prefix: `${ns}/${project}/${runPath(run)}`,
-        description: run.description ?? null, tags: run.tags ?? [], metadata: run.metadata ?? null,
-        metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true }));
+      const found: RemoteExperiment[] = [];
+      for (const target of await selectedProjects(c, ns, project)) {
+        const base = runsBase(target.ns, target.project);
+        for (const run of await eachRun(c, target.ns, target.project)) {
+          if (!selected(runPath(run)) || experiment !== undefined && run.name !== experiment) continue;
+          client.bases.set(String(run.id), base);
+          found.push({ project: target.project, experiment: run.name, experimentId: run.id, owner: target.ns, prefix: `${target.ns}/${target.project}/${runPath(run)}`,
+            description: run.description ?? null, tags: run.tags ?? [], metadata: run.metadata ?? null,
+            metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true });
+        }
+      }
+      return found;
     },
   };
 }
@@ -500,12 +538,19 @@ export async function listRunsNative(args: ParsedArgs): Promise<number> {
   const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a folder or glob');
   const selected = pathSelector(rest);
   const tags = typeof args.tags === 'string' ? args.tags.split(',').map(t => t.trim()).filter(Boolean) : null;
-  const runs = (await eachRun(c, ns, project)).filter(run => selected(runPath(run)) &&
-    (args.status === undefined || (args.status === 'ARCHIVED' ? !!run.archivedAt : run.status === args.status && !run.archivedAt)) &&
-    (!tags || (run.tags ?? []).some((t: string) => tags.includes(t))));
-  if (!runs.length) { console.log(yellow('No runs found')); return 0; }
-  console.log(bold(`\nRuns in ${ns}/${project}${rest ? `/${rest}` : ''}\n`));
-  for (const run of runs) console.log(`  ${cyan(runPath(run))}  ${run.archivedAt ? 'ARCHIVED' : run.status}  ${run.id}`);
+  const targets = await selectedProjects(c, ns, project);
+  const many = hasWildcard(ns) || hasWildcard(project);
+  let shown = 0;
+  for (const target of targets) {
+    const runs = (await eachRun(c, target.ns, target.project)).filter(run => selected(runPath(run)) &&
+      (args.status === undefined || (args.status === 'ARCHIVED' ? !!run.archivedAt : run.status === args.status && !run.archivedAt)) &&
+      (!tags || (run.tags ?? []).some((t: string) => tags.includes(t))));
+    if (!runs.length) continue;
+    console.log(bold(`\nRuns in ${target.ns}/${target.project}${rest ? `/${rest}` : ''}\n`));
+    for (const run of runs) console.log(`  ${cyan(many ? `${target.ns}/${target.project}/${runPath(run)}` : runPath(run))}  ${run.archivedAt ? 'ARCHIVED' : run.status}  ${run.id}`);
+    shown += runs.length;
+  }
+  if (!shown) console.log(yellow('No runs found'));
   return 0;
 }
 
