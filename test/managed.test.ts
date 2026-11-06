@@ -292,13 +292,13 @@ const writes=(calls:Call[])=>calls.filter(c=>c.method!=='GET');
 test('native upload refuses write_protected or bindrs before any write when the server does not list them',async t=>{
  for(const [meta,schema] of [[{write_protected:true},null],[{write_protected:true},schemaOps(false,true)],[{bindrs:['best']},schemaOps(true,false)]] as const){
   const f=await fixture(t,nativeServer(schema));
-  const r=await f.cli(['upload',dashRun(f.dir,meta as any),'--backend','native']);
+  const r=await f.cli(['upload',dashRun(f.dir,meta as any),'--backend','native','--state-file',path.join(f.dir,'state.json')]);
   assert.equal(r.code,1,JSON.stringify(meta));assert.match(r.err+r.out,/nothing was uploaded/);
   assert.deepEqual(writes(f.calls),[],JSON.stringify(meta));
   assert.ok(!f.calls.some(c=>c.path.startsWith('/namespaces/')),'no project lookup or create before the refusal');}});
 test('native upload attaches run and file bindrs (by the new file id) before protecting the run last',async t=>{
  const f=await fixture(t,nativeServer(schemaOps(true,true)));
- const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true,bindrs:['best','sweep']},['ckpt']),'--backend','native']);assert.equal(r.code,0,r.out+r.err);
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true,bindrs:['best','sweep']},['ckpt']),'--backend','native','--state-file',path.join(f.dir,'state.json')]);assert.equal(r.code,0,r.out+r.err);
  const w=writes(f.calls).map(c=>[c.method,c.path.slice(nroot.length),c.path.endsWith('/files')?'(form)':c.body]);
  assert.deepEqual(w[0].slice(0,2),['PUT','/run-paths/sweep/r1']);assert.deepEqual((w[0][2] as any).bindrs,['best','sweep']);
  const fileAt=w.findIndex(x=>x[1]===`/runs/${RUN}/files`),bindAt=w.findIndex(x=>x[1]===`/runs/${RUN}/bindrs`);
@@ -308,5 +308,5 @@ test('native upload attaches run and file bindrs (by the new file id) before pro
 test('native upload fails the run, unprotected, when a file bindr is not confirmed',async t=>{
  const base=nativeServer(schemaOps(true,true));
  const f=await fixture(t,c=>c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/bindrs`?{statusCode:409,response:{error:{code:'NATIVE_RUN_BINDRS_UNAVAILABLE'}}}:base(c));
- const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true},['ckpt']),'--backend','native']);assert.equal(r.code,1,r.out);
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true},['ckpt']),'--backend','native','--state-file',path.join(f.dir,'state.json')]);assert.equal(r.code,1,r.out);
  assert.ok(!f.calls.some(c=>c.method==='PATCH'),'never protected after a failed part');});
