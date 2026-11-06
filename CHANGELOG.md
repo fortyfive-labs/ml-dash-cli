@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.4.0 — DreamLake-native experiments
+
+- Add `--backend native` run, parameter, metric, log, file and track commands, with native upload/download and scoped writer credentials.
+- Discover native capabilities and operation schemas before requests; unsupported features fail explicitly. Native run paths, metadata, protection and bindr operations use the matching DreamLake APIs.
+- Keep protected creation atomic and resume run imports without widening writer scope. Downloads verify their bytes; existing standalone and managed commands remain available.
+- Requires matching DreamLake backend capabilities and rollout activation. Installation does not migrate historical runs or activate server flags.
+
 ## 0.3.1 — Current experiment schema
 
 - Fix standalone experiment listing, wildcard search, track discovery and download discovery against the current server schema by removing retired `logMetadata` and `metricMetadata` selections.
