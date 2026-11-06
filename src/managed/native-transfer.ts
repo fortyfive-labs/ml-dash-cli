@@ -25,6 +25,7 @@ import { bold, cyan, green, red, yellow } from '../util/ansi.js';
 import { fnmatch, hasWildcard } from '../util/glob.js';
 import { context, ManagementError, type Context } from './client.js';
 import { call, isNativeMetricName, json, nativeError, validName } from './native.js';
+import { fileMultipart } from './multipart.js';
 
 const RUN_KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const LEVELS = ['info', 'warn', 'error', 'debug', 'fatal'];
@@ -260,14 +261,12 @@ class NativeUploadClient implements ExperimentUploadClient {
     const blob = await openAsBlob(args.filePath, { type: args.contentType || 'application/octet-stream' });
     const hash = createHash('sha256');
     for await (const chunk of blob.stream() as unknown as AsyncIterable<Uint8Array>) hash.update(chunk);
-    const form = new FormData();
-    form.append('sizeBytes', String(blob.size));
-    form.append('checksum', hash.digest('hex'));
-    form.append('prefix', '/' + (args.prefix ?? '').replace(/^\/+/, ''));
-    if (args.description) form.append('description', args.description);
-    if (args.tags?.length) form.append('tags', args.tags.join(','));
-    if (args.metadata) form.append('metadata', JSON.stringify(args.metadata));
-    form.append('file', blob, args.filename);
+    const fields: Record<string, string> = { sizeBytes: String(blob.size), checksum: hash.digest('hex'),
+      prefix: '/' + (args.prefix ?? '').replace(/^\/+/, '') };
+    if (args.description) fields.description = args.description;
+    if (args.tags?.length) fields.tags = args.tags.join(',');
+    if (args.metadata) fields.metadata = JSON.stringify(args.metadata);
+    const form = fileMultipart(fields, blob, args.filename);
     const value = await json(this.c, `${this.run(args.experimentId)}/files`, 'POST', undefined, form);
     // The file's bindrs go on the file just stored, by its new id; a failed attach fails the file (and the run).
     if (args.bindrs?.length) {
@@ -387,6 +386,7 @@ export function nativeUploadTarget(args: ParsedArgs) {
 /** RemoteClient's download surface over native REST, for one DreamLake project. */
 class NativeDownloadClient implements ExperimentDownloadClient {
   private readonly fileRuns = new Map<string, string>();
+  private readonly bindrSupport = new Map<string, Promise<boolean>>();
   /** The project route of each discovered run: a glob may select runs of several projects. */
   readonly bases = new Map<string, string>();
   constructor(private readonly c: Context) {}
@@ -427,9 +427,23 @@ class NativeDownloadClient implements ExperimentDownloadClient {
     if (offset > 0) return { files: [], hasMore: false };
     const files = (await json(this.c, `${this.run(id)}/files`)).files ?? [];
     for (const f of files) this.fileRuns.set(String(f.id), id);
-    return { files: files.map((f: any) => ({ id: f.id, name: f.filename, pPath: f.prefix ?? f.path ?? '', description: f.description ?? null,
+    const out = [];
+    for (const f of files) out.push({ id: f.id, name: f.filename, pPath: f.prefix ?? f.path ?? '', description: f.description ?? null,
       tags: f.tags ?? [], metadata: f.metadata ?? null,
-      physicalFile: { filename: f.filename, checksum: f.checksum, contentType: f.contentType, sizeBytes: f.sizeBytes } })), hasMore: false };
+      bindrs: await this.bindrs(id, 'file', String(f.id)),
+      physicalFile: { filename: f.filename, checksum: f.checksum, contentType: f.contentType, sizeBytes: f.sizeBytes } });
+    return { files: out, hasMore: false };
+  }
+  async bindrs(id: string, itemKind?: string, itemId?: string): Promise<string[]> {
+    const base = this.bases.get(id)!;
+    if (!this.bindrSupport.has(base)) this.bindrSupport.set(base,
+      json(this.c, `${base}/status`).then(value => (value.capabilities ?? []).includes('run-bindrs')));
+    if (!await this.bindrSupport.get(base)) return [];
+    const query = itemKind ? `?itemKind=${encodeURIComponent(itemKind)}&itemId=${encodeURIComponent(itemId!)}` : '';
+    const value = await json(this.c, `${this.run(id)}/bindrs${query}`);
+    if (!Array.isArray(value.bindrs) || value.bindrs.some((b: any) => typeof b?.name !== 'string'))
+      throw nativeError('NATIVE_INVALID_RESPONSE', 'Invalid run Bindr list.', 'Check matching server versions.');
+    return value.bindrs.map((b: any) => b.name);
   }
   async downloadFileStreaming(fileId: string, destPath: string): Promise<string> {
     const runId = this.fileRuns.get(fileId);
@@ -500,6 +514,7 @@ export function nativeDownloadSource(args: ParsedArgs) {
           client.bases.set(String(run.id), base);
           found.push({ project: target.project, experiment: run.name, experimentId: run.id, owner: target.ns, prefix: `${target.ns}/${target.project}/${runPath(run)}`,
             description: run.description ?? null, tags: run.tags ?? [], metadata: run.metadata ?? null,
+            bindrs: await client.bindrs(String(run.id)), writeProtected: run.writeProtected === true,
             metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true });
         }
       }

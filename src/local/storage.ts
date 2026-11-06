@@ -135,6 +135,7 @@ export class LocalStorage {
     description?: string | null;
     tags?: string[] | null;
     bindrs?: string[] | null;
+    writeProtected?: boolean;
     metadata?: Record<string, unknown> | null;
   }): string {
     const prefixClean = args.prefix.replace(/\/+$/, "");
@@ -159,7 +160,7 @@ export class LocalStorage {
           prefix: args.prefix,
           metadata: args.metadata ?? null,
           created_at: utcNowIso(),
-          write_protected: false,
+          write_protected: args.writeProtected ?? false,
         }),
       );
       return dir;
@@ -181,7 +182,7 @@ export class LocalStorage {
           prefix: args.prefix,
           metadata: args.metadata ?? null,
           created_at: utcNowIso(),
-          write_protected: false,
+          write_protected: args.writeProtected ?? false,
         }),
       );
       return dir;
@@ -190,6 +191,7 @@ export class LocalStorage {
     if (args.description != null) existing.description = args.description;
     if (args.tags != null) existing.tags = args.tags;
     if (args.bindrs != null) existing.bindrs = args.bindrs;
+    if (args.writeProtected !== undefined) existing.write_protected = args.writeProtected;
     if (args.prefix != null) existing.prefix = args.prefix;
     if (args.metadata != null) existing.metadata = args.metadata;
     existing.updated_at = utcNowIso();
