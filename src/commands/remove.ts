@@ -38,15 +38,16 @@ Examples:
     { flags: ["-p", "--project"], dest: "project", required: true, metavar: "PROJECT", help: "Project name or namespace/project (e.g. 'my-project' or 'tom/my-project')" },
     { flags: ["-y", "--yes"], dest: "yes", boolean: true, help: "Skip confirmation prompt" },
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (default: https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: the DreamLake project and its experiment data" },
   ],
 };
 
 /** The typed confirmation, or null when stdin ended without one. */
-async function promptForName(): Promise<string | null> {
+async function promptForName(question = "Type the project name to confirm deletion: "): Promise<string | null> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     return await new Promise<string | null>((resolve) => {
-      rl.question("Type the project name to confirm deletion: ").then(
+      rl.question(question).then(
         (answer) => resolve(answer.trim()),
         () => resolve(null),
       );
@@ -60,6 +61,10 @@ async function promptForName(): Promise<string | null> {
 }
 
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    const n = await import("../managed/native-transfer.js");
+    return n.runNativeTransfer(() => n.removeProjectNative(args, promptForName));
+  }
   const ctx = resolveContext(args);
   const raw = String(args.project);
   const split = splitProjectArg(raw);

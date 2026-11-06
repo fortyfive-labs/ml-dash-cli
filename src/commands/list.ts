@@ -30,6 +30,7 @@ export const spec: CommandSpec = {
   description: "Discover projects and experiments available on the remote ML-Dash server.",
   options: [
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (defaults to config or https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: DreamLake-native Experiments with the DreamLake login" },
     { flags: ["-n", "--namespace"], dest: "namespace", metavar: "NS", help: "Namespace slug for all queries (defaults to authenticated user's namespace)" },
     { flags: ["-p", "--pref", "--prefix", "--proj", "--project"], dest: "project", metavar: "PROJECT", help: "List experiments in this project. Supports glob patterns — always quote them: -p 'tom/tut*'" },
     { flags: ["--status"], dest: "status", metavar: "STATUS", choices: ["COMPLETED", "RUNNING", "FAILED", "ARCHIVED"], help: "Filter experiments by status" },
@@ -323,6 +324,10 @@ async function searchExperiments(
 // ── entry point ──────────────────────────────────────────────────────────────
 
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    const n = await import("../managed/native-transfer.js");
+    return n.runNativeTransfer(() => (args.tracks ? n.listTracksNative(args) : args.project === undefined ? n.listProjectsNative(args) : n.listRunsNative(args)));
+  }
   const ctx = resolveContext(args);
   if (!ctx.apiKey) {
     console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx)}`);

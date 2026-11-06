@@ -1,0 +1,689 @@
+/**
+ * `upload`, `download` and `list` with `--backend native`.
+ *
+ * Local `.dash` transfer runs through the existing upload/download pipelines (discovery,
+ * validation, --strict, --resume/--state-file, batching, concurrency, --overwrite, skips)
+ * with the native adapters below in place of the standalone RemoteClient. Tracks use their
+ * own native routes. Everything uses the shared DreamLake login (managed `context`), and
+ * nothing falls back to a standalone Dash server.
+ *
+ * Runs keep their folders, names and metadata on servers with `run-paths`. Bindrs (the run's, with
+ * its create; each file's, right after that file with its new id) and `write_protected` (your
+ * login protects the run once every part and bindr is written; a protected run takes no data) need
+ * the server's native-1 operation schema to list them: otherwise they are refused before any write.
+ */
+import { createHash, randomUUID } from 'node:crypto';
+import { createWriteStream, existsSync, linkSync, openAsBlob, renameSync, statSync, unlinkSync, readFileSync } from 'node:fs';
+import path from 'node:path';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
+import type { ParsedArgs } from '../cli/parser.js';
+import type { LocalStorage } from '../local/storage.js';
+import type { ExperimentInfo, ExperimentUploadClient } from '../commands/upload.js';
+import type { ExperimentDownloadClient, RemoteExperiment } from '../commands/download.js';
+import { bold, cyan, green, red, yellow } from '../util/ansi.js';
+import { fnmatch, hasWildcard } from '../util/glob.js';
+import { context, ManagementError, type Context } from './client.js';
+import { call, isNativeMetricName, json, nativeError, validName } from './native.js';
+
+const RUN_KEY = /^[A-Za-z0-9_-]{1,128}$/;
+const LEVELS = ['info', 'warn', 'error', 'debug', 'fatal'];
+/** Native per-request limits; larger --batch-size values are split, never truncated. */
+const MAX_BATCH = 1000;
+const runsBase = (ns: string, project: string) => `/native-experiments/ns/${encodeURIComponent(ns)}/projects/${encodeURIComponent(project)}`;
+const chunks = <T>(items: T[], size: number) => Array.from({ length: Math.ceil(items.length / size) }, (_, i) => items.slice(i * size, (i + 1) * size));
+
+function refuse(args: ParsedArgs, names: string[], why: string) {
+  const given = names.find(k => args[k] !== undefined && args[k] !== false);
+  if (given) throw nativeError('NATIVE_OPTION_UNSUPPORTED', `--${given.replace(/_/g, '-')} is not supported with --backend native.`, why);
+}
+function nativeContext(args: ParsedArgs): Context {
+  refuse(args, ['dash_url'], 'Native mode uses the DreamLake login and server; remove --dash-url.');
+  return context(args);
+}
+/** `ns/project/<run path>[/topic…]` split into namespace, project and the remaining path segments. */
+function trackTarget(raw: string, minParts: number, usage: string) {
+  const parts = raw.replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length < minParts || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', `Path must be ${usage}.`, 'Give namespace/project, the run (with its folders) and, for track data, the topic.');
+  return { namespace: parts[0]!, project: parts[1]!, segments: parts.slice(2) };
+}
+
+/**
+ * The run a track path names, and the topic after it. With native folders every split point is
+ * looked up by path (as the old CLI tried each split); a path that names more than one run is
+ * reported as ambiguous instead of picking one. Without folders the run is the third segment.
+ */
+async function resolveTrackRun(c: Context, ns: string, project: string, segments: string[], topicRequired: boolean) {
+  const base = runsBase(ns, project);
+  const caps: unknown[] = (await json(c, `${base}/status`)).capabilities ?? [];
+  if (!caps.includes('run-paths')) {
+    if (!RUN_KEY.test(segments[0]!)) throw nativeError('NATIVE_INVALID_RUN_KEY', `'${segments[0]}' is not a native run key.`, 'Run keys contain 1-128 letters, digits, underscores or hyphens.');
+    if (!topicRequired && segments.length > 1) throw nativeError('NATIVE_INVALID_PATH', 'This server has no native folders: give namespace/project/run.', 'Pass the topic with --topic-filter.');
+    return { run: await runByKey(c, ns, project, segments[0]!), topic: segments.slice(1).join('/') };
+  }
+  const found: Array<{ run: any; topic: string; at: string }> = [];
+  const last = topicRequired ? segments.length - 1 : segments.length;
+  for (let k = topicRequired ? 1 : last; k <= last; k++) {
+    const at = segments.slice(0, k);
+    if (!at.every(validName)) continue;
+    try {
+      const value = await json(c, `${base}/by-path/${at.map(encodeURIComponent).join('/')}`);
+      if (value.kind === 'run') found.push({ run: value.experiment, topic: segments.slice(k).join('/'), at: at.join('/') });
+    } catch (e) { if (!has(e, 'NATIVE_HTTP_404') && !has(e, 'NATIVE_PATH_NOT_FOUND')) throw e; }
+  }
+  if (!found.length) throw nativeError('NATIVE_RUN_NOT_FOUND', `No run found at ${ns}/${project}/${segments.join('/')}.`, 'Check the run path (folders and name).');
+  if (found.length > 1) throw nativeError('NATIVE_PATH_AMBIGUOUS', `The path names more than one run: ${found.map(f => `${f.at} (topic ${f.topic})`).join(', ')}.`,
+    'Rename the run or folder so that the run and the topic can be told apart.');
+  return { run: found[0]!.run, topic: found[0]!.topic };
+}
+
+/**
+ * Runs of a project (archived included), page by page until the server reports no next page.
+ * `stop` ends the scan early. A repeated cursor is a server paging fault and stops it.
+ */
+async function eachRun(c: Context, ns: string, project: string, stop: (run: any) => boolean = () => false): Promise<any[]> {
+  const runs: any[] = [];
+  const seen = new Set<string>();
+  for (let cursor: string | null = null; ;) {
+    const value: Record<string, any> = await json(c, `${runsBase(ns, project)}/runs?limit=100&includeArchived=true${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ''}`);
+    if (!Array.isArray(value.runs)) throw nativeError('NATIVE_INVALID_RESPONSE', 'Invalid run list.', 'Check matching server versions.');
+    for (const run of value.runs) { runs.push(run); if (stop(run)) return runs; }
+    if (!value.nextCursor) return runs;
+    if (typeof value.nextCursor !== 'string' || seen.has(value.nextCursor))
+      throw nativeError('NATIVE_CURSOR_LOOP', 'The server repeated a run cursor.', 'Retry after the server paging issue is resolved.');
+    seen.add(value.nextCursor);
+    cursor = value.nextCursor;
+  }
+}
+/** The run with this key, without creating one (the old CLI required an existing experiment). Keys are unique per project. */
+async function runByKey(c: Context, ns: string, project: string, key: string) {
+  const found = (await eachRun(c, ns, project, run => run.name === key)).find(run => run.name === key);
+  if (!found) throw nativeError('NATIVE_RUN_NOT_FOUND', `Run '${key}' was not found in ${ns}/${project}.`, 'Create it with ml-dash runs create --backend native, or check the key.');
+  return found;
+}
+
+/** Stream a response into `output` through a sibling temp file; `replace` keeps the old CLI's overwrite. */
+async function saveResponse(response: Response, output: string, replace: boolean) {
+  if (!response.body) throw nativeError('NATIVE_INVALID_RESPONSE', 'Empty response body.', 'Retry the download.');
+  const temp = path.join(path.dirname(output), `.ml-dash-download-${process.pid}-${randomUUID()}`);
+  const hash = createHash('sha256');
+  let bytes = 0;
+  try {
+    await pipeline(Readable.fromWeb(response.body as any),
+      new Transform({ transform(chunk: Buffer, _e, done) { hash.update(chunk); bytes += chunk.length; done(null, chunk); } }),
+      createWriteStream(temp, { flags: 'wx', mode: 0o600 }));
+    if (statSync(temp).size !== bytes) throw nativeError('NATIVE_WRITE_INCOMPLETE', 'The download was not fully written.', 'Retry the download.');
+    if (replace) renameSync(temp, output);
+    else linkSync(temp, output);
+  } finally {
+    try { unlinkSync(temp); } catch { /* renamed or never created */ }
+  }
+  return { bytes, checksum: hash.digest('hex') };
+}
+
+// ── canonical DreamLake projects ────────────────────────────────────────────
+
+const projectRoute = (ns: string, project: string) => `/namespaces/${encodeURIComponent(ns)}/projects/${encodeURIComponent(project)}`;
+/** The caller's personal namespace (what the old CLI's `me.username` named). */
+async function personalNamespace(c: Context): Promise<string> {
+  const me = await json(c, '/auth/me');
+  const slug = me.namespace?.slug ?? me.user?.namespace?.slug;
+  if (typeof slug !== 'string' || !slug) throw nativeError('NATIVE_NAMESPACE_UNKNOWN', 'Your DreamLake account has no personal namespace.', 'Pass namespace/project explicitly.');
+  return slug;
+}
+const has = (e: unknown, code: string) => e instanceof ManagementError && e.code === code;
+/**
+ * Make sure a canonical DreamLake project exists, creating it PRIVATE when it does not, as the old
+ * uploader's upsert did. A readable project is used as is; a slug held by a project the caller cannot
+ * see is reported, never taken over; a missing namespace is never created. Auth, network and other
+ * errors propagate unchanged, so only a real "not found" leads to a create.
+ */
+export async function ensureProject(c: Context, ns: string, project: string, description?: string): Promise<{ created: boolean; project: Record<string, any> }> {
+  try { return { created: false, project: await json(c, projectRoute(ns, project)) }; }
+  catch (e) { if (!has(e, 'NATIVE_HTTP_404')) throw e; }
+  try {
+    const created = await json(c, `/namespaces/${encodeURIComponent(ns)}/projects`, 'POST',
+      { name: project, slug: project, visibility: 'private', ...(description !== undefined ? { description } : {}) });
+    return { created: true, project: created };
+  } catch (e) {
+    if (has(e, 'NATIVE_HTTP_409')) {
+      // Created meanwhile by someone whose project we can read is fine; a hidden one is not ours to use.
+      try { return { created: false, project: await json(c, projectRoute(ns, project)) }; } catch (again) { if (!has(again, 'NATIVE_HTTP_404')) throw again; }
+      throw nativeError('NATIVE_PROJECT_INACCESSIBLE', `Project '${ns}/${project}' exists but you cannot access it.`, 'Ask its owner for access, or choose another project name. Nothing was created.');
+    }
+    if (has(e, 'NATIVE_HTTP_404')) throw nativeError('NATIVE_NAMESPACE_NOT_FOUND', `Namespace '${ns}' does not exist.`, 'Namespaces and organizations are not created automatically; check the name.');
+    if (has(e, 'NATIVE_HTTP_403')) throw nativeError('NATIVE_PROJECT_CREATE_FORBIDDEN', `You cannot create projects in '${ns}'.`, 'Ask a namespace owner for project create permission, or create the project there first.');
+    throw e;
+  }
+}
+
+/** `create -p [namespace/]project [-d TEXT] --backend native` */
+export async function createProjectNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  const parts = String(args.project ?? '').replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length > 2 || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', 'Project can have at most 2 parts (namespace/project).', 'Examples: ml-dash create -p new-project --backend native');
+  const [ns, project] = parts.length === 2 ? parts as [string, string] : [await personalNamespace(c), parts[0]!];
+  const result = await ensureProject(c, ns, project, typeof args.description === 'string' ? args.description : undefined);
+  const p = result.project;
+  console.log(result.created ? `${green('✓')} Project created successfully!` : `${yellow('⚠')} Project already exists.`);
+  console.log(`  Name: ${bold(String(p.slug ?? project))}\n  Namespace: ${bold(ns)}\n  ID: ${p.id}\n  Visibility: ${p.visibility ?? 'private'}`);
+  if (result.created && typeof args.description === 'string') console.log(`  Description: ${args.description}`);
+  return 0;
+}
+
+/** `list [-n namespace] --backend native`: every DreamLake project the caller can read in the namespace. */
+export async function listProjectsNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  refuse(args, ['status', 'tags', 'topic_filter', 'detailed'], 'Project listing takes --namespace only; pass -p namespace/project to list runs.');
+  const ns = typeof args.namespace === 'string' ? args.namespace : await personalNamespace(c);
+  const projects: any[] = [];
+  for (let page = 1; ; page++) {
+    const value = await json(c, `/namespaces/${encodeURIComponent(ns)}/projects?page=${page}&pageSize=200`);
+    if (!Array.isArray(value.projects)) throw nativeError('NATIVE_INVALID_RESPONSE', 'Invalid project list.', 'Check matching server versions.');
+    projects.push(...value.projects);
+    const pages = Number(value.totalPages);
+    if (!value.projects.length || !Number.isSafeInteger(pages) || page >= pages) break;
+  }
+  if (!projects.length) { console.log(yellow(`No projects found in ${ns}`)); return 0; }
+  console.log(bold(`\nProjects in ${ns}\n`));
+  for (const p of projects) console.log(`  ${cyan(String(p.slug))}  ${p.visibility}  ${p.name !== p.slug ? p.name : ''}`.trimEnd());
+  return 0;
+}
+
+// ── upload adapter ──────────────────────────────────────────────────────────
+
+export { validName };
+
+/** `namespace/project/folders…/run`; a legacy two-part `project/run` is in the personal namespace (the old CLI's default). */
+function parsePrefix(prefix: string, personal: string | null) {
+  const parts = prefix.replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.some(p => !p) || parts.length < 2) return null;
+  const full = parts.length === 2 ? (personal ? [personal, ...parts] : null) : parts;
+  if (!full) return null;
+  return { ns: full[0]!, project: full[1]!, folders: full.slice(2, -1), name: full[full.length - 1]! };
+}
+const segmentsPath = (segments: string[]) => segments.map(encodeURIComponent).join('/');
+
+/** RemoteClient's upload surface over native REST. Run IDs map to their project route. */
+class NativeUploadClient implements ExperimentUploadClient {
+  private readonly bases = new Map<string, string>();
+  /** Capabilities per `namespace/project`, read in the preflight (after the project exists). */
+  readonly caps = new Map<string, string[]>();
+  personal: string | null = null;
+  constructor(readonly c: Context) {}
+  private run(id: string) {
+    const base = this.bases.get(id);
+    if (!base) throw new Error(`unknown native run ${id}`);
+    return `${base}/runs/${id}`;
+  }
+  async createOrUpdateExperiment(args: Parameters<ExperimentUploadClient['createOrUpdateExperiment']>[0]): Promise<any> {
+    const target = parsePrefix(args.prefix ?? '', this.personal);
+    // The prefix is the run's DreamLake location (checked against --target or the declared prefix in the preflight).
+    if (!target || target.name !== args.name) throw new Error(`prefix '${args.prefix}' does not name run '${args.name}'`);
+    // Protection is applied by protectExperiment once every part is written: a protected run takes no data.
+    const caps = this.caps.get(`${target.ns}/${target.project}`) ?? [];
+    const body: Record<string, unknown> = {};
+    const bindrs = args.bindrs ?? [];
+    // A string clears or sets ('' clears); null means "not recorded" and leaves the run as it is.
+    if (typeof args.description === 'string') body.description = args.description;
+    if (Array.isArray(args.tags)) body.tags = args.tags;
+    if (args.metadata && Object.keys(args.metadata).length) body.metadata = args.metadata;
+    if (bindrs.length) body.bindrs = bindrs;
+    const base = runsBase(target.ns, target.project);
+    const value = caps.includes('run-paths')
+      ? await json(this.c, `${base}/run-paths/${segmentsPath([...target.folders, target.name])}`, 'PUT', body)
+      : await json(this.c, `${base}/runs/${encodeURIComponent(target.name)}`, 'PUT', body);
+    this.bases.set(String(value.experiment?.id), base);
+    // The run's bindrs are found or created and attached with the create; a name missing from the answer is a failed run.
+    const attached = new Set(Array.isArray(value.bindrs) ? value.bindrs.map((b: any) => b?.name) : []);
+    const missing = [...new Set(bindrs.map(name => name.trim()))].filter(name => !attached.has(name));
+    if (missing.length) throw new Error(`the server did not confirm the run's bindrs ${JSON.stringify(missing)}`);
+    return value;
+  }
+  /** `write_protected`: a person's protection, set last (PATCH `writeProtected: true`), after all data was written. */
+  async protectExperiment(id: string): Promise<void> {
+    const value = await json(this.c, this.run(id), 'PATCH', { writeProtected: true });
+    if (value.experiment?.writeProtected !== true) throw new Error('the server did not confirm the run\'s write protection');
+  }
+  async setParameters(id: string, data: Record<string, unknown>): Promise<any> {
+    return json(this.c, `${this.run(id)}/parameters`, 'POST', { data });
+  }
+  async createLogEntries(id: string, logs: Record<string, unknown>[]): Promise<any> {
+    for (const batch of chunks(logs, MAX_BATCH)) await json(this.c, `${this.run(id)}/logs`, 'POST', { entries: batch });
+    return { count: logs.length };
+  }
+  async appendBatchToMetric(id: string, name: string, points: unknown[]): Promise<any> {
+    for (const batch of chunks(points, MAX_BATCH)) await json(this.c, `${this.run(id)}/metrics/${encodeURIComponent(name)}`, 'POST', { dataPoints: batch });
+    return { count: points.length };
+  }
+  async uploadFile(args: Parameters<ExperimentUploadClient['uploadFile']>[0]): Promise<any> {
+    const blob = await openAsBlob(args.filePath, { type: args.contentType || 'application/octet-stream' });
+    const hash = createHash('sha256');
+    for await (const chunk of blob.stream() as unknown as AsyncIterable<Uint8Array>) hash.update(chunk);
+    const form = new FormData();
+    form.append('sizeBytes', String(blob.size));
+    form.append('checksum', hash.digest('hex'));
+    form.append('prefix', '/' + (args.prefix ?? '').replace(/^\/+/, ''));
+    if (args.description) form.append('description', args.description);
+    if (args.tags?.length) form.append('tags', args.tags.join(','));
+    if (args.metadata) form.append('metadata', JSON.stringify(args.metadata));
+    form.append('file', blob, args.filename);
+    const value = await json(this.c, `${this.run(args.experimentId)}/files`, 'POST', undefined, form);
+    // The file's bindrs go on the file just stored, by its new id; a failed attach fails the file (and the run).
+    if (args.bindrs?.length) {
+      const id = value.id ?? value.file?.id;
+      if (typeof id !== 'string' || !/^[0-9a-f]{24}$/.test(id)) throw new Error('the server returned no file id to attach its bindrs to');
+      for (const name of new Set(args.bindrs.map(b => b.trim()))) {
+        const done = await json(this.c, `${this.run(args.experimentId)}/bindrs`, 'POST', { name, item: { kind: 'file', id } });
+        if (done.bindr?.name !== name) throw new Error(`the server did not confirm bindr '${name}' on file ${args.filename}`);
+      }
+    }
+    return value;
+  }
+}
+
+interface PreflightItem { info: ExperimentInfo; validation: { metadata?: Record<string, any> }; fullPrefix: string; targetProject: string }
+
+/**
+ * Every reason an experiment would reach native storage incompletely, for all experiments, before
+ * any run data is written. Static checks first; then each target project is made to exist (created
+ * private where allowed, as the old uploader did) so its capabilities can be read; then folders,
+ * names and run metadata are checked against them. A refusal there can leave a new empty project.
+ */
+async function preflight(client: NativeUploadClient, storage: LocalStorage, items: PreflightItem[], skipLogs: boolean, skipMetrics: boolean): Promise<string[]> {
+  const problems: string[] = [];
+  if (items.some(i => i.fullPrefix.replace(/^\/+|\/+$/g, '').split('/').length === 2)) client.personal = await personalNamespace(client.c);
+  const targets = new Map<string, { ns: string; project: string }>();
+  const wants = { bindrs: [] as string[], protection: [] as string[] };
+  const needs: Array<{ name: string; key: string; folders: string[]; runName: string; metadata: boolean }> = [];
+  for (const { info, validation, fullPrefix, targetProject } of items) {
+    const name = `${info.project}/${info.experiment}`;
+    const target = parsePrefix(fullPrefix, client.personal);
+    if (!target) { problems.push(`${name}: '${fullPrefix}' is not namespace/project/[folders/]run.`); continue; }
+    // From --target or a declared prefix, the project and run must agree with it. From the storage path alone,
+    // the path is the location (its second segment is the project; deeper segments are folders).
+    const fromStorage = !info.declaredPrefix && fullPrefix === info.storagePrefix;
+    if (target.name !== info.experiment || !fromStorage && target.project !== targetProject)
+      problems.push(`${name}: prefix '${fullPrefix}' does not name project '${targetProject}' and run '${info.experiment}'.`);
+    for (const segment of [...target.folders, target.name])
+      if (!validName(segment)) problems.push(`${name}: '${segment}' is not a valid native folder or run name.`);
+    const meta = validation.metadata ?? {};
+    const runBindrs = Array.isArray(meta.bindrs) ? meta.bindrs : [];
+    let fileBindrs = false;
+    try { fileBindrs = storage.listFiles(info.storagePrefix).some(f => (f.bindrs ?? []).length > 0); } catch { /* reported by the file upload */ }
+    for (const b of runBindrs) if (typeof b !== 'string' || !b.trim() || b.trim().length > 120) problems.push(`${name}: bindr ${JSON.stringify(b)} is not a valid name (1-120 characters).`);
+    if (new Set(runBindrs.map((b: string) => String(b).trim())).size > 32) problems.push(`${name}: a run takes at most 32 bindrs.`);
+    if (runBindrs.length || fileBindrs) wants.bindrs.push(name);
+    if (meta.write_protected === true) wants.protection.push(name);
+    if (!skipMetrics) for (const metric of info.metrics) {
+      if (!isNativeMetricName(metric.name)) { problems.push(`${name}: metric '${metric.name}' is not a native metric name (1-256 characters, no '/', not '.' or '..').`); continue; }
+      if (storage.readMetricPoints(metric).points.some(p => !p || typeof p !== 'object' || Array.isArray(p)))
+        problems.push(`${name}: metric '${metric.name}' has non-object points, which native metrics do not store.`);
+    }
+    if (!skipLogs && info.hasLogs) {
+      let bad = 0;
+      // Lines without `message` stay skipped with a warning, as before; uploaded entries need what the native API requires.
+      for (const line of readFileSync(path.join(info.dir, 'logs', 'logs.jsonl'), 'utf8').split('\n')) {
+        if (!line.trim()) continue;
+        let entry: any; try { entry = JSON.parse(line); } catch { continue; }
+        if (!entry || typeof entry !== 'object' || !('message' in entry)) continue;
+        if (typeof entry.message !== 'string' || typeof entry.timestamp !== 'string' || !Number.isFinite(Date.parse(entry.timestamp)) ||
+            entry.level !== undefined && !LEVELS.includes(entry.level)) bad++;
+      }
+      if (bad) problems.push(`${name}: ${bad} log entr${bad === 1 ? 'y needs' : 'ies need'} a string message, an ISO timestamp and a native level.`);
+    }
+    const key = `${target.ns}/${target.project}`;
+    targets.set(key, { ns: target.ns, project: target.project });
+    needs.push({ name, key, folders: target.folders, runName: target.name,
+      metadata: !!(meta.metadata && typeof meta.metadata === 'object' && Object.keys(meta.metadata).length) });
+  }
+  if (problems.length) return problems;
+  // Before any project, run or byte is written: the server must list run protection and run bindrs in its operation schema.
+  if (wants.bindrs.length || wants.protection.length) {
+    const schema = await operationSchema(client.c);
+    if (wants.protection.length && !supportsRunProtection(schema))
+      problems.push(`write_protected (${wants.protection.join(', ')}) needs a server whose native operation schema lists run protection (runs.update writeProtected); this one does not.`);
+    if (wants.bindrs.length && !supportsRunBindrs(schema))
+      problems.push(`bindrs (${wants.bindrs.join(', ')}) need a server whose native operation schema lists run bindrs (POST runs/:runId/bindrs); this one does not.`);
+    if (problems.length) return problems;
+  }
+  for (const [key, t] of targets) {
+    await ensureProject(client.c, t.ns, t.project);
+    client.caps.set(key, (await json(client.c, `${runsBase(t.ns, t.project)}/status`)).capabilities ?? []);
+  }
+  for (const n of needs) {
+    const caps = client.caps.get(n.key)!;
+    if (!caps.includes('run-paths')) {
+      if (n.folders.length) problems.push(`${n.name}: folders (${n.folders.join('/')}) need a server with native folders (run-paths).`);
+      else if (!RUN_KEY.test(n.runName)) problems.push(`${n.name}: the name '${n.runName}' needs a server with native folders (run-paths).`);
+    }
+    if (n.metadata && !caps.includes('run-metadata-dict') && !caps.includes('run-paths')) problems.push(`${n.name}: run metadata needs a newer server (run-metadata-dict).`);
+  }
+  return problems;
+}
+
+/** The server's native-1 operation schema (`GET /native-experiments/schema?version=1`), or null when it has none. */
+async function operationSchema(c: Context): Promise<any[] | null> {
+  try {
+    const value = await json(c, '/native-experiments/schema?version=1');
+    return value.protocolVersion === 'native-1' && Array.isArray(value.operations) ? value.operations : null;
+  } catch (e) { if (has(e, 'NATIVE_HTTP_404')) return null; throw e; }
+}
+const supportsRunProtection = (ops: any[] | null) =>
+  !!ops?.some(op => op?.id === 'runs.update' && op.method === 'PATCH' && op.input?.properties?.body?.properties?.writeProtected);
+const supportsRunBindrs = (ops: any[] | null) =>
+  !!ops?.some(op => op?.method === 'POST' && typeof op.path === 'string' && /\/runs\/:runId\/bindrs$/.test(op.path));
+
+/** The upload pipeline's native target: its client, state identity and pre-write check. */
+export function nativeUploadTarget(args: ParsedArgs) {
+  const c = nativeContext(args);
+  const client = new NativeUploadClient(c);
+  return { client, server: c.url, stateIdentity: `native:${c.url}`,
+    preflight: (storage: LocalStorage, items: PreflightItem[], skipLogs: boolean, skipMetrics: boolean) => preflight(client, storage, items, skipLogs, skipMetrics) };
+}
+
+// ── download adapter ────────────────────────────────────────────────────────
+
+/** RemoteClient's download surface over native REST, for one DreamLake project. */
+class NativeDownloadClient implements ExperimentDownloadClient {
+  private readonly fileRuns = new Map<string, string>();
+  /** The project route of each discovered run: a glob may select runs of several projects. */
+  readonly bases = new Map<string, string>();
+  constructor(private readonly c: Context) {}
+  private run(id: string) {
+    const base = this.bases.get(id);
+    if (!base) throw new Error(`native run ${id} was not discovered`);
+    return `${base}/runs/${encodeURIComponent(id)}`;
+  }
+  async getParameters(id: string): Promise<Record<string, unknown>> {
+    try {
+      const value = (await json(this.c, `${this.run(id)}/parameters`)).parameters;
+      const data = value && typeof value === 'object' && value.data && typeof value.data === 'object' ? value.data : value;
+      return data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+    } catch (e) {
+      if (e instanceof ManagementError && (e.code === 'NATIVE_PARAMETERS_NOT_FOUND' || e.code === 'NATIVE_HTTP_404')) return {};
+      throw e;
+    }
+  }
+  async queryLogs(id: string, opts: Parameters<ExperimentDownloadClient['queryLogs']>[1] = {}): Promise<any> {
+    const q = new URLSearchParams({ limit: String(Math.min(opts.limit ?? MAX_BATCH, MAX_BATCH)), cursor: String(opts.offset ?? 0) });
+    if (opts.orderBy) q.set('orderBy', opts.orderBy);
+    if (opts.order) q.set('order', opts.order);
+    const value = await json(this.c, `${this.run(id)}/logs?${q}`);
+    return { logs: value.logs ?? [], hasMore: value.hasMore === true };
+  }
+  async listMetrics(id: string): Promise<any[]> { return (await json(this.c, `${this.run(id)}/metrics`)).metrics ?? []; }
+  /** Native metrics have no chunk index: the pipeline reads them by index pages instead. */
+  async getMetricStats(): Promise<any> { throw new Error('native metrics are read by index pages'); }
+  async downloadMetricChunk(): Promise<any> { throw new Error('native metrics are read by index pages'); }
+  async getMetricData(id: string, name: string, opts: { startIndex?: number; limit?: number; bufferOnly?: boolean } = {}): Promise<any> {
+    if (opts.bufferOnly) throw new Error('native metrics are read by index pages');
+    const q = new URLSearchParams({ limit: String(Math.min(opts.limit ?? MAX_BATCH, MAX_BATCH)), cursor: String(opts.startIndex ?? 0) });
+    const value = await json(this.c, `${this.run(id)}/metrics/${encodeURIComponent(name)}?${q}`);
+    return { data: (value.rows ?? []).map((row: unknown) => ({ data: row })), hasMore: value.nextCursor != null };
+  }
+  /** Native file listing is one response: the first page holds every file. */
+  async listFiles(id: string, _limit = 500, offset = 0): Promise<any> {
+    if (offset > 0) return { files: [], hasMore: false };
+    const files = (await json(this.c, `${this.run(id)}/files`)).files ?? [];
+    for (const f of files) this.fileRuns.set(String(f.id), id);
+    return { files: files.map((f: any) => ({ id: f.id, name: f.filename, pPath: f.prefix ?? f.path ?? '', description: f.description ?? null,
+      tags: f.tags ?? [], metadata: f.metadata ?? null,
+      physicalFile: { filename: f.filename, checksum: f.checksum, contentType: f.contentType, sizeBytes: f.sizeBytes } })), hasMore: false };
+  }
+  async downloadFileStreaming(fileId: string, destPath: string): Promise<string> {
+    const runId = this.fileRuns.get(fileId);
+    if (!runId) throw new Error(`file ${fileId} was not listed`);
+    const response = await call(this.c, `${this.run(runId)}/files/${encodeURIComponent(fileId)}/download`);
+    if (!response.body) throw new Error('empty download body');
+    await pipeline(Readable.fromWeb(response.body as any), createWriteStream(destPath));
+    return destPath;
+  }
+}
+
+/** A run's place under its project: its folder path and name (`path`), or its key at the root. */
+const runPath = (run: any) => String(run.path ?? run.name);
+/** `-p` beyond namespace/project: a glob over run paths, else an exact run or a folder's whole subtree. */
+function pathSelector(rest: string | undefined) {
+  if (!rest) return () => true;
+  if (hasWildcard(rest)) return (p: string) => fnmatch(p, rest);
+  return (p: string) => p === rest || p.startsWith(`${rest}/`);
+}
+function projectSelector(raw: string, what: string) {
+  const parts = raw.replace(/^\/+|\/+$/g, '').split('/');
+  const [ns, project] = parts;
+  if (!ns || !project) throw nativeError('NATIVE_INVALID_PATH', `--project must be namespace/project[/folder…], ${what}.`, 'Native runs live in a DreamLake project.');
+  return { ns, project, rest: parts.slice(2).join('/') || undefined };
+}
+
+/**
+ * The canonical projects a `namespace/project` selector names. Exact names are used as given (an
+ * unreadable one fails with its own error). A glob fans out over what the caller can read: your
+ * personal namespace and your organizations, and each namespace's readable-project catalog, every
+ * page. A project you cannot see is never listed, so it is never matched.
+ */
+async function selectedProjects(c: Context, ns: string, project: string): Promise<Array<{ ns: string; project: string }>> {
+  let namespaces = [ns];
+  if (hasWildcard(ns)) {
+    const mine = await personalNamespace(c).catch(() => null);
+    const orgs = await json(c, '/graphql', 'POST', { query: 'query MlDashNativeGlobOrgs { myOrganizations { slug } }' });
+    const slugs = [...(mine ? [mine] : []), ...((orgs.data?.myOrganizations ?? []) as Array<{ slug: string }>).map(o => o.slug)];
+    namespaces = [...new Set(slugs)].filter(slug => fnmatch(slug, ns));
+  }
+  if (!hasWildcard(project)) return namespaces.map(n => ({ ns: n, project }));
+  const out: Array<{ ns: string; project: string }> = [];
+  for (const n of namespaces) {
+    for (let page = 1; ; page++) {
+      const value = await json(c, `/namespaces/${encodeURIComponent(n)}/projects?page=${page}&pageSize=200`);
+      for (const p of value.projects ?? []) if (fnmatch(String(p.slug), project)) out.push({ ns: n, project: String(p.slug) });
+      if (!value.projects?.length || !Number.isSafeInteger(Number(value.totalPages)) || page >= Number(value.totalPages)) break;
+    }
+  }
+  return out;
+}
+
+/** The download pipeline's native source: `-p namespace/project[/folder…|/glob]` (globs anywhere), every page of runs. */
+export function nativeDownloadSource(args: ParsedArgs) {
+  const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a run, folder or glob');
+  const c = nativeContext(args);
+  const client = new NativeDownloadClient(c);
+  const selected = pathSelector(rest);
+  return {
+    client,
+    stateIdentity: `native:${c.url}`,
+    async discover(experiment?: string): Promise<RemoteExperiment[]> {
+      const found: RemoteExperiment[] = [];
+      for (const target of await selectedProjects(c, ns, project)) {
+        const base = runsBase(target.ns, target.project);
+        for (const run of await eachRun(c, target.ns, target.project)) {
+          if (!selected(runPath(run)) || experiment !== undefined && run.name !== experiment) continue;
+          client.bases.set(String(run.id), base);
+          found.push({ project: target.project, experiment: run.name, experimentId: run.id, owner: target.ns, prefix: `${target.ns}/${target.project}/${runPath(run)}`,
+            description: run.description ?? null, tags: run.tags ?? [], metadata: run.metadata ?? null,
+            metricNames: [], fileCount: 0, status: run.status ?? 'RUNNING', countsUnknown: true });
+        }
+      }
+      return found;
+    },
+  };
+}
+
+export function reportNativeError(e: unknown): number {
+  if (e instanceof ManagementError) console.error(`${red('Error:')} ${e.code}: ${e.message}\n${e.remediation}`);
+  else console.error(`${red('Error:')} The native request did not complete; a write outcome may be unknown.`);
+  return 1;
+}
+
+// ── tracks ──────────────────────────────────────────────────────────────────
+
+/** `upload --tracks FILE --remote-path ns/project/run/topic --backend native` */
+export async function uploadTrackNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  const t = trackTarget(String(args.remote_path ?? ''), 4, "'namespace/project/run/topic'");
+  const local = String(args.tracks);
+  if (!existsSync(local)) throw nativeError('NATIVE_FILE_UNREADABLE', `File not found: ${local}`, 'Choose a readable JSONL file.');
+  const { run, topic } = await resolveTrackRun(c, t.namespace, t.project, t.segments, true);
+  const entries: Record<string, unknown>[] = [];
+  readFileSync(local, 'utf8').split('\n').forEach((line, i) => {
+    if (!line.trim()) return;
+    try {
+      const entry = JSON.parse(line);
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry) || typeof entry.timestamp !== 'number') {
+        console.log(`${yellow('Warning:')} Line ${i + 1} has no numeric timestamp, skipping`);
+        return;
+      }
+      entries.push(entry);
+    } catch (e) { console.log(`${yellow('Warning:')} Line ${i + 1} invalid JSON: ${(e as Error).message}`); }
+  });
+  if (!entries.length) throw nativeError('NATIVE_TRACK_EMPTY', 'No valid entries found in the file.', 'Each JSONL line needs a numeric timestamp.');
+  console.log(bold('Uploading track data (native)...'));
+  const route = `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks/${encodeURIComponent(topic)}/append_batch`;
+  let total = 0;
+  for (const batch of chunks(entries, 1000)) {
+    await json(c, route, 'POST', { entries: batch });
+    total += batch.length;
+    console.log(`  Uploaded ${total}/${entries.length} entries`);
+  }
+  console.log(`\n${green('✓ Track data uploaded successfully')}\n  Total entries: ${total}\n  Topic: ${topic}\n  Run: ${t.namespace}/${t.project}/${runPath(run)} (${run.id})`);
+  return 0;
+}
+
+/** `download --tracks ns/project/run/topic [--format F] [-o FILE] --backend native` */
+export async function downloadTrackNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  const t = trackTarget(String(args.tracks), 4, "'namespace/project/run/topic'");
+  const format = typeof args.format === 'string' ? args.format : 'jsonl';
+  const { run, topic: name } = await resolveTrackRun(c, t.namespace, t.project, t.segments, true);
+  const output = path.resolve(typeof args.output === 'string' ? args.output : `${name.replace(/\//g, '_')}.${format}`);
+  // A trailing '/' in the topic selects every track under it (mcap only), as the server documents.
+  const topic = encodeURIComponent(name + (String(args.tracks).endsWith('/') ? '/' : ''));
+  const response = await call(c, `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks/${topic}/data?format=${encodeURIComponent(format)}`);
+  const { bytes } = await saveResponse(response, output, true);
+  console.log(`${green('✓ Track data downloaded successfully')}\n  Output: ${output}\n  Size: ${bytes} bytes\n  Format: ${format}`);
+  return 0;
+}
+
+/** `list --tracks -p ns/project/run [--topic-filter T] --backend native` */
+export async function listTracksNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  refuse(args, ['status', 'tags', 'detailed'], 'Native track listing takes --project and --topic-filter only.');
+  const t = trackTarget(String(args.project ?? ''), 3, "'namespace/project/run'");
+  const { run } = await resolveTrackRun(c, t.namespace, t.project, t.segments, false);
+  const filter = typeof args.topic_filter === 'string' ? `?topic=${encodeURIComponent(args.topic_filter)}` : '';
+  const { tracks } = await json(c, `${runsBase(t.namespace, t.project)}/runs/${run.id}/tracks${filter}`);
+  if (!Array.isArray(tracks) || !tracks.length) { console.log(yellow('No tracks found')); return 0; }
+  console.log(bold(`\nTracks in ${t.namespace}/${t.project}/${runPath(run)}\n`));
+  for (const track of tracks) console.log(`  ${cyan(String(track.topic))}  ${track.totalEntries ?? track.count ?? 0} entries`);
+  return 0;
+}
+
+/** `list -p ns/project[/folder…|/glob] [--status S] [--tags a,b] --backend native`: the project's runs by path. */
+export async function listRunsNative(args: ParsedArgs): Promise<number> {
+  const c = nativeContext(args);
+  refuse(args, ['topic_filter', 'detailed'], 'Native run listing takes --project, --status and --tags.');
+  const { ns, project, rest } = projectSelector(String(args.project ?? ''), 'optionally followed by a folder or glob');
+  const selected = pathSelector(rest);
+  const tags = typeof args.tags === 'string' ? args.tags.split(',').map(t => t.trim()).filter(Boolean) : null;
+  const targets = await selectedProjects(c, ns, project);
+  const many = hasWildcard(ns) || hasWildcard(project);
+  let shown = 0;
+  for (const target of targets) {
+    const runs = (await eachRun(c, target.ns, target.project)).filter(run => selected(runPath(run)) &&
+      (args.status === undefined || (args.status === 'ARCHIVED' ? !!run.archivedAt : run.status === args.status && !run.archivedAt)) &&
+      (!tags || (run.tags ?? []).some((t: string) => tags.includes(t))));
+    if (!runs.length) continue;
+    console.log(bold(`\nRuns in ${target.ns}/${target.project}${rest ? `/${rest}` : ''}\n`));
+    for (const run of runs) console.log(`  ${cyan(many ? `${target.ns}/${target.project}/${runPath(run)}` : runPath(run))}  ${run.archivedAt ? 'ARCHIVED' : run.status}  ${run.id}`);
+    shown += runs.length;
+  }
+  if (!shown) console.log(yellow('No runs found'));
+  return 0;
+}
+
+/** Shared error reporting for the human-output track and list commands. */
+export async function runNativeTransfer(work: () => Promise<number>): Promise<number> {
+  try { return await work(); } catch (e) { return reportNativeError(e); }
+}
+
+// ── project removal ─────────────────────────────────────────────────────────
+
+/** The server's answer to a project delete, with only the fields a person needs to act on. */
+async function deleteProjectRequest(c: Context, route: string): Promise<{ ok: true; body: Record<string, any> } | { ok: false; status: number; body: Record<string, any> }> {
+  let response: Response;
+  try {
+    response = await fetch(`${c.url}${route}`, { method: 'DELETE', redirect: 'error', signal: AbortSignal.timeout(120_000),
+      headers: c.token ? { authorization: `Bearer ${c.token}` } : {} });
+  } catch {
+    throw nativeError('NATIVE_NETWORK_ERROR', 'The delete request did not complete; whether the project was deleted is unknown.', 'Run the same remove again: it reports "not found" if the delete went through.', true);
+  }
+  let body: Record<string, any> = {};
+  try { body = await response.json() as Record<string, any>; } catch { /* empty or not JSON */ }
+  return response.ok ? { ok: true, body } : { ok: false, status: response.status, body };
+}
+
+/**
+ * `remove -p [namespace/]project [-y] --backend native`: delete the canonical DreamLake project and
+ * accept permanent deletion of its native experiment data, in one server transaction. Refuses on
+ * servers that cannot accept both together; it never falls back to deleting only the project.
+ */
+export async function removeProjectNative(args: ParsedArgs, confirm: (question: string) => Promise<string | null>): Promise<number> {
+  const c = nativeContext(args);
+  const parts = String(args.project ?? '').replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length > 2 || parts.some(p => !p)) throw nativeError('NATIVE_INVALID_PATH', 'Project can have at most 2 parts (namespace/project).', 'Example: ml-dash remove -p alice/old-project --backend native');
+  const [ns, slug] = parts.length === 2 ? parts as [string, string] : [await personalNamespace(c), parts[0]!];
+  const full = `${ns}/${slug}`;
+  let project: Record<string, any>;
+  try { project = await json(c, projectRoute(ns, slug)); } catch (e) {
+    if (has(e, 'NATIVE_HTTP_404')) { console.log(`${yellow('⚠')} Project '${bold(full)}' not found.`); return 0; }
+    throw e;
+  }
+  let capabilities: unknown[] = [];
+  // Native Experiments off or an older server: no capability, so no delete. Login and access errors are reported as they are.
+  try { capabilities = (await json(c, `${runsBase(ns, slug)}/status`)).capabilities ?? []; }
+  catch (e) { if (!(e instanceof ManagementError) || ['NATIVE_HTTP_401', 'NATIVE_LOGIN_REQUIRED', 'NATIVE_FORBIDDEN'].includes(e.code)) throw e; }
+  if (!capabilities.includes('project-delete-native-cleanup'))
+    throw nativeError('NATIVE_PROJECT_DELETE_UNAVAILABLE', 'This DreamLake server cannot delete a project together with its experiment data yet. Nothing was deleted.',
+      'Use a server that supports it; deleting only the project would leave its experiment data behind.');
+  const runs = (await eachRun(c, ns, slug)).length + ((await json(c, `${runsBase(ns, slug)}/trash?limit=100`)).runs ?? []).length;
+  if (!args.yes) {
+    console.log(`\n${red(bold('⚠ WARNING ⚠'))}\n\nYou are about to delete the DreamLake project ${bold(full)}\n` +
+      `  Project ID: ${project.id}\n  Visibility: ${project.visibility}\n  Experiment runs: ${runs}${runs >= 100 ? '+' : ''} (including archived and trashed)\n\n` +
+      'What happens:\n' +
+      `  • The project is removed and cannot be restored. Its name becomes free for a new project.\n` +
+      `  • Its experiment runs (parameters, metrics, logs, files and tracks) are queued for permanent deletion.\n` +
+      `  • Notes, artifacts, datasets and other items filed in the project are not deleted: they stay in '${ns}', no longer in this project.\n` +
+      `  • The project's bindrs and everyone's access grants to it are removed.\n` +
+      `  • If this project was set up for managed Dash Experiments, those experiments stay on the managed Dash service,\n` +
+      `    but you can no longer reach them through DreamLake: the project's managed commands (runs, metrics, logs, files,\n` +
+      `    setup and credentials without --backend native) stop working, and a new project with this name is not connected to them.\n\n` +
+      `${red('This action CANNOT be undone.')}\n`);
+    const answer = await confirm(`Type ${full} to confirm deletion: `);
+    if (answer === null) { console.log(`\n${yellow('Deletion cancelled.')} No confirmation on stdin — pass -y to confirm non-interactively.`); return 0; }
+    if (answer !== full) { console.log(`\n${yellow('Deletion cancelled.')}`); return 0; }
+  }
+  // The name may have been released and taken since the preview: the server checks this id again.
+  const current = await json(c, projectRoute(ns, slug)).catch(() => null);
+  if (!current || current.id !== project.id) throw nativeError('NATIVE_PROJECT_REPLACED', `'${full}' no longer names the project you reviewed. Nothing was deleted.`, 'Run remove again to review the current project.');
+  console.log(`\nDeleting project '${full}'...`);
+  const result = await deleteProjectRequest(c, `${projectRoute(ns, slug)}?expectedProjectId=${project.id}&nativeExperiments=purge`);
+  if (!result.ok) {
+    const code = typeof result.body.code === 'string' ? result.body.code : `NATIVE_HTTP_${result.status}`;
+    if (code === 'NATIVE_RUNS_WRITE_PROTECTED') {
+      console.error(`${red('✗')} These runs are write-protected, so nothing was deleted. Remove their protection first:`);
+      for (const run of result.body.runs ?? []) console.error(`    ${run.name} (${run.home})`);
+    } else if (code === 'PROJECT_COMPUTE_ACTIVE') {
+      console.error(`${red('✗')} Jobs are still running in this project, so nothing was deleted. Finish or cancel them first:`);
+      for (const job of result.body.computations ?? []) console.error(`    ${job.kind} ${job.id} (${job.status})`);
+    } else if (code === 'PROJECT_REPLACED') console.error(`${red('✗')} '${full}' now names a different project. Nothing was deleted; run remove again.`);
+    else if (result.status === 403) console.error(`${red('✗')} You do not have permission to delete '${full}'.`);
+    else if (result.status === 404) { console.log(`${yellow('⚠')} Project '${bold(full)}' not found.`); return 0; }
+    else console.error(`${red('✗')} The server refused the delete (${code}). Nothing is known to have changed; run remove again to check.`);
+    return 1;
+  }
+  const done = result.body;
+  console.log(`${green('✓')} Project '${bold(full)}' deleted.`);
+  if (done.nativeCleanup?.accepted) console.log('  Its experiment data is queued for permanent deletion.');
+  for (const [label, key] of [['Items moved out of the project', 'mountsRemoved'], ['Bindrs removed', 'bindrsRemoved'], ['Access grants removed', 'grantsRemoved']] as const)
+    if (typeof done[key] === 'number') console.log(`  ${label}: ${done[key]}`);
+  return 0;
+}

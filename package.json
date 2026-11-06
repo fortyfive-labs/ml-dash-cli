@@ -41,7 +41,8 @@
   },
   "dependencies": {
     "qrcode": "^1.5.4",
-    "semver": "^7.8.5"
+    "semver": "^7.8.5",
+    "yaml": "^2.9.1"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

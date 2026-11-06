@@ -28,6 +28,7 @@ Notes:
     { flags: ["--mutation", "-m"], dest: "mutation", metavar: "MUTATION", help: "GraphQL mutation string" },
     { flags: ["--jq"], dest: "jq", metavar: "PATH", help: "Extract value using dot-path (e.g., .me.username)" },
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (default: https://api.dash.ml)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): the ML-Dash server; native: DreamLake's ml-dash GraphQL endpoint, with the DreamLake login" },
   ],
   mutuallyExclusive: [{ dests: ["query", "mutation"], required: true }],
 };
@@ -60,7 +61,50 @@ export function extractPath(data: unknown, path: string): unknown {
   return cur;
 }
 
+/**
+ * `--backend native`: the same query against `<DreamLake API>/native-dash/graphql` (ml-dash's schema over
+ * DreamLake-native experiments) with the DreamLake login. No fallback to an ML-Dash server.
+ */
+async function nativeQuery(args: ParsedArgs, query: string): Promise<unknown> {
+  if (typeof args.dash_url === "string") throw new Error("--dash-url does not apply to --backend native (it uses the DreamLake login and server).");
+  const { context } = await import("../managed/client.js");
+  const c = context(args);
+  let response: Response;
+  try {
+    response = await fetch(`${c.url}/native-dash/graphql`, { method: "POST", redirect: "error", signal: AbortSignal.timeout(60_000),
+      headers: { "content-type": "application/json", ...(c.token ? { authorization: `Bearer ${c.token}` } : {}) },
+      body: JSON.stringify({ query }) });
+  } catch {
+    throw new Error("The DreamLake server did not answer; a mutation's outcome may be unknown.");
+  }
+  if (response.status === 404) throw new Error("This DreamLake server has no native ml-dash GraphQL endpoint.");
+  let body: any;
+  try { body = await response.json(); } catch { throw new Error(`The native GraphQL endpoint answered HTTP ${response.status} without JSON.`); }
+  if (Array.isArray(body?.errors) && body.errors.length) {
+    const first = body.errors[0] ?? {};
+    const code = typeof first.extensions?.code === "string" ? ` (${first.extensions.code})` : "";
+    throw new Error(`${typeof first.message === "string" ? first.message : "GraphQL error"}${code}`);
+  }
+  if (!response.ok) throw new Error(`The native GraphQL endpoint answered HTTP ${response.status}.`);
+  return body?.data ?? null;
+}
+
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") {
+    try {
+      const isMutation = typeof args.mutation === "string";
+      let result = await nativeQuery(args, buildQuery(String(isMutation ? args.mutation : args.query), isMutation));
+      if (typeof args.jq === "string") {
+        try { result = extractPath(result, args.jq); }
+        catch (e) { console.error(red(`Error extracting path '${args.jq}': ${(e as Error).message}`)); return 1; }
+      }
+      console.log(JSON.stringify(result, null, 2));
+      return 0;
+    } catch (e) {
+      console.error(red(`Error: ${(e as Error).message}`));
+      return 1;
+    }
+  }
   const ctx = resolveContext(args);
   if (!ctx.apiKey) {
     console.error(`${red("Error:")} ${notAuthenticatedMessage(ctx)}`);

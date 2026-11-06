@@ -28,6 +28,7 @@ export const spec: CommandSpec = {
     { flags: ["--dash-url", "--api-url"], dest: "dash_url", metavar: "URL", help: "ML-Dash server URL (default: from config)" },
     { flags: ["--json"], dest: "json", boolean: true, help: "Output as JSON" },
     { flags: ["--cached"], dest: "cached", boolean: true, help: "Use cached token data (default: fetch fresh from server)" },
+    { flags: ["--backend"], dest: "backend", metavar: "BACKEND", choices: ["standalone", "native"], help: "standalone (default): this ML-Dash login; native: the shared DreamLake login" },
   ],
 };
 
@@ -58,7 +59,24 @@ async function fetchFreshProfile(remoteUrl: string, token: string): Promise<Reco
   }
 }
 
+/** The DreamLake identity behind `--backend native`: always fetched from the server, never decoded locally. */
+async function nativeProfile(args: ParsedArgs): Promise<Record<string, any>> {
+  const { context, identity, request, ManagementError } = await import("../managed/client.js");
+  const info: Record<string, any> = { authenticated: false, backend: "native", local_user: safeUsername() };
+  try {
+    const c = context(args);
+    info.remote_url = c.url;
+    info.user = identity(await request(c, "/auth/me"));
+    info.authenticated = true;
+    info.source = "server";
+  } catch (e) {
+    info.error = e instanceof ManagementError ? `${e.code}: ${e.message} ${e.remediation}` : "Could not verify the DreamLake login.";
+  }
+  return info;
+}
+
 export async function run(args: ParsedArgs): Promise<number> {
+  if (args.backend === "native") return render(args, await nativeProfile(args));
   const config = new Config();
   const store = new TokenStore(config.configDir);
   const loaded = store.load();
@@ -99,6 +117,10 @@ export async function run(args: ParsedArgs): Promise<number> {
     }
   }
 
+  return render(args, info);
+}
+
+function render(args: ParsedArgs, info: Record<string, any>): number {
   if (args.json) {
     console.log(JSON.stringify(info, null, 2));
     return 0;
@@ -109,7 +131,7 @@ export async function run(args: ParsedArgs): Promise<number> {
       renderPanel(
         `${cyan(bold("OS Username:"))}  ${info.local_user}\n\n` +
           `${yellow(info.error ?? "Not authenticated")}\n\n` +
-          `Run ${cyan("ml-dash login")} to authenticate.`,
+          `Run ${cyan(info.backend === "native" ? "ml-dash auth login" : "ml-dash login")} to authenticate.`,
         { title: bold("ML-Dash Info") },
       ),
     );

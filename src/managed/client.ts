@@ -100,8 +100,10 @@ export async function workload(c: Context, a: ParsedArgs, suffix: string, method
 export async function graphql(c: Context, operation: string, variables: Record<string,unknown>): Promise<any> {
   const result=record(await request(c,'/graphql','POST',{query:operation,variables}));
   if(Array.isArray(result.errors)&&result.errors.length){
-    const allow=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND','BAD_USER_INPUT','OWNERSHIP_LIFECYCLE_UNSUPPORTED','ORGANIZATION_NOT_EMPTY','LAST_OWNER','LAST_OWNER_REQUIRED','CONFLICT']);
+    const allow=new Set(['UNAUTHENTICATED','FORBIDDEN','NOT_FOUND','BAD_USER_INPUT','OWNERSHIP_LIFECYCLE_UNSUPPORTED','ORGANIZATION_NOT_EMPTY','LAST_OWNER','LAST_OWNER_REQUIRED','CONFLICT','PRECONDITION_FAILED']);
     const supplied=result.errors[0]?.extensions?.code;const code=typeof supplied==='string'&&allow.has(supplied)?supplied:'MANAGED_GRAPHQL_REJECTED';
+    // A precondition failure carries the server's own instruction (e.g. which work must finish first); keep it.
+    if(code==='PRECONDITION_FAILED'&&typeof result.errors[0]?.message==='string')throw new ManagementError(code,'The server refused the organization operation.',result.errors[0].message.slice(0,300));
     throw new ManagementError(code,'The typed organization operation was rejected.',code==='OWNERSHIP_LIFECYCLE_UNSUPPORTED'?'DreamLake organization deletion is intentionally disabled until resource and secret retention manifests exist; retain the organization.':'Check current organization ownership and membership; no successful change was confirmed.');
   }
   return record(result.data);

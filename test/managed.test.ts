@@ -17,7 +17,8 @@ async function fixture(t:any,respond?:(call:Call)=>any){
  const calls:Call[]=[];const dir=mkdtempSync(path.join(tmpdir(),'managed-cli-test-'));const config=path.join(dir,'config');mkdirSync(config);
  const server=http.createServer(async(req,res)=>{
   let input='';for await(const c of req)input+=c;
-  const call={path:req.url!,method:req.method!,body:input?JSON.parse(input):undefined,auth:req.headers.authorization};calls.push(call);
+  let body:any;try{body=input?JSON.parse(input):undefined;}catch{body=input;}
+  const call={path:req.url!,method:req.method!,body,auth:req.headers.authorization};calls.push(call);
   let value=respond?.(call);if(value===undefined){
    if(call.path==='/auth/me')value={user:{id:'user-id',name:'Researcher'}};
    else if(call.path.startsWith('/managed-experiments/capabilities'))value={instanceId:'dash-instance',version:'1',apiUrl:'/managed-experiments',capabilities:['managed-setup-plan','runs','files'],token:'never-print'};
@@ -67,8 +68,9 @@ test('setup rejects a receipt for a different project rather than claiming ready
 
 test('standalone discovery uses separate Dash credential and paginated typed API',async t=>{const f=await fixture(t,c=>c.path==='/graphql'?{data:{myOrganizationsPaginated:{organizations:[{id:'dash-org',slug:'same-name'}],totalCount:4,hasMore:true,nextOffset:2}}}:undefined);const legacy=path.join(f.dir,'standalone');mkdirSync(legacy);writeFileSync(path.join(legacy,'config.json'),JSON.stringify({remote_url:f.url,api_key:'standalone-only-fixture'}));const r=await f.cli(['orgs','list','--standalone','--limit','2','--offset','0','--json']);assert.equal(r.code,0,r.out);assert.equal(r.data.data.nextOffset,2);assert.equal(f.calls[0].auth,'Bearer standalone-only-fixture');assert.match(f.calls[0].body.query,/myOrganizationsPaginated/);assert.doesNotMatch(r.out+r.err,/standalone-only-fixture|user-secret/);});
 test('standalone instance reads well-known metadata without guessing binary version',async t=>{const f=await fixture(t,c=>c.path==='/.well-known/dash-experiments'?{instanceId:'standalone-instance',protocolVersion:'1',managed:{supported:true,enabled:false}}:undefined);const legacy=path.join(f.dir,'standalone');mkdirSync(legacy);writeFileSync(path.join(legacy,'config.json'),JSON.stringify({remote_url:f.url,api_key:'standalone-fixture'}));const r=await f.cli(['instance','show','--standalone','--json']);assert.equal(r.code,0,r.out);assert.equal(r.data.data.protocolVersion,'1');assert.equal('binaryVersion'in r.data.data,false);assert.equal(r.data.data.managed.enabled,false);});
-test('organization create review is authority-specific and uses fixed typed variables',async t=>{const f=await fixture(t,c=>c.path==='/graphql'?{data:c.body.query.includes('CliOrganizationActor')?{me:{id:'actor-id'}}:c.body.query.includes('CliOrganizationAvailable')?{isOrgSlugAvailable:true}:{organizationCreate:{id:'new-org',slug:'new-lab',name:'New Lab'}}}:undefined);const out=path.join(f.dir,'org-create.json');const args=['orgs','create','--namespace','new-lab','--name','New Lab','--json'];assert.equal((await f.cli([...args,'--out',out])).code,0);assert.ok(f.calls.every(c=>!c.body.query.startsWith('mutation')));const r=await f.cli([...args,'--apply','--review',out]);assert.equal(r.code,0,r.out);assert.deepEqual(f.calls.find(c=>c.body.query.startsWith('mutation'))?.body.variables,{input:{slug:'new-lab',name:'New Lab'}});assert.equal(JSON.parse(readFileSync(out,'utf8')).authority,'dreamlake');});
-test('managed organization deletion remains disabled, without an unsafe mutation',async t=>{const f=await fixture(t,c=>c.path==='/graphql'?{data:{me:{id:'actor'}}}:undefined);const r=await f.cli(['orgs','delete','--namespace','lab','--json']);assert.equal(r.code,1);assert.equal(r.data.error.code,'OWNERSHIP_LIFECYCLE_UNSUPPORTED');assert.ok(f.calls.every(c=>!c.body?.query?.startsWith('mutation')));});
+test('organization create review is authority-specific and uses fixed typed variables',async t=>{const f=await fixture(t,c=>c.path==='/auth/me'?{user:{id:'actor-id'}}:c.path==='/graphql'?{data:c.body.query.includes('CliOrganizationAvailable')?{isOrgSlugAvailable:true}:{organizationCreate:{id:'new-org',slug:'new-lab',name:'New Lab'}}}:undefined);const out=path.join(f.dir,'org-create.json');const args=['orgs','create','--namespace','new-lab','--name','New Lab','--json'];assert.equal((await f.cli([...args,'--out',out])).code,0);assert.ok(f.calls.every(c=>!c.body?.query?.startsWith('mutation')));const r=await f.cli([...args,'--apply','--review',out]);assert.equal(r.code,0,r.out);assert.deepEqual(f.calls.find(c=>c.body?.query?.startsWith('mutation'))?.body.variables,{input:{slug:'new-lab',name:'New Lab'}});assert.equal(JSON.parse(readFileSync(out,'utf8')).authority,'dreamlake');});
+test('DreamLake organization deletion previews the canonical quarantine and applies only the reviewed id',async t=>{const f=await fixture(t,c=>c.path==='/auth/me'?{user:{id:'actor-id'}}:c.path==='/graphql'?{data:c.body.query.includes('CliOrganizationReview')?{organizationBySlug:{id:'org-id',slug:'lab',name:'Lab',description:null,myRole:'OWNER'}}:{organizationDelete:true}}:undefined);const out=path.join(f.dir,'org-delete.json');const args=['orgs','delete','--namespace','lab','--json'];const p=await f.cli([...args,'--out',out]);assert.equal(p.code,0,p.out);assert.match(p.data.data.review.effect,/Quarantine the organization/);assert.ok(f.calls.every(c=>!c.body?.query?.startsWith('mutation')));const r=await f.cli([...args,'--apply','--review',out]);assert.equal(r.code,0,r.out);assert.deepEqual(f.calls.filter(c=>c.body?.query?.startsWith('mutation')).map(c=>c.body.variables),[{id:'org-id'}]);});
+test('a canonical precondition refusal is reported with the server instruction, never as success',async t=>{const f=await fixture(t,c=>c.path==='/auth/me'?{user:{id:'actor-id'}}:c.path==='/graphql'?(c.body.query.includes('CliOrganizationReview')?{data:{organizationBySlug:{id:'org-id',slug:'lab',name:'Lab',description:null,myRole:'OWNER'}}}:{data:null,errors:[{message:'Finish or cancel active runs before deleting this organization.',extensions:{code:'PRECONDITION_FAILED'}}]}):undefined);const out=path.join(f.dir,'org-delete.json');const args=['orgs','delete','--namespace','lab','--json'];await f.cli([...args,'--out',out]);const r=await f.cli([...args,'--apply','--review',out]);assert.equal(r.code,1);assert.equal(r.data.error.code,'PRECONDITION_FAILED');assert.match(r.data.error.remediation,/active runs/);});
 test('explicit run delete gets only delete mode and leaves ordinary write session unchanged',async t=>{const f=await fixture(t);const out=path.join(f.dir,'delete.json');const args=['runs','delete',...target,'--run','run-id','--credential','writer-id','--json'];assert.equal((await f.cli([...args,'--out',out])).code,0);assert.ok(f.calls.every(c=>c.method==='GET'));const r=await f.cli([...args,'--apply','--review',out]);assert.equal(r.code,0,r.out);assert.deepEqual(f.calls.find(c=>c.path===root+'/session')?.body,{mode:'delete',runId:'run-id',workloadId:'writer-id'});assert.deepEqual(f.calls.find(c=>c.method==='DELETE')?.body,{});});
 test('trusted GraphQL extension codes survive without echoing arbitrary messages',async t=>{const f=await fixture(t,c=>c.path==='/graphql'?{errors:[{message:'sensitive-fixture',extensions:{code:'NOT_FOUND'}}]}:undefined);const r=await f.cli(['orgs','members','--namespace','lab','--json']);assert.equal(r.data.error.code,'NOT_FOUND');assert.doesNotMatch(r.out+r.err,/sensitive-fixture/);});
 
@@ -131,3 +133,180 @@ test('managed team discovery keeps DreamLake visibility separate from standalone
  for(const allowed of ['VISIBLE','SECRET']){visibility=allowed;const r=await f.cli(['orgs','teams','--namespace','lab','--json']);assert.equal(r.code,0,r.out);assert.equal(r.data.data.teams[0].visibility,allowed);}
  for(const rejected of ['PUBLIC','PRIVATE']){visibility=rejected;const r=await f.cli(['orgs','teams','--namespace','lab','--json']);assert.equal(r.code,1);assert.equal(r.data.error.code,'MANAGED_INVALID_RESPONSE');}
 });
+
+// ─── --backend native ─────────────────────────────────────────────────────────
+// Contract checks against dreamlake-server PR #1683 native routes (9fa3c663); not a run against that server.
+const nroot='/native-experiments/ns/lab/projects/research';
+const RUN='b'.repeat(24),FILE='c'.repeat(24);
+test('native backend is explicit: default stays managed, native never touches managed or Dash routes',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot+'/runs?')?{runs:[{id:RUN,name:'k'}],hasMore:false,nextCursor:null,token:'never-print'}:undefined);
+ const managed=await f.cli(['runs','list',...target,'--json']);assert.equal(managed.code,0,managed.out);assert.ok(f.calls.every(c=>c.path.startsWith('/managed-experiments/')));
+ f.calls.length=0;const native=await f.cli(['runs','list',...target,'--backend','native','--limit','2','--cursor','a'.repeat(24),'--json']);assert.equal(native.code,0,native.out);
+ assert.deepEqual(f.calls.map(c=>c.method+' '+c.path),[`GET ${nroot}/runs?limit=2&cursor=${'a'.repeat(24)}`]);assert.equal(f.calls[0].auth,'Bearer user-secret-never-print');
+ assert.equal(native.data.data.runs[0].id,RUN);assert.doesNotMatch(native.out+native.err,/never-print/);});
+test('native backend refuses managed-only options, commands without a native form, and foreign paths before any request',async t=>{const f=await fixture(t);
+ for(const args of [['setup','plan',...target],['runs','create',...target,'--run-key','k','--apply'],['runs','list',...target,'--standalone'],['adoption','inventory',...target],['orgs','list','--limit','5'],['runs','show',...target,'--run','../../other']]){
+  const r=await f.cli([...args,'--backend','native','--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/^NATIVE_/);}
+ const managed=await f.cli(['runs','archive',...target,'--run',RUN,'--json']);assert.equal(managed.data.error.code,'MANAGED_NATIVE_ONLY_ACTION');
+ assert.equal(f.calls.length,0);});
+test('native writes apply directly to the selected project with the documented bodies',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot)?{ok:true}:undefined);
+ const points=path.join(f.dir,'points.json'),meta=path.join(f.dir,'meta.json'),params=path.join(f.dir,'params.json');writeFileSync(points,'[{"step":1,"loss":0.5}]');writeFileSync(meta,'{"unit":"nats"}');writeFileSync(params,'{"lr":0.001}');
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','create','--run-key','trial_1'],['runs','status','--run',RUN,'--status','COMPLETED'],['runs','parameters','--run',RUN,'--data',params],
+  ['metrics','append','--run',RUN,'--metric','train.loss','--data',points,'--description','loss','--tags','a, b','--metadata',meta],['metrics','read','--run',RUN,'--metric','train.loss','--limit','1000','--cursor','1000'],['logs','read','--run',RUN,'--cursor','100']])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['PUT','/runs/trial_1',{}],['POST',`/runs/${RUN}/status`,{status:'COMPLETED'}],['POST',`/runs/${RUN}/parameters`,{data:{lr:0.001}}],
+  ['POST',`/runs/${RUN}/metrics/train.loss`,{dataPoints:[{step:1,loss:0.5}],description:'loss',tags:['a','b'],metadata:{unit:'nats'}}],
+  ['GET',`/runs/${RUN}/metrics/train.loss?limit=1000&cursor=1000`,undefined],['GET',`/runs/${RUN}/logs?cursor=100`,undefined]]);});
+test('native metric names and batches follow the server contract: Unicode names percent-encoded, >1000 small entries in one request',async t=>{const f=await fixture(t,c=>c.path.startsWith(nroot)?{ok:true}:undefined);
+ const n=['--backend','native','--json',...target];const small=path.join(f.dir,'small.json'),logs=path.join(f.dir,'logs.json'),big=path.join(f.dir,'big.json');
+ writeFileSync(small,JSON.stringify(Array.from({length:2000},(_,i)=>({step:i,v:i}))));
+ writeFileSync(logs,JSON.stringify(Array.from({length:1500},(_,i)=>({timestamp:'2026-11-05T00:00:00Z',level:'info',message:`m${i}`}))));
+ writeFileSync(big,JSON.stringify(Array.from({length:1001},()=>({blob:'x'.repeat(1100)}))));
+ for(const args of [['metrics','append','--run',RUN,'--metric','训练 loss','--data',small],['metrics','stats','--run',RUN,'--metric','acc?x#y'],
+  ['metrics','read','--run',RUN,'--metric','é'.repeat(256)],['logs','append','--run',RUN,'--data',logs]])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length)]),[['POST',`/runs/${RUN}/metrics/%E8%AE%AD%E7%BB%83%20loss`],
+  ['GET',`/runs/${RUN}/metrics/acc%3Fx%23y/stats`],['GET',`/runs/${RUN}/metrics/${encodeURIComponent('é'.repeat(256))}`],['POST',`/runs/${RUN}/logs`]]);
+ assert.equal(f.calls[0].body.dataPoints.length,2000);assert.equal(f.calls[3].body.entries.length,1500);
+ f.calls.length=0;
+ for(const bad of ['a/b','.','..','x'.repeat(257)])assert.equal((await f.cli(['metrics','stats','--run',RUN,'--metric',bad,...n])).data.error.code,'NATIVE_INVALID_METRIC',bad);
+ assert.equal((await f.cli(['metrics','append','--run',RUN,'--metric','m','--data',big,...n])).data.error.code,'NATIVE_INVALID_METRICS');
+ assert.equal(f.calls.length,0);});
+test('native files upload integrity fields before the file and download only checksum-verified bytes',async t=>{const served='"payload"';const sum=hash(Buffer.from(served));
+ const f=await fixture(t,c=>c.path.endsWith('/download')?'payload':c.path.endsWith(`/files/${FILE}`)?{file:{id:FILE,checksum:sum}}:c.path.endsWith('/files')?{id:FILE}:undefined);
+ const input=path.join(f.dir,'model.bin');writeFileSync(input,Buffer.from([1,2,3]));
+ assert.equal((await f.cli(['files','upload',...target,'--run',RUN,'--input',input,'--backend','native','--json'])).code,0);
+ const body=String(f.calls[0].body);const order=['name="sizeBytes"','name="checksum"','name="file"'].map(k=>body.indexOf(k));assert.ok(order.every((v,i)=>v>=0&&(i===0||v>order[i-1])),body);assert.match(body,new RegExp(hash(Buffer.from([1,2,3]))));
+ const out=path.join(f.dir,'got.bin');const d=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(d.code,0,d.out);assert.equal(readFileSync(out,'utf8'),served);
+ const again=await f.cli(['files','download',...target,'--run',RUN,'--file',FILE,'--out',out,'--backend','native','--json']);assert.equal(again.data.error.code,'NATIVE_DESTINATION_EXISTS');});
+test('native logout follows the shared login contract and keeps other envs and the standalone login',async t=>{const f=await fixture(t);
+ const {stringify}=await import('yaml');
+ writeFileSync(path.join(f.config,'auth.yml'),stringify({current:'beta',envs:{alpha:{server:'https://alpha.example',namespace:'a',token:'alpha-secret'},beta:{server:f.url,namespace:'b',token:'user-secret-never-print'}}}));
+ mkdirSync(path.join(f.dir,'standalone'),{recursive:true});writeFileSync(path.join(f.dir,'standalone','token'),'standalone-kept');
+ const one=await f.cli(['logout','--backend','native','--env','alpha','--json']);assert.equal(one.code,0,one.out);assert.equal(one.data.data.projection,'unchanged');
+ assert.equal(JSON.parse(readFileSync(path.join(f.config,'tokens.json'),'utf8'))['dreamlake-token'],'user-secret-never-print');
+ const two=await f.cli(['logout','--backend','native','--json']);assert.equal(two.data.data.projection,'cleared');
+ assert.equal(existsSync(path.join(f.config,'auth.yml')),false);assert.equal(JSON.parse(readFileSync(path.join(f.config,'tokens.json'),'utf8'))['dreamlake-token'],undefined);
+ assert.equal(JSON.parse(readFileSync(path.join(f.config,'config.json'),'utf8')).bss_url,'preserve-bss');
+ const denied=await f.cli(['auth','status','--backend','native','--json']);assert.equal(denied.data.error.code,'MANAGED_LOGIN_REQUIRED');
+ assert.equal(readFileSync(path.join(f.dir,'standalone','token'),'utf8'),'standalone-kept');
+ assert.doesNotMatch(one.out+two.out+denied.out,/secret/);
+ const unknown=await f.cli(['logout','--backend','native','--env','gamma','--json']);assert.equal(unknown.code,1);assert.equal(unknown.data.error.code,'SHARED_LOGIN_UNKNOWN_ENV');});
+test('native flags that an action would ignore are refused in both modes',async t=>{const f=await fixture(t);
+ for(const args of [['runs','protect',...target,'--run',RUN,'--tags','a','--backend','native'],['folders','list',...target,'--wait','--backend','native'],['logs','append',...target,'--run',RUN,'--data','x','--level','warn','--backend','native'],['runs','list',...target,'--tags','a']]){
+  const r=await f.cli([...args,'--json']);assert.equal(r.code,1,args.join(' '));assert.match(r.data.error.code,/_OPTION_UNSUPPORTED$/);}
+ assert.equal(f.calls.length,0);});
+
+const FOLDER='d'.repeat(24),OP='e'.repeat(24),TEAM='f'.repeat(24);
+test('native protection, folders and batches send the protocol-6 bodies; folder operations are followed to a terminal state',async t=>{let polls=0;
+ const f=await fixture(t,c=>{
+  if(c.path===`${nroot}/folders/${FOLDER}/purge`)return {operationId:OP,state:'checking'};
+  if(c.path===`${nroot}/folders/${FOLDER}/protect`)return {operationId:OP,state:'applying'};
+  if(c.path===`${nroot}/folder-operations/${OP}`)return {operation:{id:OP,kind:'purge',state:++polls<2?'checking':'done',counts:{applied:2,skipped:0}}};
+  if(c.path===`${nroot}/batch/trash`)return {items:c.body.items.map((i:any)=>({...i,status:i.type==='run'?'done':'accepted',...(i.type==='folder'?{operationId:OP}:{})})),counts:{done:1,accepted:1,skipped:0}};
+  if(c.path===`${nroot}/batch/purge`)return {items:[{type:'run',id:RUN,status:'skipped',reason:'NATIVE_RUN_WRITE_PROTECTED'}],counts:{done:0,accepted:0,skipped:1}};
+  return c.path.startsWith(nroot)?{ok:true}:undefined;});
+ const meta=path.join(f.dir,'meta.json');writeFileSync(meta,'{"seed":1}');
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','create','--run-key','训练 1','--folder-path','sweep/a','--write-protected','--metadata',meta],['runs','create','--run-key','k1','--write-protected'],
+  ['runs','protect','--run',RUN],['runs','unprotect','--run',RUN],['runs','update','--run',RUN,'--metadata',meta],['runs','move','--run',RUN,'--name','r2','--folder-path','root'],['runs','purge','--run',RUN],
+  ['folders','create','--path','sweep/a'],['folders','create','--name','b','--parent',FOLDER],['folders','update','--folder',FOLDER,'--parent','root'],['folders','list','--parent',FOLDER,'--limit','200'],
+  ['folders','show','--path','sweep/a'],['folders','protect','--folder',FOLDER],['folders','purge','--folder',FOLDER,'--wait'],['batch','trash','--runs',RUN,'--folders',FOLDER]]){
+  const r=await f.cli([...args,...n]);assert.equal(r.code,0,args.join(' ')+r.out);}
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['PUT','/run-paths/sweep/a/%E8%AE%AD%E7%BB%83%201',{metadata:{seed:1},writeProtected:true}],['PUT','/runs/k1',{writeProtected:true}],
+  ['PATCH',`/runs/${RUN}`,{writeProtected:true}],['PATCH',`/runs/${RUN}`,{writeProtected:false}],['PATCH',`/runs/${RUN}`,{metadata:{seed:1}}],
+  ['PATCH',`/runs/${RUN}`,{name:'r2',folderPath:''}],['POST',`/runs/${RUN}/purge`,undefined],
+  ['POST','/folders',{path:'sweep/a'}],['POST','/folders',{name:'b',parentId:FOLDER}],['PATCH',`/folders/${FOLDER}`,{parentId:null}],['GET',`/folders?limit=200&parentId=${FOLDER}`,undefined],
+  ['GET','/by-path/sweep/a',undefined],['POST',`/folders/${FOLDER}/protect`,undefined],
+  ['POST',`/folders/${FOLDER}/purge`,undefined],['GET',`/folder-operations/${OP}`,undefined],['GET',`/folder-operations/${OP}`,undefined],
+  ['POST','/batch/trash',{items:[{type:'run',id:RUN},{type:'folder',id:FOLDER}]}]]);
+ f.calls.length=0;
+ const partial=await f.cli(['batch','purge','--runs',RUN,...n]);assert.equal(partial.code,1);assert.equal(partial.data.error.code,'NATIVE_BATCH_PARTIAL');assert.match(partial.data.error.remediation,/NATIVE_RUN_WRITE_PROTECTED/);
+ // Refused before any request: bad ids, both destinations, an empty batch, and the managed backend.
+ for(const args of [['folders','trash','--folder','x',...n],['runs','move','--run',RUN,'--folder',FOLDER,'--folder-path','a',...n],['batch','trash',...n],['folders','list',...target,'--json'],['runs','protect',...target,'--run',RUN,'--json']]){
+  const r=await f.cli(args);assert.equal(r.code,1,args.join(' '));}
+ assert.deepEqual(f.calls.map(c=>c.path),[`${nroot}/batch/purge`]);});
+test('native teams delete previews the exact team, then applies only that reviewed state',async t=>{let members=[{id:'m1'}];let deleted=0;
+ const f=await fixture(t,c=>{if(c.path!=='/graphql')return undefined;
+  if(/teamDelete/.test(c.body.query)){deleted++;return {data:{teamDelete:true}};}
+  return {data:{team:{id:TEAM,slug:'leaf',name:'Leaf',orgId:'org-1',parentId:null,myRole:'MAINTAINER',org:{slug:'lab',myRole:'OWNER'},children:[],members}}};});
+ const out=path.join(f.dir,'team-review.json');
+ const preview=await f.cli(['teams','delete','--team',TEAM,'--out',out,'--backend','native','--json']);assert.equal(preview.code,0,preview.out);
+ assert.equal(preview.data.data.review.kind,'team-delete-review-v1');assert.equal(deleted,0);
+ members=[{id:'m1'},{id:'m2'}];
+ const stale=await f.cli(['teams','delete','--team',TEAM,'--apply','--review',out,'--backend','native','--json']);assert.equal(stale.data.error.code,'NATIVE_REVIEW_CHANGED');assert.equal(deleted,0);
+ members=[{id:'m1'}];
+ const applied=await f.cli(['teams','delete','--team',TEAM,'--apply','--review',out,'--backend','native','--json']);assert.equal(applied.code,0,applied.out);assert.equal(deleted,1);
+ const managed=await f.cli(['teams','delete','--team',TEAM,'--json']);assert.equal(managed.data.error.code,'MANAGED_NATIVE_ONLY_ACTION');});
+test('device login keeps polling through vuer-auth\'s HTTP 202 pending reply (live behavior) and its RFC 400 form',async t=>{let polls=0;
+ const f=await fixture(t,c=>c.path==='/api/device/start'?{user_code:'ABCD-EFGH',verification_uri:'https://auth.example/verify',interval:1,expires_in:20}
+  :c.path==='/api/device/poll'?(++polls===1?{statusCode:202,response:{error:'authorization_pending'}}:polls===2?{statusCode:400,response:{error:'authorization_pending'}}:{access_token:'vuer-fixture-secret'})
+  :c.path==='/auth/exchange'?{dreamlake_token:'new-dreamlake-fixture-secret'}:undefined);
+ const r=await f.cli(['auth','login','--auth-url',f.url,'--json','--no-browser']);assert.equal(r.code,0,r.out+r.err);assert.equal(polls,3);
+ assert.doesNotMatch(r.out+r.err,/vuer-fixture-secret|new-dreamlake-fixture-secret/);});
+const BINDR='a1'.repeat(12),NEWFILE='9'.repeat(24);
+test('native run bindrs: list, bind and unbind the run or one item; create joins named bindrs',async t=>{
+ const f=await fixture(t,c=>c.path.startsWith(nroot)?(c.path.endsWith('/bindrs')&&c.method==='POST'?{bindr:{id:BINDR,name:c.body.name??'x',parent:null},attached:true}:{ok:true,bindrs:[]}):undefined);
+ const n=['--backend','native','--json',...target];
+ for(const args of [['runs','bindrs','--run',RUN],['runs','bindrs','--run',RUN,'--item-kind','file','--item-id',FILE],['runs','bind','--run',RUN,'--bindr',' best '],
+  ['runs','bind','--run',RUN,'--bindr-id',BINDR,'--item-kind','metric','--item-id',FILE],['runs','unbind','--run',RUN,'--bindr-id',BINDR],['runs','create','--run-key','k2','--bindrs','a, b,a']])
+  assert.equal((await f.cli([...args,...n])).code,0,args.join(' '));
+ assert.deepEqual(f.calls.map(c=>[c.method,c.path.slice(nroot.length),c.body]),[
+  ['GET',`/runs/${RUN}/bindrs`,undefined],['GET',`/runs/${RUN}/bindrs?itemKind=file&itemId=${FILE}`,undefined],
+  ['POST',`/runs/${RUN}/bindrs`,{name:'best'}],['POST',`/runs/${RUN}/bindrs`,{bindrId:BINDR,item:{kind:'metric',id:FILE}}],
+  ['DELETE',`/runs/${RUN}/bindrs`,{bindrId:BINDR}],['PUT','/runs/k2',{bindrs:['a','b']}]]);
+ f.calls.length=0;
+ for(const args of [['runs','bind','--run',RUN],['runs','bind','--run',RUN,'--bindr','x','--bindr-id',BINDR],['runs','bindrs','--run',RUN,'--item-kind','file']])
+  assert.equal((await f.cli([...args,...n])).code,1,args.join(' '));
+ assert.equal(f.calls.length,0);});
+
+/** A native `.dash` upload target: one run with params, a log, a metric and one file. */
+function dashRun(dir:string,meta:Record<string,unknown>,fileBindrs:string[]=[]){
+ const d=path.join(dir,'dash','lab','research','sweep','r1');const body=Buffer.from('ckpt');
+ for(const sub of ['logs','metrics/loss',`files/ckpt/${FILE}`])mkdirSync(path.join(d,sub),{recursive:true});
+ writeFileSync(path.join(d,'experiment.json'),JSON.stringify({name:'r1',project:'research',description:null,tags:[],bindrs:[],prefix:'lab/research/sweep/r1',metadata:null,created_at:'2026-01-01T00:00:00Z',write_protected:false,...meta}));
+ writeFileSync(path.join(d,'parameters.json'),JSON.stringify({version:1,data:{lr:0.1},updatedAt:'2026-01-01T00:00:00Z'}));
+ writeFileSync(path.join(d,'logs','logs.jsonl'),JSON.stringify({sequenceNumber:0,timestamp:'2026-01-01T00:00:00Z',level:'info',message:'go'})+'\n');
+ writeFileSync(path.join(d,'metrics','loss','data.jsonl'),JSON.stringify({index:0,data:{step:0,loss:1}})+'\n');
+ writeFileSync(path.join(d,'metrics','loss','metadata.json'),JSON.stringify({name:'loss',totalDataPoints:1,nextIndex:1}));
+ writeFileSync(path.join(d,'files','ckpt',FILE,'model.bin'),body);
+ writeFileSync(path.join(d,'files','.files_metadata.json'),JSON.stringify({files:[{id:FILE,experimentId:'x',path:'ckpt',filename:'model.bin',description:null,tags:[],bindrs:fileBindrs,contentType:'application/octet-stream',sizeBytes:body.length,checksum:hash(body),metadata:null,uploadedAt:'2026-01-01T00:00:00Z',updatedAt:'2026-01-01T00:00:00Z',deletedAt:null}]}));
+ return path.join(dir,'dash');
+}
+const schemaOps=(protection:boolean,bindrs:boolean)=>({schemaVersion:'1',protocolVersion:'native-1',operations:[
+ {id:'runs.update',method:'PATCH',path:`${nroot}/runs/:runId`,input:{properties:{body:{properties:{archived:{},...(protection?{writeProtected:{type:'boolean'}}:{})}}}}},
+ ...(bindrs?[{id:'runs.bindrs.attach',method:'POST',path:'/native-experiments/ns/:namespace/projects/:project/runs/:runId/bindrs'}]:[])]});
+function nativeServer(schema:any){return (c:Call)=>{
+ if(c.path==='/native-experiments/schema?version=1')return schema??{statusCode:404,response:{error:{code:'NATIVE_HTTP_404'}}};
+ if(c.path==='/namespaces/lab/projects/research')return {id:'p'.repeat(24),slug:'research',visibility:'private'};
+ if(c.path===`${nroot}/status`)return {status:'ready',capabilities:['runs','run-paths','folders','machine-schema']};
+ if(c.method==='PUT'&&c.path.startsWith(`${nroot}/run-paths/`))return {experiment:{id:RUN,name:'r1'},...(c.body.bindrs?{bindrs:c.body.bindrs.map((name:string,i:number)=>({id:String(i).repeat(24),name}))}:{})};
+ if(c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/files`)return {id:NEWFILE,filename:'model.bin'};
+ if(c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/bindrs`)return {bindr:{id:BINDR,name:c.body.name,parent:null},attached:true};
+ if(c.method==='PATCH'&&c.path===`${nroot}/runs/${RUN}`)return {experiment:{id:RUN,writeProtected:c.body.writeProtected===true}};
+ if(c.path.startsWith(nroot))return {ok:true};
+ return undefined;};}
+const writes=(calls:Call[])=>calls.filter(c=>c.method!=='GET');
+test('native upload refuses write_protected or bindrs before any write when the server does not list them',async t=>{
+ for(const [meta,schema] of [[{write_protected:true},null],[{write_protected:true},schemaOps(false,true)],[{bindrs:['best']},schemaOps(true,false)]] as const){
+  const f=await fixture(t,nativeServer(schema));
+  const r=await f.cli(['upload',dashRun(f.dir,meta as any),'--backend','native','--state-file',path.join(f.dir,'state.json')]);
+  assert.equal(r.code,1,JSON.stringify(meta));assert.match(r.err+r.out,/nothing was uploaded/);
+  assert.deepEqual(writes(f.calls),[],JSON.stringify(meta));
+  assert.ok(!f.calls.some(c=>c.path.startsWith('/namespaces/')),'no project lookup or create before the refusal');}});
+test('native upload attaches run and file bindrs (by the new file id) before protecting the run last',async t=>{
+ const f=await fixture(t,nativeServer(schemaOps(true,true)));
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true,bindrs:['best','sweep']},['ckpt']),'--backend','native','--state-file',path.join(f.dir,'state.json')]);assert.equal(r.code,0,r.out+r.err);
+ const w=writes(f.calls).map(c=>[c.method,c.path.slice(nroot.length),c.path.endsWith('/files')?'(form)':c.body]);
+ assert.deepEqual(w[0].slice(0,2),['PUT','/run-paths/sweep/r1']);assert.deepEqual((w[0][2] as any).bindrs,['best','sweep']);
+ const fileAt=w.findIndex(x=>x[1]===`/runs/${RUN}/files`),bindAt=w.findIndex(x=>x[1]===`/runs/${RUN}/bindrs`);
+ assert.ok(fileAt>0&&bindAt===fileAt+1);assert.deepEqual(w[bindAt][2],{name:'ckpt',item:{kind:'file',id:NEWFILE}});
+ assert.deepEqual(w[w.length-1],['PATCH',`/runs/${RUN}`,{writeProtected:true}]);
+ assert.equal(w.filter(x=>x[0]==='PATCH').length,1);});
+test('native upload fails the run, unprotected, when a file bindr is not confirmed',async t=>{
+ const base=nativeServer(schemaOps(true,true));
+ const f=await fixture(t,c=>c.method==='POST'&&c.path===`${nroot}/runs/${RUN}/bindrs`?{statusCode:409,response:{error:{code:'NATIVE_RUN_BINDRS_UNAVAILABLE'}}}:base(c));
+ const r=await f.cli(['upload',dashRun(f.dir,{write_protected:true},['ckpt']),'--backend','native','--state-file',path.join(f.dir,'state.json')]);assert.equal(r.code,1,r.out);
+ assert.ok(!f.calls.some(c=>c.method==='PATCH'),'never protected after a failed part');});

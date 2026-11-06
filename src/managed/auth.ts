@@ -14,33 +14,37 @@ export async function login(a: ParsedArgs): Promise<unknown> {
   const verification = new URL(text(flow.verification_uri));
   if (verification.protocol !== 'https:' && !['127.0.0.1','localhost'].includes(verification.hostname)) throw invalidResponse();
   process.stderr.write(`Authorize this login at ${verification.origin}${verification.pathname}\nCode: ${text(flow.user_code)}\n`);
-  const interval = typeof flow.interval === 'number' ? Math.max(1,Math.min(flow.interval,30)) : 5;
+  let interval = typeof flow.interval === 'number' ? Math.max(1,Math.min(flow.interval,30)) : 5;
   const until = Date.now()+Math.min(Number(flow.expires_in)||600,600)*1000;
   let access: string | undefined;
   while (Date.now()<until) {
-    // Poll replies use OAuth's HTTP400 pending envelope, not the management error contract.
+    // Poll replies use OAuth's pending envelope, not the management error contract: vuer-auth answers a pending
+    // poll with HTTP 202 `{error:"authorization_pending"}` (RFC 8628 uses 400), so a 2xx alone is not a token.
     let response: Response;
     try { response = await fetch(`${authUrl}/api/device/poll`,{method:'POST',redirect:'error',signal:AbortSignal.timeout(10000),headers:{'content-type':'application/json'},body:JSON.stringify({client_id:'dreamlake-app',device_secret_hash:hash})}); }
     catch { throw new ManagementError('MANAGED_AUTH_NETWORK','Device authorization could not be completed.','Retry login; no credential was saved.',true); }
-    const result = record(await response.json());
-    if (response.ok) { access = text(result.access_token); break; }
-    if (!['authorization_pending','slow_down'].includes(result.error)) throw new ManagementError('MANAGED_AUTH_DENIED','Device authorization was denied or expired.','Run auth login again.');
-    await new Promise(resolve=>setTimeout(resolve,interval*1000));
+    const result = record(await response.json().catch(()=>null));
+    if (result.error === 'authorization_pending' || result.error === 'slow_down') {
+      if (result.error === 'slow_down') interval = Math.min(interval+5,30);
+      await new Promise(resolve=>setTimeout(resolve,interval*1000));
+      continue;
+    }
+    if (response.status === 200 && result.error === undefined) { access = text(result.access_token); break; }
+    throw new ManagementError('MANAGED_AUTH_DENIED','Device authorization was denied or expired.','Run auth login again.');
   }
   if (!access) throw new ManagementError('MANAGED_AUTH_EXPIRED','Device authorization expired.','Run auth login again.');
   const exchanged = record(await request({...c,token:access},'/auth/exchange','POST'));
   const token = text(exchanged.dreamlake_token);
-  identity(await request({...c,token},'/auth/me'));
-  mkdirSync(c.dir,{recursive:true,mode:0o700});
-  // Credentials are written only after exchange and live validation; never returned.
-  let previous: Record<string,unknown> = {};
-  try { previous=record(JSON.parse(readFileSync(path.join(c.dir,'config.json'),'utf8'))); } catch { /* No prior config. */ }
-  for (const [name,value] of [['tokens.json',{'dreamlake-token':token}],['config.json',{...previous,remote_url:c.url}]] as const) {
-    const file=path.join(c.dir,name); const temp=`${file}.${process.pid}.tmp`;
-    writeFileSync(temp,JSON.stringify(value)+'\n',{mode:0o600}); chmodSync(temp,0o600); renameSync(temp,file);
-  }
+  const me = record(await request({...c,token},'/auth/me'));
+  identity(me);
+  // Credentials are written only after exchange and live validation; never returned. The shared
+  // login contract saves the environment in auth.yml and projects it, as `dreamlake login` does.
+  const { envNameFor, saveLogin } = await import('./shared-login.js');
+  const env = envNameFor(c.dir, c.url, arg(a,'env'));
+  try { saveLogin(c.dir, env, { server: c.url, auth: authUrl, namespace: typeof me.namespace?.slug === 'string' ? me.namespace.slug : '', token }); }
+  catch (e) { if ((e as any)?.code === 'SHARED_LOGIN_ENV_CONFLICT') throw new ManagementError('SHARED_LOGIN_ENV_CONFLICT', (e as Error).message, 'Pass --env <name> for this server.'); throw e; }
   access='';
-  return {authenticated:true,server:c.url,credentialSource:'DreamLake shared login',scopedCredentialsPersisted:false};
+  return {authenticated:true,server:c.url,environment:env,credentialSource:'DreamLake shared login',scopedCredentialsPersisted:false};
 }
 
 /** Advanced standalone login has a separate client ID, token exchange and store. */

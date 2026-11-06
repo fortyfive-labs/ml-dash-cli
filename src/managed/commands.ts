@@ -9,39 +9,59 @@ import { adoptionCommand } from './adoption.js';
 import { connectionCommand } from './connections.js';
 import { login, standaloneLogin } from './auth.js';
 import { organizationInspection, organizationPaging, allOrganizationMembers } from './organizationInspection.js';
+import { assertFlagUse, assertNativeSelection, nativeCommand, nativeOnlyActions, sharedOrganizationAction } from './native.js';
 
-const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams'] as const;
+const names = ['auth','instance','orgs','projects','setup','credentials','runs','metrics','logs','files','health','diagnostics','connections','workspaces','adoption','teams','folders','batch'] as const;
 export const managementActions: Record<string,string[]> = {
- teams:['list','members'],
+ teams:['list','members','delete'],
  adoption:['inventory','plan','apply','reconcile','recover'],
  connections:['list'],workspaces:['list','status','plan','apply','detach'],
  auth:['status','login'],instance:['show','capabilities','schema'],orgs:['list','create','update','delete','members','teams','member-add','member-role','member-remove'],projects:['list','access'],
- setup:['plan','apply','status','resume'],credentials:['list','inspect','create','rotate','retire'],runs:['list','show','create','status','parameters','delete'],
- metrics:['list','read','append'],logs:['read','append'],files:['list','inspect','upload','download'],health:['check'],diagnostics:['check'],
+ setup:['plan','apply','status','resume'],credentials:['list','inspect','create','rotate','retire'],runs:['list','show','create','status','parameters','delete','archive','unarchive','trash','restore','update','parameters-delete','protect','unprotect','move','purge','bindrs','bind','unbind'],
+ metrics:['list','read','append','stats','metadata'],logs:['read','append'],files:['list','inspect','upload','download','update','delete'],health:['check'],diagnostics:['check'],
+ folders:['list','show','create','update','trash','restore','protect','unprotect','purge','operation'],batch:['trash','purge'],
 };
-const help: Record<string,string>={teams:'Inspect standalone teams and membership for access diagnostics',adoption:'Inventory and explicitly adopt a legacy project with operator safeguards',connections:'List operator-approved external connections (advanced)',workspaces:'Explicit external workspace discovery, binding and detachment (advanced)',auth:'Shared DreamLake login and live status',instance:'Managed instance identity, version and capabilities',orgs:'Discover organizations and current membership',projects:'Discover projects and inspect effective access',setup:'Review exact resources and resume idempotent setup',credentials:'Inspect or revoke scoped credentials without exporting tokens',runs:'Inspect and create experiment runs',metrics:'Read cursor pages and append metric points',logs:'Read cursor pages and append logs',files:'Inspect and transfer experiment files',health:'Read instance health',diagnostics:'Check identity, capabilities, setup and access'};
+const help: Record<string,string>={teams:'Inspect standalone teams and membership for access diagnostics',adoption:'Inventory and explicitly adopt a legacy project with operator safeguards',connections:'List operator-approved external connections (advanced)',workspaces:'Explicit external workspace discovery, binding and detachment (advanced)',auth:'Shared DreamLake login and live status',instance:'Managed instance identity, version and capabilities',orgs:'Discover organizations and current membership',projects:'Discover projects and inspect effective access',setup:'Review exact resources and resume idempotent setup',credentials:'Inspect or revoke scoped credentials without exporting tokens',runs:'Inspect and create experiment runs',metrics:'Read cursor pages and append metric points',logs:'Read cursor pages and append logs',files:'Inspect and transfer experiment files',health:'Read instance health',diagnostics:'Check identity, capabilities, setup and access',folders:'Native run folders: list, create, move, and trash/restore/protect/unprotect/purge with operation status (--backend native)',batch:'Native batch trash or purge of runs and folders, one receipt per item (--backend native)'};
 export function managementCommand(name: typeof names[number]) {
  const spec: CommandSpec={name,help:help[name],description:`Managed Experiments: ${help[name]}. Existing standalone login/list/upload remain available.`,positionals:[{dest:'action',metavar:'ACTION',help:managementActions[name].join(' | '),default:managementActions[name][0]}],options:[
   {flags:['--schema-version'],dest:'schema_version',choices:['1'],help:'Supported machine schema version (default 1; instance schema only)'},
   {flags:['--standalone'],dest:'standalone',boolean:true,help:'Explicitly use standalone Dash identity and APIs, never the DreamLake login'},
+  {flags:['--backend'],dest:'backend',choices:['managed','native'],help:'DreamLake Experiments backend: managed (default) or native; never falls back to the other'},
   {flags:['--dash-url','--api-url'],dest:'dash_url',help:'Standalone Dash server matching its existing login'},
   {flags:['--offset'],dest:'offset',help:'Server nextOffset for organization members/teams and standalone lists'},
-  {flags:['--team'],dest:'team',help:'Explicit standalone team ID for membership inspection'},
+  {flags:['--team'],dest:'team',help:'Team ID for membership inspection, or the team teams delete removes (--backend native)'},
   {flags:['--remote-project'],dest:'remote_project',help:'Explicit legacy Dash project ID for adoption'},
   {flags:['--expected-revision'],dest:'expected_revision',help:'Reviewed authority revision for adoption plan/recovery'},
   {flags:['--plan-hash'],dest:'plan_hash',help:'Exact server adoption plan hash for reconciliation'},
   {flags:['--connection'],dest:'connection',help:'Operator-approved external connection alias; never a URL'},
   {flags:['--remote-namespace'],dest:'remote_namespace',help:'Explicit verified external namespace ID or unique slug for preview'},
   {flags:['--dreamlake-url'],dest:'dreamlake_url',help:'DreamLake server matching the shared login'},
+  {flags:['--env'],dest:'env',help:'DreamLake environment name a login saves under (auth login; default: built-in or matching server, else default)'},
   {flags:['--auth-url'],dest:'auth_url',help:'Vuer device authorization server (auth login only)'},
   {flags:['-n','--namespace'],dest:'namespace',help:'Explicit DreamLake organization slug'},
   {flags:['-p','--project'],dest:'project',help:'Explicit DreamLake project slug or ID'},
   {flags:['--run'],dest:'run',help:'Stable experiment run ID'},
-  {flags:['--name'],dest:'name',help:'Explicit organization display name'},
-  {flags:['--description'],dest:'description',help:'Explicit organization description'},
+  {flags:['--name'],dest:'name',help:'Explicit organization display name, or a native run or folder name (runs move, folders create|update)'},
+  {flags:['--description'],dest:'description',help:'Explicit organization description, or a new native metric\'s description'},
+  {flags:['--tags'],dest:'tags',help:'Comma-separated tags of a new native metric (metrics append --backend native)'},
+  {flags:['--metadata'],dest:'metadata',help:'JSON object file (or -): a native run\'s metadata dict (runs create|update), or a new metric\'s or file\'s metadata'},
   {flags:['--user'],dest:'user',help:'Exact user ID for organization membership operations'},
   {flags:['--role'],dest:'role',choices:['OWNER','MEMBER'],help:'Explicit organization role'},
-  {flags:['--run-key'],dest:'run_key',help:'Idempotent run creation key (letters/numbers/_/-)'},
+  {flags:['--run-key'],dest:'run_key',help:'Idempotent run creation key (letters/numbers/_/-); with --folder-path, the run name'},
+  {flags:['--write-protected'],dest:'write_protected',boolean:true,help:'Native runs create: create the run write-protected, with its metadata, in one step (never unprotects)'},
+  {flags:['--bindrs'],dest:'bindrs',help:'Native runs create: comma-separated bindr names the new run joins (found or created)'},
+  {flags:['--bindr'],dest:'bindr',help:'Native runs bind|unbind: bindr name (bind creates it when missing)'},
+  {flags:['--bindr-id'],dest:'bindr_id',help:'Native runs bind|unbind: bindr ID'},
+  {flags:['--item-kind'],dest:'item_kind',choices:['metric','file','parameters'],help:'Native runs bindrs|bind|unbind: a run item instead of the run'},
+  {flags:['--item-id'],dest:'item_id',help:'Native runs bindrs|bind|unbind: the item ID (with --item-kind)'},
+  {flags:['--folder'],dest:'folder',help:'Native folder ID (root: the project root, for runs move)'},
+  {flags:['--folder-path'],dest:'folder_path',help:'Native folder path a/b (runs create, runs move; root: the project root)'},
+  {flags:['--parent'],dest:'parent',help:'Native parent folder ID, or root (folders list|create|update)'},
+  {flags:['--path'],dest:'path',help:'Native folder path a/b/c (folders create; folders show resolves a folder or run)'},
+  {flags:['--operation'],dest:'operation',help:'Native folder operation ID (folders operation)'},
+  {flags:['--wait'],dest:'wait',boolean:true,help:'Follow a native folder operation until done or refused (up to 10 minutes)'},
+  {flags:['--runs'],dest:'runs',help:'Native batch: comma-separated run IDs'},
+  {flags:['--folders'],dest:'folders',help:'Native batch: comma-separated folder IDs'},
   {flags:['--metric'],dest:'metric',help:'Exact metric name'},
   {flags:['--file'],dest:'file',help:'Stable experiment file ID'},
   {flags:['--input'],dest:'input',help:'Local file to upload (managed limit 8 MiB)'},
@@ -51,6 +71,14 @@ export function managementCommand(name: typeof names[number]) {
   {flags:['--mode'],dest:'mode',choices:['read','write'],help:'Scoped credential mode (default read)'},
   {flags:['--credential'],dest:'credential',help:'Workload credential ID, never its token'},
   {flags:['--expected-generation'],dest:'expected_generation',help:'Reviewed workload credential generation'},
+  {flags:['--include-archived'],dest:'include_archived',boolean:true,help:'Native runs list: include archived runs'},
+  {flags:['--level'],dest:'level',help:'Native logs read: comma list of info, warn, error, debug, fatal'},
+  {flags:['--start-time'],dest:'start_time',help:'Native logs read: inclusive ISO lower bound'},
+  {flags:['--end-time'],dest:'end_time',help:'Native logs read: inclusive ISO upper bound'},
+  {flags:['--search'],dest:'search',help:'Native logs read: case-sensitive message substring'},
+  {flags:['--order-by'],dest:'order_by',choices:['sequenceNumber','timestamp'],help:'Native logs read: sort field'},
+  {flags:['--order'],dest:'order',choices:['asc','desc'],help:'Native logs read: sort direction'},
+  {flags:['--prefix'],dest:'prefix',help:'Native files: destination or filter prefix'},
   {flags:['--limit'],dest:'limit',help:'Page size, 1–1000'}, {flags:['--cursor'],dest:'cursor',help:'Opaque next-page cursor'},
   {flags:['--out'],dest:'out',help:'Save a non-secret plan/receipt, or download destination'},
   {flags:['--review'],dest:'review',help:'Previously reviewed plan JSON; required for apply/resume'},
@@ -108,7 +136,17 @@ async function writeIntent(c:ReturnType<typeof context>,a:ParsedArgs,intent:unkn
 }
 export async function runManagement(name:string,a:ParsedArgs):Promise<number>{
  try{
-  const act=action(a,name);let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
+  const act=action(a,name);
+  if(arg(a,'backend')!=='native'&&nativeOnlyActions[name]?.includes(act))throw new ManagementError('MANAGED_NATIVE_ONLY_ACTION',`${name} ${act} is served only by the native backend.`,'Add --backend native for a DreamLake-native project.');
+  if(arg(a,'backend')==='native'&&!sharedOrganizationAction(name,act)){
+   assertNativeSelection(name,act,a);
+   const native=context(a,!(name==='auth'&&act==='login'));
+   const value=name==='auth'&&act==='login'?await login(a):await nativeCommand(name,act,native,a);
+   emit(a,safe(value,[native.token||'']));return 0;
+  }
+  if(arg(a,'backend')==='native')assertNativeSelection(name,act,a);
+  else assertFlagUse(name,act,a,false);
+  let c=a.standalone?standaloneContext(a,name!=='auth'||act!=='login'):context(a,name!=='auth'||act!=='login');let result:unknown;
   if(name==='orgs'&&['create','update','delete'].includes(act)){result=await organizationMutation(c,a,act);emit(a,safe(result,[c.token||'']));return 0;}
   if(a.standalone&&!(name==='auth'&&act==='login')){result=await standaloneCommand(name,act,c,a);emit(a,safe(result,[c.token||'']));return 0;}
   if(name==='teams')throw new ManagementError('MANAGED_AUTHORITY_SELECTION','Team inspection requires explicit --standalone in this CLI.','DreamLake project access is inspected using projects access; teams never imply standalone project grants.');

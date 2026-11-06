@@ -1,6 +1,7 @@
 import type { CommandSpec } from './parser.js';
 import { commandLoaders } from './loaders.js';
 import { managementActions } from '../managed/commands.js';
+import { nativeOnlyActions } from '../managed/native.js';
 import { ManagementError, record, text } from '../managed/client.js';
 import { VERSION } from '../version.js';
 
@@ -23,7 +24,13 @@ function operation(spec:CommandSpec, action:string) {
  const id=`${spec.name}.${action}`;
  const input=inputs(spec,action);
  const required=[...(requiredInputs[id]??[])];
- if(['setup','credentials','runs','metrics','logs','files','adoption'].includes(spec.name))required.push('namespace','project');
+ if(['setup','credentials','runs','metrics','logs','files','adoption','folders','batch'].includes(spec.name))required.push('namespace','project');
+ const nativeOnly=!!nativeOnlyActions[spec.name]?.includes(action);
+ if(nativeOnly)required.push('backend');
+ if(spec.name==='runs'&&['protect','unprotect','move','purge','bindrs','bind','unbind'].includes(action))required.push('run');
+ if(spec.name==='folders'&&!['list','show','create','operation'].includes(action))required.push('folder');
+ if(id==='folders.operation')required.push('operation');
+ if(id==='teams.delete')required.push('team');
  if(spec.name==='setup'&&['apply','resume'].includes(action))required.push('apply','review','idempotency_key');
  if(spec.name==='credentials') {
   if(['inspect','rotate','retire'].includes(action))required.push('credential');
@@ -43,12 +50,13 @@ function operation(spec:CommandSpec, action:string) {
  if(['adoption.plan','adoption.recover'].includes(id))required.push('expected_revision');
  if(id==='adoption.reconcile')required.push('plan_hash');
  if(['adoption.apply','adoption.recover'].includes(id))required.push('apply','review','idempotency_key');
- if(spec.name==='teams'){required.push('standalone');if(action==='members')required.push('team');}
+ if(spec.name==='teams'&&!nativeOnly){required.push('standalone');if(action==='members')required.push('team');}
  input.required=[...new Set(['action',...input.required,...required])];
  if(required.includes('apply'))input.properties.apply={type:'boolean',const:true};
- if(spec.name==='teams')input.properties.standalone={type:'boolean',const:true};
- return {id,authority:spec.name==='teams'?'standalone-dash-required':'dreamlake-default',input,output:successEnvelopeSchema,error:errorEnvelopeSchema,
-  ...( ['setup','credentials','runs','metrics','logs','files','orgs','workspaces','adoption'].includes(spec.name)?{mutationPolicy:{default:'preview-for-write-actions',applyRequires:['apply','review'],writerSession:'in-memory-only',note:'Read actions do not require apply. Run parameters without data is read-only; first writes additionally require a writer credential or UUID idempotency intent. Server authorization is final.'}}:{}),
+ if(spec.name==='teams'&&!nativeOnly)input.properties.standalone={type:'boolean',const:true};
+ if(nativeOnly)input.properties.backend={type:'string',const:'native'};
+ return {id,authority:spec.name==='teams'&&!nativeOnly?'standalone-dash-required':nativeOnly?'dreamlake-native':'dreamlake-default',input,output:successEnvelopeSchema,error:errorEnvelopeSchema,
+  ...(nativeOnly?{mutationPolicy:{default:id==='teams.delete'?'preview-for-write-actions':'direct',...(id==='teams.delete'?{applyRequires:['apply','review']}:{}),note:'Native-only. Native run and folder writes apply directly with your DreamLake login; teams delete previews first. Server authorization is final.'}}:['setup','credentials','runs','metrics','logs','files','orgs','workspaces','adoption'].includes(spec.name)?{mutationPolicy:{default:'preview-for-write-actions',applyRequires:['apply','review'],writerSession:'in-memory-only',note:'Read actions do not require apply. Run parameters without data is read-only; first writes additionally require a writer credential or UUID idempotency intent. Server authorization is final.'}}:{}),
   ...(id==='orgs.members'||id==='orgs.teams'?{pagination:{kind:'offset',inputs:['limit','offset'],continuation:'nextOffset',serverSide:true}}:{}),
   ...(id==='workspaces.list'||id==='connections.list'?{pagination:{kind:'cursor',inputs:['limit','cursor'],continuation:'nextCursor',serverSide:true}}:{})};
 }
