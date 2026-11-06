@@ -91,6 +91,8 @@ export interface RemoteExperiment {
   countsUnknown?: boolean;
   /** Native run metadata, recorded in experiment.json. */
   metadata?: Record<string, unknown> | null;
+  bindrs?: string[];
+  writeProtected?: boolean;
 }
 
 function fromGraphql(data: any): RemoteExperiment {
@@ -237,7 +239,8 @@ async function downloadExperiment(
       prefix,
       description: exp.description,
       tags: exp.tags,
-      bindrs: [],
+      bindrs: exp.bindrs ?? [],
+      writeProtected: exp.writeProtected,
       metadata: exp.metadata ?? null,
     });
 
@@ -422,6 +425,7 @@ interface RemoteFile {
   filePath: string;
   description: string | null;
   tags: string[];
+  bindrs: string[];
   metadata: Record<string, unknown> | null;
   checksum: string;
   contentType: string;
@@ -437,6 +441,7 @@ function normalizeFile(node: any): RemoteFile {
     filePath: typeof node?.pPath === "string" ? node.pPath.replace(/^\/+/, "") : "",
     description: node?.description ?? null,
     tags: node?.tags ?? [],
+    bindrs: node?.bindrs ?? [],
     metadata: node?.metadata ?? null,
     checksum: physical.checksum ?? "",
     contentType: physical.contentType ?? "",
@@ -518,6 +523,7 @@ async function downloadSingleFile(
       filename: file.filename,
       description: file.description,
       tags: file.tags,
+      bindrs: file.bindrs,
       metadata: file.metadata,
       checksum: file.checksum,
       contentType: file.contentType,

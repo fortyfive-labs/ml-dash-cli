@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.4.1 — Native archive roundtrips
+
+- Preserve run/file Bindr labels and write protection when downloading native `.dash` archives.
+- Preserve quoted and Unicode filenames on native uploads using the extended multipart filename.
+
 ## 0.4.0 — DreamLake-native experiments
 
 - Add `--backend native` run, parameter, metric, log, file and track commands, with native upload/download and scoped writer credentials.

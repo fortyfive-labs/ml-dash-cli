@@ -11,6 +11,7 @@ import { pipeline } from 'node:stream/promises';
 import path from 'node:path';
 import type { ParsedArgs } from '../cli/parser.js';
 import { arg, invalidResponse, ManagementError, record, required, type Context } from './client.js';
+import { fileMultipart, type FileMultipart } from './multipart.js';
 
 const FOLDER_ACTIONS = ['list', 'show', 'create', 'update', 'trash', 'restore', 'protect', 'unprotect', 'purge', 'operation'];
 /** Commands that have a native implementation, and the actions each supports there. */
@@ -99,13 +100,13 @@ function page(a: ParsedArgs, max: number, cursor: RegExp) {
 }
 
 /** One request to the DreamLake API origin. Redirects are refused, so the bearer never leaves it. */
-export async function call(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Response> {
+export async function call(c: Context, route: string, method = 'GET', body?: unknown, form?: FileMultipart): Promise<Response> {
   let response: Response;
   const timeout = form ? 30 * 60 * 1000 : 30000;
   try {
     response = await fetch(`${c.url}${route}`, { method, redirect: 'error', signal: AbortSignal.timeout(timeout),
-      headers: { ...(c.token ? { authorization: `Bearer ${c.token}` } : {}), ...(body === undefined ? {} : { 'content-type': 'application/json' }) },
-      ...(form ? { body: form } : body === undefined ? {} : { body: JSON.stringify(body) }) });
+      headers: { ...(c.token ? { authorization: `Bearer ${c.token}` } : {}), ...(form ? { 'content-type': form.contentType } : body === undefined ? {} : { 'content-type': 'application/json' }) },
+      ...(form ? { body: form.body } : body === undefined ? {} : { body: JSON.stringify(body) }) });
   } catch {
     throw nativeError('NATIVE_NETWORK_ERROR', 'Request failed; a write outcome may be unknown.', 'Inspect the run before retrying a write.', true);
   }
@@ -121,7 +122,7 @@ export async function call(c: Context, route: string, method = 'GET', body?: unk
   }
   return response;
 }
-export async function json(c: Context, route: string, method = 'GET', body?: unknown, form?: FormData): Promise<Record<string, any>> {
+export async function json(c: Context, route: string, method = 'GET', body?: unknown, form?: FileMultipart): Promise<Record<string, any>> {
   const response = await call(c, route, method, body, form);
   try {
     if (Number(response.headers.get('content-length')) > RESPONSE_LIMIT) throw invalidResponse();
@@ -416,15 +417,13 @@ export async function nativeCommand(name: string, act: string, c: Context, a: Pa
     const blob = await openAsBlob(input, { type: contentType });
     if (blob.size !== size) throw nativeError('NATIVE_FILE_CHANGED', 'The file changed while it was read.', 'Retry once the file is stable.');
     // Integrity fields precede the file part: the server only reads fields sent before it.
-    const form = new FormData();
-    form.append('sizeBytes', String(size));
-    form.append('checksum', checksum);
+    const fields: Record<string, string> = { sizeBytes: String(size), checksum };
     const extra = describe(a);
-    if (arg(a, 'prefix') !== undefined) form.append('prefix', arg(a, 'prefix')!);
-    if (typeof extra.description === 'string') form.append('description', extra.description);
-    if (Array.isArray(extra.tags) && extra.tags.length) form.append('tags', extra.tags.join(','));
-    if (extra.metadata) form.append('metadata', JSON.stringify(extra.metadata));
-    form.append('file', blob, path.basename(input));
+    if (arg(a, 'prefix') !== undefined) fields.prefix = arg(a, 'prefix')!;
+    if (typeof extra.description === 'string') fields.description = extra.description;
+    if (Array.isArray(extra.tags) && extra.tags.length) fields.tags = extra.tags.join(',');
+    if (extra.metadata) fields.metadata = JSON.stringify(extra.metadata);
+    const form = fileMultipart(fields, blob, path.basename(input));
     return json(c, `${run()}/files`, 'POST', undefined, form);
   }
   // download: verify against the file row's checksum before the destination appears.
